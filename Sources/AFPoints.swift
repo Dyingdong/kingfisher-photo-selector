@@ -147,11 +147,15 @@ enum AFReader {
                 try? fm.removeItem(at: script)
                 try fm.copyItem(at: original, to: script)
             }
-            if !fm.fileExists(atPath: libLink.path) {
-                let base = original.deletingLastPathComponent()
-                let candidates = ["lib", "exiftool_lib"].map { base.appendingPathComponent($0) }
-                let srcLib = candidates.first { fm.fileExists(atPath: $0.path) }
-                           ?? base.appendingPathComponent("lib")
+            // 每次都校验库软链指向当前 App 的库目录；App 换位置后旧软链会失效，必须重建。
+            let base = original.deletingLastPathComponent()
+            let candidates = ["lib", "exiftool_lib"].map { base.appendingPathComponent($0) }
+            let srcLib = candidates.first { fm.fileExists(atPath: $0.path) }
+                       ?? base.appendingPathComponent("lib")
+            let desired = srcLib.path
+            let current = try? FileManager.default.destinationOfSymbolicLink(atPath: libLink.path)
+            if current != desired {
+                try? fm.removeItem(at: libLink)
                 try fm.createSymbolicLink(at: libLink, withDestinationURL: srcLib)
             }
             return (script.path, dir)

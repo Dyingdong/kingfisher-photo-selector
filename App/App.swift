@@ -35,6 +35,11 @@ final class Store: ObservableObject {
     @Published var selectionRect: CGRect?
     @Published var wbCache: [URL: WhiteBalanceStats] = [:]
     @Published var afCache: [URL: AFInfo] = [:]
+    /// 对焦点读取状态：loading 驱动"读取中"提示；attempted 避免 nil 结果反复跑 exiftool。
+    @Published var afLoading: Set<URL> = []
+    @Published var afAttempted: Set<URL> = []
+    /// 右下信息区高度（用户手动拖拽分割条改变，其它操作不得改动）。
+    @Published var infoHeight: CGFloat = 290
     @Published var exifCache: [URL: ExifInfo] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
@@ -106,6 +111,8 @@ final class Store: ObservableObject {
         results = []
         wbCache = [:]
         afCache = [:]
+        afLoading = []
+        afAttempted = []
         exifCache = [:]
         ratingCache = [:]
         selectionRatio = nil
@@ -191,10 +198,16 @@ final class Store: ObservableObject {
     }
 
     func ensureAF(for url: URL) {
-        guard afCache[url] == nil else { return }
+        // attempted 同时覆盖"读到数据"与"确认无数据"，避免无数据的图反复跑 exiftool。
+        guard !afAttempted.contains(url) else { return }
+        afAttempted.insert(url)
+        afLoading.insert(url)
         DispatchQueue.global(qos: .utility).async {
             let info = AFReader.read(url)
-            DispatchQueue.main.async { self.afCache[url] = info }
+            DispatchQueue.main.async {
+                self.afLoading.remove(url)
+                if let info { self.afCache[url] = info }
+            }
         }
     }
 
@@ -320,6 +333,7 @@ final class Store: ObservableObject {
         metrics.removeAll { removedURLs.contains($0.url) }
         for key in removedURLs {
             wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
+            afLoading.remove(key); afAttempted.remove(key)
         }
         excluded = excluded.subtracting(removedURLs)
         if let s = selected, removedURLs.contains(s) {
@@ -401,7 +415,8 @@ func makeHeatmap(_ m: PhotoMetrics, floor: Double) -> NSImage {
 // 滚轮事件 SwiftUI 拿不到，用 AppKit 本地监听。约定：向下滚（deltaY<0）放大，向上滚缩小。
 
 struct ScrollWheelBridge: NSViewRepresentable {
-    var onScroll: (CGFloat) -> Void
+    /// 回调传滚动量与鼠标位置（容器左上原点坐标，和 DragGesture 的 location 一致）。
+    var onScroll: (CGFloat, CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSView {
@@ -413,7 +428,7 @@ struct ScrollWheelBridge: NSViewRepresentable {
         guard let v = nsView as? ScrollWheelNSView else { return }
         v.coordinator?.onScroll = onScroll
     }
-    final class Coordinator { var onScroll: ((CGFloat) -> Void)? }
+    final class Coordinator { var onScroll: ((CGFloat, CGPoint) -> Void)? }
 
     final class ScrollWheelNSView: NSView {
         weak var coordinator: Coordinator?
@@ -433,7 +448,8 @@ struct ScrollWheelBridge: NSViewRepresentable {
                 guard let host else { return e }
                 let p = host.convert(e.locationInWindow, from: nil)
                 guard host.bounds.contains(p) else { return e }
-                self.coordinator?.onScroll?(e.scrollingDeltaY)
+                let topLeft = CGPoint(x: p.x, y: host.bounds.height - p.y)
+                self.coordinator?.onScroll?(e.scrollingDeltaY, topLeft)
                 return nil
             }
         }
@@ -665,6 +681,31 @@ struct DetailView: View {
         )
     }
 
+    /// 以光标所在位置为锚点缩放：缩放前后，光标下的同一个图像点保持在屏幕原位。
+    /// 保持 zoomCenter 不变，只按当前显示矩形反算 panOffset，因此可连续滚动累积。
+    private func zoomAround(_ p: CGPoint, factor: CGFloat,
+                            fitW: CGFloat, fitH: CGFloat,
+                            ox: CGFloat, oy: CGFloat) {
+        let sc0 = store.zoom
+        let sc1 = min(8, max(1, sc0 * factor))
+        guard abs(sc1 - sc0) > 1e-6, fitW > 0, fitH > 0 else { return }
+        let d = displayedImageRect(fitW: fitW, fitH: fitH, ox: ox, oy: oy)
+        guard d.width > 0, d.height > 0 else { return }
+        // 光标在图像中的归一化位置（缩放前后不变）
+        let u = (p.x - d.minX) / d.width
+        let v = (p.y - d.minY) / d.height
+        let zx = store.zoomCenter.x, zy = store.zoomCenter.y
+        // 令缩放后 d2.x + u*d2.w == p.x，反算所需 offset
+        let dx2 = p.x - u * fitW * sc1 - ox - fitW / 2 + fitW * sc1 / 2
+        let dy2 = p.y - v * fitH * sc1 - oy - fitH / 2 + fitH * sc1 / 2
+        store.panOffset = CGSize(
+            width: dx2 - (0.5 - zx) * fitW * sc1,
+            height: dy2 - (zy - 0.5) * fitH * sc1
+        )
+        store.zoom = sc1
+        store.panStart = nil
+    }
+
     /// 把屏幕坐标的拖框换算成图像归一化坐标（Vision 的 y 轴朝上）。
     /// 基于当前显示矩形换算，因此放大后再次拖框、圈选仍然对得上。
     private func imageRect(_ s: CGPoint, _ e: CGPoint,
@@ -718,7 +759,7 @@ struct DetailView: View {
                 Button("＋") { store.zoomIn() }.frame(width: 26)
                 Button("复位") { store.resetZoom() }.font(.caption)
                 Spacer()
-                Text("左键拖框圈选重判 · ⌘/右键拖框放大 · 滚轮下滚放大/上滚缩小 · 空格+拖动平移 · 单击还原")
+                Text("左键拖框放大 · ⌘+左键圈选主体 · 右键拖框放大 · 滚轮下滚放大/上滚缩小 · 空格+拖动平移 · 单击还原")
                     .font(.caption).foregroundColor(.secondary).lineLimit(1)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -777,9 +818,14 @@ struct DetailView: View {
                             .frame(width: abs(c.x - s.x), height: abs(c.y - s.y))
                             .position(x: (s.x + c.x) / 2, y: (s.y + c.y) / 2)
                     }
-                    ScrollWheelBridge { deltaY in
+                    ScrollWheelBridge { deltaY, p in
                         // deltaY < 0 = 向下滚 → 放大；deltaY > 0 = 向上滚 → 缩小。
-                        if deltaY < 0 { store.zoomIn() } else if deltaY > 0 { store.zoomOut() }
+                        // 以光标所在图像点为锚点缩放。
+                        if deltaY < 0 {
+                            zoomAround(p, factor: 1.18, fitW: fitW, fitH: fitH, ox: ox, oy: oy)
+                        } else if deltaY > 0 {
+                            zoomAround(p, factor: 1 / 1.18, fitW: fitW, fitH: fitH, ox: ox, oy: oy)
+                        }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .allowsHitTesting(false)
@@ -833,6 +879,21 @@ struct DetailView: View {
                     .allowsHitTesting(false)
                 }
                 .clipped()
+                .overlay(alignment: .bottomTrailing) {
+                    if store.showAFPoints && store.afLoading.contains(r.id) {
+                        HStack(spacing: 6) {
+                            ProgressView().scaleEffect(0.7).frame(width: 14, height: 14)
+                            Text("读取相机对焦点信息中…")
+                        }
+                        .font(.caption)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.black.opacity(0.65)))
+                        .foregroundColor(.white)
+                        .padding(12)
+                        .allowsHitTesting(false)
+                    }
+                }
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 4)
                     .onChanged { v in
@@ -854,7 +915,8 @@ struct DetailView: View {
                             return
                         }
                         if store.dragStart == nil {
-                            store.dragIsZoom = NSEvent.modifierFlags.contains(.command)
+                            // 左键直接拖框 = 放大；按住 ⌘ + 左键拖框 = 圈选主体重判。
+                            store.dragIsZoom = !NSEvent.modifierFlags.contains(.command)
                         }
                         store.dragStart = v.startLocation
                         store.dragCurrent = v.location
@@ -1038,7 +1100,13 @@ struct InfoView: View {
             Divider()
             VStack(alignment: .leading, spacing: 4) {
                 Text("相机对焦点").font(.caption).foregroundColor(.secondary)
-                if let af = store.afCache[r.id] {
+                if store.afLoading.contains(r.id) {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.7).frame(width: 13, height: 13)
+                        Text("读取相机对焦点信息中…")
+                    }
+                    .font(.caption).foregroundColor(.secondary)
+                } else if let af = store.afCache[r.id] {
                     Text(af.summary).font(.callout)
                     if let p = af.points.first {
                         Text("对焦框 \(Int(p.w * 100))%×\(Int(p.h * 100))% · 画面 \(Int(p.cx * 100))%, \(Int(p.cy * 100))%")
@@ -1046,8 +1114,11 @@ struct InfoView: View {
                     }
                     Text("读取自 RAW 原始文件；DNG 代理或转档后可能保留旧数据，仅供参考。")
                         .font(.caption2).foregroundColor(.secondary)
+                } else if MetadataWriter.isRAW(r.id) {
+                    Text("未记录对焦点（RAW 不支持 AFInfo 或未启用对焦）：检查预览区「对焦点」开关，或此机型暂不支持")
+                        .font(.caption).foregroundColor(.secondary)
                 } else {
-                    Text("无对焦点数据（非 RAW、或相机未记录）").font(.caption).foregroundColor(.secondary)
+                    Text("无对焦点数据（JPG 不含相机对焦记录）").font(.caption).foregroundColor(.secondary)
                 }
             }
             Text(r.id.path).font(.caption2).foregroundColor(.secondary).lineLimit(1)
@@ -1075,6 +1146,9 @@ struct InfoView: View {
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
+    /// 拖动开始时的信息区高度，作为绝对基准；isDividerDragging 标记本轮是否已记录基准。
+    @State private var dividerStartHeight: CGFloat = 0
+    @State private var isDividerDragging = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1108,36 +1182,66 @@ struct ContentView: View {
                 .frame(minWidth: 90, idealWidth: 100, maxWidth: 240)
                 .frame(maxHeight: .infinity)
 
-                VSplitView {
-                    Group {
-                        if let id = store.selected,
-                           let r = store.results.first(where: { $0.id == id }) {
-                            DetailView(r: r)
-                        } else {
-                            VStack(spacing: 10) {
-                                Image(systemName: "photo.on.rectangle.angled")
-                                    .font(.system(size: 44)).foregroundColor(.secondary)
-                                Text("拖入照片文件夹即可开始筛选")
-                                    .foregroundColor(.secondary)
-                                Text("RAW 原片不会被修改，只生成同名 .xmp 侧车")
-                                    .font(.caption).foregroundColor(.secondary)
+                GeometryReader { region in
+                    let totalH = region.size.height
+                    let dividerH: CGFloat = 8
+                    let minTop: CGFloat = 180
+                    let minBottom: CGFloat = 140
+                    let maxBottom = max(minBottom, totalH - dividerH - minTop)
+                    let bottomH = min(max(store.infoHeight, minBottom), maxBottom)
+                    let topH = max(minTop, totalH - dividerH - bottomH)
+                    VStack(spacing: 0) {
+                        Group {
+                            if let id = store.selected,
+                               let r = store.results.first(where: { $0.id == id }) {
+                                DetailView(r: r)
+                            } else {
+                                VStack(spacing: 10) {
+                                    Image(systemName: "photo.on.rectangle.angled")
+                                        .font(.system(size: 44)).foregroundColor(.secondary)
+                                    Text("拖入照片文件夹即可开始筛选")
+                                        .foregroundColor(.secondary)
+                                    Text("RAW 原片不会被修改，只生成同名 .xmp 侧车")
+                                        .font(.caption).foregroundColor(.secondary)
+                                }
                             }
                         }
-                    }
-                    .frame(minHeight: 180, idealHeight: 430, maxHeight: .infinity)
-                    .frame(maxWidth: .infinity)
+                        .frame(height: topH)
+                        .frame(maxWidth: .infinity)
 
-                    Group {
-                        if let id = store.selected,
-                           let r = store.results.first(where: { $0.id == id }) {
-                            InfoView(r: r)
-                        } else {
-                            Text("选中照片后显示清晰度、白平衡等信息")
-                                .foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        // 自定义分隔条：高度只由 infoHeight 决定，评星等内容变化不影响。
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.28))
+                            .frame(height: dividerH)
+                            .frame(maxWidth: .infinity)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                if hovering { NSCursor.resizeUpDown.push() }
+                                else { NSCursor.resizeUpDown.pop() }
+                            }
+                            .gesture(DragGesture(minimumDistance: 0)
+                                .onChanged { g in
+                                    if !isDividerDragging {
+                                        dividerStartHeight = store.infoHeight
+                                        isDividerDragging = true
+                                    }
+                                    // 向上拖（translation<0）→ 信息区变高
+                                    store.infoHeight = min(max(dividerStartHeight - g.translation.height, minBottom), maxBottom)
+                                }
+                                .onEnded { _ in isDividerDragging = false })
+
+                        Group {
+                            if let id = store.selected,
+                               let r = store.results.first(where: { $0.id == id }) {
+                                InfoView(r: r)
+                            } else {
+                                Text("选中照片后显示清晰度、白平衡等信息")
+                                    .foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
                         }
+                        .frame(height: bottomH)
+                        .frame(maxWidth: .infinity)
                     }
-                    .frame(minHeight: 140, idealHeight: 290, maxHeight: .infinity)
-                    .frame(maxWidth: .infinity)
                 }
                 .frame(minWidth: 480, idealWidth: 820, maxWidth: .infinity)
                 .frame(maxHeight: .infinity)
