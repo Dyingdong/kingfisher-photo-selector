@@ -39,7 +39,8 @@ final class Store: ObservableObject {
     @Published var afLoading: Set<URL> = []
     @Published var afAttempted: Set<URL> = []
     /// 右下信息区高度（用户手动拖拽分割条改变，其它操作不得改动）。
-    @Published var infoHeight: CGFloat = 290
+    /// 默认 440：无需滚动即可完整显示评分/判定/指标/拍摄参数/白平衡/对焦点。
+    @Published var infoHeight: CGFloat = 440
     @Published var exifCache: [URL: ExifInfo] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
@@ -52,6 +53,34 @@ final class Store: ObservableObject {
     @Published var panOffset = CGSize.zero
     @Published var panStart: CGPoint?
     @Published var panBegin = CGSize.zero
+
+    /// 渲染缓存：拖动分隔条/缩放窗口会反复触发 body 重算，热力图按块绘制很重。
+    /// 缓存后 body 重算只取现成 NSImage 做 GPU 缩放，避免画面跳动。
+    /// 非 @Published：生成结果不需要触发 UI 刷新；选中图/基准变化时按 key 自动失效。
+    private var heatCache: [URL: (floor: Double, img: NSImage)] = [:]
+    private var baseCache: [URL: (full: Bool, img: NSImage)] = [:]
+
+    func heatmapImage(for r: PhotoResult) -> NSImage {
+        let floor = heatFloor
+        if let c = heatCache[r.id], c.floor == floor { return c.img }
+        let img = makeHeatmap(r.metrics, floor: floor)
+        heatCache[r.id] = (floor, img)
+        return img
+    }
+
+    func baseImage(for r: PhotoResult) -> NSImage {
+        let useFull = fullPreviewURL == r.id && fullPreview != nil
+        if let c = baseCache[r.id], c.full == useFull { return c.img }
+        let cg = useFull ? (fullPreview ?? r.metrics.preview) : r.metrics.preview
+        let img: NSImage
+        if let cg {
+            img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        } else {
+            img = NSImage()
+        }
+        baseCache[r.id] = (useFull, img)
+        return img
+    }
 
     private var metrics: [PhotoMetrics] = []
     private var hiMin: Double = 0
@@ -115,6 +144,8 @@ final class Store: ObservableObject {
         afAttempted = []
         exifCache = [:]
         ratingCache = [:]
+        heatCache = [:]
+        baseCache = [:]
         selectionRatio = nil
         status = "正在分析…"
         let faces = preferFaces
@@ -334,6 +365,7 @@ final class Store: ObservableObject {
         for key in removedURLs {
             wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
             afLoading.remove(key); afAttempted.remove(key)
+            heatCache[key] = nil; baseCache[key] = nil
         }
         excluded = excluded.subtracting(removedURLs)
         if let s = selected, removedURLs.contains(s) {
@@ -749,7 +781,6 @@ struct DetailView: View {
 
     var body: some View {
         let m = r.metrics
-        let shownImage = store.fullPreviewURL == r.id ? (store.fullPreview ?? m.preview) : m.preview
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Toggle("锐度热力图", isOn: $store.showHeatmap)
@@ -774,13 +805,10 @@ struct DetailView: View {
 
                 ZStack {
                     ZStack {
-                        if let cg = shownImage {
-                            Image(nsImage: NSImage(cgImage: cg,
-                                                   size: NSSize(width: cg.width, height: cg.height)))
-                                .resizable().frame(width: fitW, height: fitH)
-                        }
+                        Image(nsImage: store.baseImage(for: r))
+                            .resizable().frame(width: fitW, height: fitH)
                         if store.showHeatmap {
-                            Image(nsImage: makeHeatmap(m, floor: store.heatFloor))
+                            Image(nsImage: store.heatmapImage(for: r))
                                 .resizable().frame(width: fitW, height: fitH)
                         }
                         ForEach(Array(m.bboxes.enumerated()), id: \.offset) { _, b in
@@ -1222,7 +1250,9 @@ struct ContentView: View {
                             .gesture(DragGesture(minimumDistance: 0)
                                 .onChanged { g in
                                     if !isDividerDragging {
-                                        dividerStartHeight = store.infoHeight
+                                        // 用实际显示高度（已被窗口尺寸 clamp 过）作基准，
+                                        // 避免默认高度超出可用空间时第一次拖动突然跳变。
+                                        dividerStartHeight = bottomH
                                         isDividerDragging = true
                                     }
                                     // 向上拖（translation<0）→ 信息区变高
