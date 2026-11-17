@@ -1,0 +1,51 @@
+﻿文件名,机型,镜头,焦距mm,光圈F,ISO,后期链,题材,人工真值,最终判定,判定原因
+260204_英雄大桥_0015.dng,Canon EOS R6m2,RF24-105mm F4 L IS USM,31,8,100,其他 DNG,建筑与夜景,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+260204_英雄大桥_0027.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,废、手动对焦,运动模糊/拖影,方向性 2.2、偏软占比 90%，更像运动模糊/拖影，未计入失焦
+260204_英雄大桥_0033.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,废、手动对焦,运动模糊/拖影,方向性 2.2、偏软占比 88%，更像运动模糊/拖影，未计入失焦
+260204_英雄大桥_0040.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,好、手动对焦,通过,主体区锐度与画面最锐区接近，未见明显失焦
+260204_英雄大桥_0045.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,好、手动对焦,通过,主体区锐度与画面最锐区接近，未见明显失焦
+260204_英雄大桥_0051.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,好、手动对焦,通过,主体区锐度与画面最锐区接近，未见明显失焦
+260204_英雄大桥_0055.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,好、手动对焦,通过,主体区锐度与画面最锐区接近，未见明显失焦
+369A4399-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,6400,DxO DeepPRIME XD3 DNG,长焦打鸟,废，但是画面整体有点模糊,疑似主体失焦,主体锐度比 0.06 且重模糊比 0.11，疑似主体失焦
+369A4577-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,500,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似全片模糊,全片最锐区 353，低于批次基准 426，疑似整体脱焦/衍射
+369A4666-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,800,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似全片模糊,全片最锐区 5，低于批次基准 426，疑似整体脱焦/衍射
+369A4669-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,800,DxO DeepPRIME XD3 DNG,长焦打鸟,好，但是画面不锐利,通过,主体区锐度与画面最锐区接近，未见明显失焦
+369A4823-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,1000,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似全片模糊,全片最锐区 163，低于批次基准 426，疑似整体脱焦/衍射
+369A5839-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,2500,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似主体失焦,主体区锐度比 0.12 而中心区仅 0.15，疑似焦点跑偏
+369A5840-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,2500,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似主体失焦,主体区锐度比 0.13 而中心区仅 0.18，疑似焦点跑偏
+369A5841-DxO_DeepPRIME XD3.dng,Canon EOS R7,RF200-800mm F6.3-9 IS USM,800,9,2500,DxO DeepPRIME XD3 DNG,长焦打鸟,废,疑似主体失焦,主体区锐度比 0.13 而中心区仅 0.17，疑似焦点跑偏
+JD5A0009-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,160,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A0178.dng,Canon EOS R6m2,,,,100,其他 DNG,建筑与夜景,好、手动对焦,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A0710-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,4000,DxO DeepPRIME XD3 DNG,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A1799.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,672,9,(未读出),相机原生 CR3,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A1800.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,672,9,(未读出),相机原生 CR3,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A1937.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,(未读出),相机原生 CR3,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A2003.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,672,9,(未读出),相机原生 CR3,长焦打鸟,废,疑似主体失焦,中心区锐度 0.07 高于主体区 0.03，疑似焦点跑偏
+JD5A2005.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,672,9,(未读出),相机原生 CR3,长焦打鸟,废,疑似主体失焦,中心区锐度 0.10 高于主体区 0.03，疑似焦点跑偏
+JD5A2059.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,(未读出),相机原生 CR3,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A2060.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,(未读出),相机原生 CR3,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A4937.CR3,Canon EOS R6m2,,0,0,(未读出),相机原生 CR3,建筑与夜景,废,疑似主体失焦,中心区锐度 0.19 高于主体区 0.14，疑似焦点跑偏
+JD5A4938.CR3,Canon EOS R6m2,,0,0,(未读出),相机原生 CR3,建筑与夜景,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A4939.CR3,Canon EOS R6m2,,0,0,(未读出),相机原生 CR3,建筑与夜景,废,疑似主体失焦,中心区锐度 0.30 高于主体区 0.21，疑似焦点跑偏
+JD5A5179-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,800,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5187-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,800,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5224-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,800,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5270-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,640,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5339-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,637,9,1250,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5607-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,637,9,2500,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5609-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,2500,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5741-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,5000,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A5789-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,1250,DxO DeepPRIME XD3 DNG,长焦打鸟,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A6900.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,47,8,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A6907.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,39,8,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A6908.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,39,16,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A7908-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,500,8,320,DxO DeepPRIME XD3 DNG,长焦打鸟,好、但是因为裁切，主体质量低，应该是对上焦的,疑似全片模糊,全片最锐区 4，低于批次基准 426，疑似整体脱焦/衍射
+JD5A7938-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM + EXTENDER RF2x,1600,18,4000,DxO DeepPRIME XD3 DNG,花草与微距,好、但是因为裁切，主体质量低，应该是对上焦的,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A7979-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM + EXTENDER RF2x,1600,18,2500,DxO DeepPRIME XD3 DNG,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A7984-DxO_DeepPRIME XD3.dng,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM + EXTENDER RF2x,1600,18,2500,DxO DeepPRIME XD3 DNG,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A8580.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A8587.CR3,Canon EOS R6m2,RF200-800mm F6.3-9 IS USM,800,9,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A8670.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,65,22,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A8671.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,95,22,(未读出),相机原生 CR3,花草与微距,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A9205.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,50,11,(未读出),相机原生 CR3,建筑与夜景,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
+JD5A9206.CR3,Canon EOS R6m2,RF24-105mm F4 L IS USM,76,11,(未读出),相机原生 CR3,建筑与夜景,好,通过,主体区锐度与画面最锐区接近，未见明显失焦
