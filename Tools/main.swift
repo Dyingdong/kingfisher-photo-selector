@@ -46,7 +46,7 @@ func err(_ s: String) {
 }
 
 let fm = FileManager.default
-let allowed = MetadataWriter.jpgExts.union(MetadataWriter.rawExts)
+let allowed = MetadataWriter.rawExts
 var files: [URL] = []
 for p in paths {
     let u = URL(fileURLWithPath: p)
@@ -68,7 +68,7 @@ for p in paths {
 }
 files.sort { $0.path < $1.path }
 
-guard !files.isEmpty else { err("没有找到可处理的 JPG / RAW 照片"); exit(1) }
+guard !files.isEmpty else { err("没有找到可处理的 RAW 照片"); exit(1) }
 
 var metrics: [PhotoMetrics] = []
 for u in files {

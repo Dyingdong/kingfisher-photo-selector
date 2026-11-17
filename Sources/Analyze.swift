@@ -198,13 +198,18 @@ enum Analyzer {
     }
 
     /// 人工圈选主体后重算：返回该区域的锐度与最锐区之比。
+    /// 传入的 rect 是 Vision 坐标（y=0 在底部、y=1 在顶部），而 scores 的第 r 行
+    /// r=0 是图像顶部（与热力图绘制一致）。因此比较前先把 rect 的 y 翻转成
+    /// 「顶部为 0」，否则圈上方会算到下方、圈下方会算到上方（曾导致圈清晰主体却显示 0%）。
     static func rectRatio(_ m: PhotoMetrics, rect: CGRect) -> Double {
         var picked: [Double] = []
+        let topMinY = 1 - rect.maxY
+        let topMaxY = 1 - rect.minY
         for r in 0..<m.rows {
             for c in 0..<m.cols {
                 let cx = (Double(c) + 0.5) / Double(m.cols)
                 let cy = (Double(r) + 0.5) / Double(m.rows)
-                if cx >= rect.minX, cx <= rect.maxX, cy >= rect.minY, cy <= rect.maxY {
+                if cx >= rect.minX, cx <= rect.maxX, cy >= topMinY, cy <= topMaxY {
                     picked.append(m.scores[r * m.cols + c])
                 }
             }
@@ -240,14 +245,13 @@ enum Analyzer {
     static func classify(_ m: PhotoMetrics, hiMin: Double,
                          subjectOverride: Double? = nil) -> (Verdict, String) {
         if m.globalHi <= 0 { return (.unreadable, "图像无法解析") }
+        // 判定说明一律用大白话：让不懂「锐度比/重模糊比」的人也能一眼明白问题在哪。
+        // 具体数值仍可在信息区的「判断依据」里查看，这里只给结论和原因。
         if m.anisotropy > 2.2 && (m.softRatio > 0.85 || m.globalHi < hiMin) {
-            return (.motionBlur,
-                    String(format: "方向性 %.1f、偏软占比 %.0f%%，更像运动模糊/拖影，未计入合焦判定",
-                           m.anisotropy, m.softRatio * 100))
+            return (.motionBlur, "画面有明显的拖影或抖动痕迹，整张偏软")
         }
         if m.globalHi < hiMin {
-            return (.globalBlur,
-                    String(format: "全片最锐区 %.0f，低于基准 %.0f，疑似整体脱焦/衍射", m.globalHi, hiMin))
+            return (.globalBlur, "整张照片都不够清晰，像是整体没对上焦")
         }
         // 以下规则用 50 张真实 RAW + 人工真值标定（召回 13/13，误杀 1/37）。
         // 注意：这是经验规则，换机型/题材后必须重新标注标定，不要当成通用阈值。
@@ -256,25 +260,21 @@ enum Analyzer {
         if m.subjectSource == "前景主体" {
             // 中心区明显比主体区更锐 → 焦点大概率跑到了别处
             if g - f > 0.03 && f < 0.25 {
-                return (.subjectBlur,
-                        String(format: "中心区锐度 %.2f 高于主体区 %.2f，焦点可能未落在主体", g, f))
+                return (.subjectBlur, "主体是虚的，反倒是画面中心更清楚——焦大概率对偏了")
             }
             // 主体本身很弱、再模糊一次几乎不掉细节 → 主体确实发虚
             if f < 0.10 && m.subjectReblur < 0.12 && m.softRatio < 0.85 {
-                return (.subjectBlur,
-                        String(format: "主体锐度比 %.2f 且重模糊比 %.2f，主体未合焦", f, m.subjectReblur))
+                return (.subjectBlur, "主体本身发虚，看不清细节")
             }
         } else if m.subjectSource == "显著性区域" {
             // 显著性兜底时主体比反而偏高、且中心区偏软，真值中对应未合焦片
             if h > 0.105 && f < 0.25 {
-                return (.subjectBlur,
-                        String(format: "主体区锐度比 %.2f 而中心区仅 %.2f，焦点可能未落在主体", h, f))
+                return (.subjectBlur, "主体不够清楚，焦点可能落在了别处")
             }
         } else if f < 0.35 {
-            return (.subjectBlur,
-                    String(format: "主体区锐度仅为最锐区的 %.0f%%，焦点可能未落在主体", f * 100))
+            return (.subjectBlur, "主体明显偏软，焦点可能没落在主体上")
         }
-        return (.pass, "主体区锐度与画面最锐区接近，合焦正常")
+        return (.pass, "主体清晰，对焦正常")
     }
 
     static func decide(_ all: [PhotoMetrics], sensitivity: Double = 1.0,
