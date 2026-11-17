@@ -18,6 +18,8 @@ final class Store: ObservableObject {
     @Published var preferFaces = false
     @Published var addColorLabel = true
     @Published var confirmWrite = false
+    @Published var confirmDelete = false
+    @Published var deleteURL: URL?
     @Published var backupPath = ""
     @Published var dropTarget = false
     @Published var showHeatmap = true
@@ -34,6 +36,8 @@ final class Store: ObservableObject {
     @Published var wbCache: [URL: WhiteBalanceStats] = [:]
     @Published var afCache: [URL: AFInfo] = [:]
     @Published var exifCache: [URL: ExifInfo] = [:]
+    /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
+    @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
     /// 当前选中照片的原尺寸预览；分析用小图只用于缩略图与打分。
     @Published var fullPreview: CGImage?
@@ -103,6 +107,7 @@ final class Store: ObservableObject {
         wbCache = [:]
         afCache = [:]
         exifCache = [:]
+        ratingCache = [:]
         selectionRatio = nil
         status = "正在分析…"
         let faces = preferFaces
@@ -124,7 +129,7 @@ final class Store: ObservableObject {
                 self.hiMin = min
                 self.results = list
                 self.processing = false
-                self.status = "已分析 \(found.count) 张，疑似失焦 \(self.suspects.count) 张"
+                self.status = "已分析 \(found.count) 张，未合焦 \(self.suspects.count) 张"
                 if let f = self.shown.first { self.selected = f.id }
             }
         }
@@ -142,7 +147,7 @@ final class Store: ObservableObject {
             r.overrideRect = old[m.url] ?? nil
             return r
         }
-        status = "已按新灵敏度重算，疑似失焦 \(suspects.count) 张"
+        status = "已按新灵敏度重算，未合焦 \(suspects.count) 张"
     }
 
     func recheck(id: URL, rect: CGRect) {
@@ -201,6 +206,38 @@ final class Store: ObservableObject {
         }
     }
 
+    func ensureRating(for url: URL) {
+        guard ratingCache[url] == nil else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let rating = MetadataWriter.snapshot(url).rating
+            DispatchQueue.main.async { self.ratingCache[url] = rating }
+        }
+    }
+
+    /// 设置星级：0~5 星，-1 为 Bridge 的「拒绝」。即时写入元数据，失败则回滚 UI。
+    func setRating(_ url: URL, rating: Int) {
+        let previous = ratingCache[url]
+        let stamp = Int(Date().timeIntervalSince1970)
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FocusScreener/backups/\(stamp)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try MetadataWriter.setRating(to: url, rating: rating, backupDir: dir)
+                DispatchQueue.main.async {
+                    self.ratingCache[url] = rating
+                    self.backupPath = dir.path
+                    let label = rating == -1 ? "拒绝" : "\(rating) 星"
+                    self.status = "已设 \(url.deletingPathExtension().lastPathComponent) 为\(label)，并写入元数据"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.ratingCache[url] = previous
+                    self.status = "评分写入失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     func ensureFullPreview(for url: URL) {
         if fullPreviewURL == url {
             if fullPreview != nil { return }
@@ -248,6 +285,47 @@ final class Store: ObservableObject {
         backupPath = dir.path
         status = "已写入 \(ok) 张照片的 Bridge 元数据" +
                  (failed.isEmpty ? "" : "，\(failed.count) 张失败：\(failed.joined(separator: "；"))")
+    }
+
+    /// 与 RAW 同目录、同文件名（不同扩展名）的 JPG；存在才返回。
+    func siblingJPG(for raw: URL) -> URL? {
+        guard MetadataWriter.isRAW(raw) else { return nil }
+        let base = raw.deletingPathExtension()
+        for ext in MetadataWriter.jpgExts {
+            let c = base.appendingPathExtension(ext)
+            if FileManager.default.fileExists(atPath: c.path) { return c }
+        }
+        return nil
+    }
+
+    /// 删除选中的照片；RAW 会连同同名 JPG 一起移到废纸篓。返回实际处理的文件名。
+    func deletePhoto(_ url: URL) -> (moved: [String], failed: String?) {
+        var targets = [url]
+        if let jpg = siblingJPG(for: url) { targets.append(jpg) }
+        var moved: [String] = []
+        var failed: String?
+        var removedURLs: Set<URL> = []
+        for t in targets {
+            do {
+                var resulting: NSURL?
+                try FileManager.default.trashItem(at: t, resultingItemURL: &resulting)
+                moved.append(t.lastPathComponent)
+                removedURLs.insert(t)
+            } catch {
+                failed = "\(t.lastPathComponent)：\(error.localizedDescription)"
+            }
+        }
+        // 从内存列表与缓存移除（只移除确实删掉的）
+        results.removeAll { removedURLs.contains($0.id) }
+        metrics.removeAll { removedURLs.contains($0.url) }
+        for key in removedURLs {
+            wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
+        }
+        excluded = excluded.subtracting(removedURLs)
+        if let s = selected, removedURLs.contains(s) {
+            selected = shown.first?.id
+        }
+        return (moved, failed)
     }
 
     func exportCSV() {
@@ -317,6 +395,54 @@ func makeHeatmap(_ m: PhotoMetrics, floor: Double) -> NSImage {
     }
     img.unlockFocus()
     return img
+}
+
+// MARK: - 滚轮缩放桥接
+// 滚轮事件 SwiftUI 拿不到，用 AppKit 本地监听。约定：向下滚（deltaY<0）放大，向上滚缩小。
+
+struct ScrollWheelBridge: NSViewRepresentable {
+    var onScroll: (CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let v = ScrollWheelNSView()
+        v.coordinator = context.coordinator
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let v = nsView as? ScrollWheelNSView else { return }
+        v.coordinator?.onScroll = onScroll
+    }
+    final class Coordinator { var onScroll: ((CGFloat) -> Void)? }
+
+    final class ScrollWheelNSView: NSView {
+        weak var coordinator: Coordinator?
+        private var monitor: Any?
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); install() }
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { remove() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        private func install() {
+            guard monitor == nil, window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] e in
+                guard let self, let win = self.window, e.window === win else { return e }
+                let host = self.superview ?? win.contentView
+                guard let host else { return e }
+                let p = host.convert(e.locationInWindow, from: nil)
+                guard host.bounds.contains(p) else { return e }
+                self.coordinator?.onScroll?(e.scrollingDeltaY)
+                return nil
+            }
+        }
+        private func remove() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+        deinit { remove() }
+    }
 }
 
 // MARK: - 左侧目录
@@ -592,7 +718,7 @@ struct DetailView: View {
                 Button("＋") { store.zoomIn() }.frame(width: 26)
                 Button("复位") { store.resetZoom() }.font(.caption)
                 Spacer()
-                Text("在图上拖框可圈选主体并重判 · ⌘/右键拖框放大 · 空格+拖动平移 · 单击还原")
+                Text("左键拖框圈选重判 · ⌘/右键拖框放大 · 滚轮下滚放大/上滚缩小 · 空格+拖动平移 · 单击还原")
                     .font(.caption).foregroundColor(.secondary).lineLimit(1)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -651,6 +777,12 @@ struct DetailView: View {
                             .frame(width: abs(c.x - s.x), height: abs(c.y - s.y))
                             .position(x: (s.x + c.x) / 2, y: (s.y + c.y) / 2)
                     }
+                    ScrollWheelBridge { deltaY in
+                        // deltaY < 0 = 向下滚 → 放大；deltaY > 0 = 向上滚 → 缩小。
+                        if deltaY < 0 { store.zoomIn() } else if deltaY > 0 { store.zoomOut() }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
                     RightDragBridge(
                         onStart: { p in
                             store.dragIsZoom = true
@@ -792,11 +924,47 @@ struct InfoView: View {
         .frame(minWidth: 120, alignment: .leading)
     }
 
+    /// Bridge 风格评分：5 颗星；已评当前星级时再点该星清零；单独「拒绝」按钮。
+    private func ratingBar(_ r: PhotoResult) -> some View {
+        let current = store.ratingCache[r.id] ?? 0
+        let rejected = current == -1
+        return HStack(spacing: 10) {
+            Text("评分").font(.caption).foregroundColor(.secondary)
+            HStack(spacing: 2) {
+                ForEach(1...5, id: \.self) { n in
+                    Button {
+                        let next = (current == n) ? 0 : n
+                        store.setRating(r.id, rating: next)
+                    } label: {
+                        Image(systemName: (!rejected && current >= n) ? "star.fill" : "star")
+                            .foregroundColor((!rejected && current >= n) ? .orange : .secondary)
+                    }
+                    .buttonStyle(.plain).help("\(n) 星")
+                }
+                Button {
+                    store.setRating(r.id, rating: rejected ? 0 : -1)
+                } label: {
+                    Text("拒绝").font(.caption)
+                        .foregroundColor(rejected ? .white : .red)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(rejected ? Color.red : Color.clear)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain).help("标记/取消拒绝（Bridge Reject）")
+            }
+            if let rt = store.ratingCache[r.id] {
+                Text(rt == -1 ? "已拒绝" : "\(rt) 星").font(.caption2).foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+    }
+
     var body: some View {
         let m = r.metrics
         let wb = store.wbCache[r.id]
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
+                ratingBar(r)
                 HStack {
                     Text(r.verdict.rawValue)
                         .foregroundColor(verdictColor(r.verdict)).fontWeight(.medium)
@@ -814,7 +982,7 @@ struct InfoView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)],
                           alignment: .leading, spacing: 8) {
                     cell("最锐区 P99", String(format: "%.0f", m.globalHi))
-                    cell("失焦基准", String(format: "%.0f（%@）", store.heatFloor, store.anchorName))
+                    cell("合焦基准", String(format: "%.0f（%@）", store.heatFloor, store.anchorName))
                     cell("主体锐度比", String(format: "%.3f", m.ratio))
                     cell("中心锐度比", String(format: "%.3f", m.centerRatio))
                     cell("偏软块占比", String(format: "%.0f%%", m.softRatio * 100))
@@ -892,11 +1060,13 @@ struct InfoView: View {
             store.ensureWB(for: r.id)
             store.ensureAF(for: r.id)
             store.ensureExif(for: r.id)
+            store.ensureRating(for: r.id)
         }
         .onChange(of: r.id) { u in
             store.ensureWB(for: u)
             store.ensureAF(for: u)
             store.ensureExif(for: u)
+            store.ensureRating(for: u)
         }
     }
 }
@@ -911,7 +1081,7 @@ struct ContentView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("摄影照片筛选工具").font(.title3).fontWeight(.medium)
-                    Text("JPG / RAW · 锐度热力图 · 失焦辅助 · 白平衡参考 · Bridge 元数据")
+                    Text("JPG / RAW · 锐度热力图 · 合焦辅助 · 白平衡参考 · Bridge 元数据")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
@@ -925,7 +1095,7 @@ struct ContentView: View {
             HSplitView {
                 VStack(spacing: 0) {
                     HStack {
-                        Toggle("只看疑似", isOn: $store.onlySuspect)
+                        Toggle("只看未合焦", isOn: $store.onlySuspect)
                         Spacer()
                         Text("\(store.shown.count) 张").font(.caption).foregroundColor(.secondary)
                     }.padding(8)
@@ -935,7 +1105,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                .frame(minWidth: 150, idealWidth: 180, maxWidth: 400)
+                .frame(minWidth: 90, idealWidth: 100, maxWidth: 240)
                 .frame(maxHeight: .infinity)
 
                 VSplitView {
@@ -966,7 +1136,7 @@ struct ContentView: View {
                                 .foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                     }
-                    .frame(minHeight: 120, idealHeight: 150, maxHeight: .infinity)
+                    .frame(minHeight: 140, idealHeight: 290, maxHeight: .infinity)
                     .frame(maxWidth: .infinity)
                 }
                 .frame(minWidth: 480, idealWidth: 820, maxWidth: .infinity)
@@ -1000,6 +1170,11 @@ struct ContentView: View {
                 }
                 Button("写入 Bridge 元数据 (\(store.writableSuspects.count))") { store.confirmWrite = true }
                     .disabled(store.suspects.isEmpty || store.processing)
+                Button("删除当前照片") {
+                    if let u = store.selected { store.deleteURL = u; store.confirmDelete = true }
+                }
+                .disabled(store.selected == nil || store.processing)
+                .foregroundColor(.red)
             }.padding(10)
 
             HStack {
@@ -1027,10 +1202,31 @@ struct ContentView: View {
             Button("确认写入") { store.writeMetadata() }
         } message: {
             Text("""
-            将对 \(store.writableSuspects.count) 张疑似失焦照片追加关键词「失焦」，并把判定原因写入 IPTC Core 的说明与 Instructions 字段。
+            将对 \(store.writableSuspects.count) 张未合焦照片追加关键词「未合焦」，并把判定原因写入 IPTC Core 的说明与 Instructions 字段。
 
             已有的关键词、说明、颜色标签、星级都会被保留。RAW 只生成同名 .xmp 侧车；JPG 只插入 XMP 段，图像数据不变。写入前的元数据会备份到「应用程序支持/FocusScreener/backups」。
             """)
+        }
+        .alert("删除照片", isPresented: $store.confirmDelete) {
+            Button("取消", role: .cancel) { store.deleteURL = nil }
+            Button("移到废纸篓", role: .destructive) {
+                if let u = store.deleteURL {
+                    let out = store.deletePhoto(u)
+                    let names = out.moved.joined(separator: "、")
+                    store.status = "已移到废纸篓：\(names)" +
+                        (out.failed.map { "；失败：\($0)" } ?? "")
+                }
+                store.deleteURL = nil
+            }
+        } message: {
+            if let u = store.deleteURL {
+                let jpg = store.siblingJPG(for: u)
+                Text("""
+                将把 \(u.lastPathComponent) 移到废纸篓\(jpg == nil ? "" : "，以及同名的 \(jpg!.lastPathComponent)")。
+
+                文件会进入废纸篓，仍可从废纸篓恢复。确认继续？
+                """)
+            }
         }
     }
 

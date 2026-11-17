@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "focuscli"
 
-SUSPECT = {"疑似全片模糊", "疑似主体失焦", "疑似景深不足"}
+SUSPECT = {"全片未合焦", "主体未合焦", "景深不足"}
 UNCERTAIN = {"运动模糊/拖影", "无法解码"}
 DC = "http://purl.org/dc/elements/1.1/"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -75,18 +75,18 @@ def classify(row, hi_min):
     if an > 2.2 and (soft > 0.85 or hi < hi_min):
         return "运动模糊/拖影"
     if margin < 1 or hi < hi_min:
-        return "疑似全片模糊"
+        return "全片未合焦"
     if src == "前景主体":
         if g - f > 0.03 and f < 0.25:
-            return "疑似主体失焦"
+            return "主体未合焦"
         if f < 0.10 and reblur < 0.12 and soft < 0.85:
-            return "疑似主体失焦"
+            return "主体未合焦"
     elif src == "显著性区域":
         if h > 0.105 and f < 0.25:
-            return "疑似主体失焦"
+            return "主体未合焦"
     elif f < 0.35:
-        return "疑似主体失焦"
-    return "通过"
+        return "主体未合焦"
+    return "合焦"
 
 
 def parse_truth(s):

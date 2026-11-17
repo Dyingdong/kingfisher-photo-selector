@@ -14,7 +14,7 @@ struct IntegrationTest {
 
         let suspects = results.filter { $0.verdict.isSuspect }
         let backup = dir.appendingPathComponent("backup")
-        print("--- 写入 \(suspects.count) 张疑似照片 ---")
+        print("--- 写入 \(suspects.count) 张未合焦照片 ---")
         for r in suspects {
             let o = try MetadataWriter.apply(to: r.id, reason: r.reason,
                                              addLabel: true, backupDir: backup)
@@ -31,7 +31,7 @@ struct IntegrationTest {
         }
 
         let pass = results.filter { !$0.verdict.isSuspect }
-        print("--- 通过/非失焦照片未被打标签:",
+        print("--- 合焦照片未被打标签:",
               pass.allSatisfy { MetadataWriter.snapshot($0.id).keywords.isEmpty })
         print("--- 写入前备份文件数:",
               (try? FileManager.default.contentsOfDirectory(atPath: backup.path))?.count ?? 0)

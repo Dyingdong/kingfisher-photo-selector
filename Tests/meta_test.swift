@@ -41,7 +41,7 @@ struct MetaTest {
         let before = try Data(contentsOf: jpg)
         let bSOS = sosOffset(before)!
         let tailBefore = before.subdata(in: bSOS..<before.count)
-        let r1 = try MetadataWriter.apply(to: jpg, reason: "主体区锐度/最锐区=0.08，疑似焦点跑偏",
+        let r1 = try MetadataWriter.apply(to: jpg, reason: "主体区锐度/最锐区=0.08，焦点未落在主体",
                                           addLabel: true, backupDir: backup)
         let after = try Data(contentsOf: jpg)
         let aSOS = sosOffset(after)!
@@ -52,19 +52,19 @@ struct MetaTest {
 
         let back = readBackXMP(jpg)
         print("ImageIO 读回 XMP 成功:", !back.isEmpty)
-        print("含关键词 失焦:", back.contains(">失焦<"))
+        print("含关键词 未合焦:", back.contains(">未合焦<"))
         print("含判定原因:", back.contains("主体区锐度/最锐区=0.08"))
         print("含 IPTC Core 说明字段:", back.contains("dc:description") && back.contains("photoshop:Instructions"))
         print("含 Bridge 颜色标签:", back.contains("xmp:Label") && back.contains("Red"))
 
         print("--- 2. 重复写入不叠加 ---")
-        _ = try MetadataWriter.apply(to: jpg, reason: "复核后仍疑似失焦", addLabel: true, backupDir: backup)
+        _ = try MetadataWriter.apply(to: jpg, reason: "复核后仍未合焦", addLabel: true, backupDir: backup)
         let back2 = readBackXMP(jpg)
-        let kwCount = back2.components(separatedBy: ">失焦<").count - 1
+        let kwCount = back2.components(separatedBy: ">未合焦<").count - 1
         let noteCount = back2.components(separatedBy: MetadataWriter.notePrefix).count - 1
-        print("关键词 失焦 出现次数:", kwCount, "(应为 1)")
+        print("关键词 未合焦 出现次数:", kwCount, "(应为 1)")
         print("原因出现次数:", noteCount, "(应为 2：说明 + Instructions)")
-        print("新原因已生效:", back2.contains("复核后仍疑似失焦"))
+        print("新原因已生效:", back2.contains("复核后仍未合焦"))
         print("旧原因已替换:", !back2.contains("主体区锐度/最锐区=0.08"))
 
         print("--- 3. 已有元数据不覆盖 ---")
@@ -87,12 +87,12 @@ struct MetaTest {
         <?xpacket end="w"?>
         """
         let merged = try MetadataWriter.mergedXMP(existing: seeded,
-                                                  note: MetadataWriter.makeNote("景深不足，疑似失焦"),
+                                                  note: MetadataWriter.makeNote("景深不足，未合焦"),
                                                   addLabel: true)
         for (name, token) in [("原关键词 旅行", ">旅行<"), ("原关键词 黄山", ">黄山<"),
                               ("原说明 云海", "云海"), ("原 Instructions", "勿裁切"),
                               ("原颜色标签 Green", "Green"), ("原星级 4", "4"),
-                              ("新关键词 失焦", ">失焦<"), ("新原因", "景深不足")] {
+                              ("新关键词 未合焦", ">未合焦<"), ("新原因", "景深不足")] {
             print("  保留/新增 \(name):", merged.contains(token))
         }
         print("  未覆盖已有颜色标签(无 Red):", !merged.contains(">Red<"))
@@ -105,7 +105,7 @@ struct MetaTest {
         let raw = dir.appendingPathComponent("IMG_0042.CR3")
         let rawBytes = Data(repeating: 0x5A, count: 4096)
         try rawBytes.write(to: raw)
-        let r3 = try MetadataWriter.apply(to: raw, reason: "全片锐度偏低，疑似整体脱焦",
+        let r3 = try MetadataWriter.apply(to: raw, reason: "全片锐度偏低，整体未合焦",
                                           addLabel: false, backupDir: backup)
         let rawAfter = try Data(contentsOf: raw)
         let sc = MetadataWriter.sidecar(raw)
@@ -113,13 +113,13 @@ struct MetaTest {
         print("写入方式:", r3.method)
         print("侧车文件名:", sc.lastPathComponent)
         print("RAW 原片字节完全不变:", rawAfter == rawBytes)
-        print("侧车含关键词与原因:", sideText.contains("失焦") && sideText.contains("疑似整体脱焦"))
+        print("侧车含关键词与原因:", sideText.contains("未合焦") && sideText.contains("整体未合焦"))
         print("侧车是合法 XML:", (try? XMLDocument(data: Data(sideText.utf8), options: [])) != nil)
 
         print("--- 5. 已有侧车增量合并 ---")
         _ = try MetadataWriter.apply(to: raw, reason: "复核：远景大面积偏软", addLabel: false, backupDir: backup)
         let side2 = try String(contentsOf: sc, encoding: .utf8)
-        print("关键词仍只有一次:", side2.components(separatedBy: ">失焦<").count - 1 == 1)
+        print("关键词仍只有一次:", side2.components(separatedBy: ">未合焦<").count - 1 == 1)
         print("原因已更新:", side2.contains("远景大面积偏软") && !side2.contains("全片锐度偏低"))
         print("ALL_TESTS_DONE")
     }

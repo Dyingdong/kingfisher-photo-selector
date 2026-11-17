@@ -5,6 +5,9 @@ struct MetaSnapshot {
     var description: String = ""
     var instructions: String = ""
     var label: String = ""
+    /// xmp:Rating，0~5 星；-1 表示 Bridge 的「拒绝」。nil 表示未评分。
+    var rating: Int?
+    var isRejected: Bool { rating == -1 }
     var hasSidecar = false
     var hasEmbeddedXMP = false
 }
@@ -32,8 +35,8 @@ enum MetaError: Error, LocalizedError {
 }
 
 enum MetadataWriter {
-    static let keyword = "失焦"
-    static let notePrefix = "[失焦质检]"
+    static let keyword = "未合焦"
+    static let notePrefix = "[合焦质检]"
     static let headerBytes: [UInt8] = Array("http://ns.adobe.com/xap/1.0/".utf8) + [0x00]
     static let packetBegin = "<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
     static let packetEnd = "<?xpacket end=\"w\"?>"
@@ -63,8 +66,9 @@ enum MetadataWriter {
          .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
-    static func freshXMP(note: String, addLabel: Bool) -> String {
+    static func freshXMP(note: String, addLabel: Bool, rating: Int? = nil) -> String {
         let label = addLabel ? "  <xmp:Label>Red</xmp:Label>\n" : ""
+        let ratingLine = rating.map { "  <xmp:Rating>\($0)</xmp:Rating>\n" } ?? ""
         let n = xmlEscape(note)
         return """
         \(packetBegin)
@@ -77,7 +81,7 @@ enum MetadataWriter {
               <dc:subject><rdf:Bag><rdf:li>\(xmlEscape(keyword))</rdf:li></rdf:Bag></dc:subject>
               <dc:description><rdf:Alt><rdf:li xml:lang="x-default">\(n)</rdf:li></rdf:Alt></dc:description>
               <photoshop:Instructions>\(n)</photoshop:Instructions>
-        \(label)    </rdf:Description>
+        \(label)\(ratingLine)    </rdf:Description>
           </rdf:RDF>
         </x:xmpmeta>
         \(packetEnd)
@@ -124,8 +128,9 @@ enum MetadataWriter {
         return kept.isEmpty ? note : kept + separator + note
     }
 
-    static func mergedXMP(existing: String?, note: String, addLabel: Bool) throws -> String {
-        guard let existing, !existing.isEmpty else { return freshXMP(note: note, addLabel: addLabel) }
+    static func mergedXMP(existing: String?, note: String, addLabel: Bool,
+                          rating: Int? = nil) throws -> String {
+        guard let existing, !existing.isEmpty else { return freshXMP(note: note, addLabel: addLabel, rating: rating) }
         guard let data = existing.data(using: .utf8),
               let doc = try? XMLDocument(data: data, options: []),
               let root = doc.rootElement(),
@@ -178,6 +183,17 @@ enum MetadataWriter {
             let l = XMLElement(name: "xmp:Label")
             l.stringValue = "Red"
             desc.addChild(l)
+        }
+
+        // xmp:Rating：0~5 星；-1 = Bridge 的「拒绝」。传入 nil 时保留原值。
+        if let rating {
+            if let node = child(desc, "Rating") {
+                node.stringValue = String(rating)
+            } else {
+                let r = XMLElement(name: "xmp:Rating")
+                r.stringValue = String(rating)
+                desc.addChild(r)
+            }
         }
 
         return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
@@ -233,7 +249,75 @@ enum MetadataWriter {
         }
         s.instructions = child(desc, "Instructions")?.stringValue ?? ""
         s.label = child(desc, "Label")?.stringValue ?? ""
+        if let r = child(desc, "Rating")?.stringValue, let v = Int(r.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            s.rating = v
+        }
         return s
+    }
+
+    /// 只改 xmp:Rating，不动说明/关键词/标签。rating 为 0~5 星，-1 表示拒绝。
+    /// 与 apply 共用同一套读取、备份、写回路径，但不会追加质检说明。
+    static func setRating(to u: URL, rating: Int, backupDir: URL) throws -> WriteOutcome {
+        let fm = FileManager.default
+        try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
+        let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before-rating.xmp")
+        let sc = sidecar(u)
+
+        if isJPEG(u) {
+            let data = try Data(contentsOf: u)
+            let embedded = embeddedXMP(data)
+            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
+            var originals: [String] = []
+            if let e = embedded { originals.append("EMBEDDED\n" + e) }
+            if let s = side { originals.append("SIDECAR\n" + s) }
+            try originals.joined(separator: "\n---\n").write(to: backup, atomically: true, encoding: .utf8)
+
+            let xmp = try ratingOnlyXMP(existing: embedded ?? side, rating: rating)
+            let newData = try injectXMP(into: data, xmp: xmp)
+            try newData.write(to: u, options: .atomic)
+            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
+            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: "星级 \(rating)")
+        }
+
+        if isRAW(u) {
+            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
+            if let s = side { try s.write(to: backup, atomically: true, encoding: .utf8) }
+            let xmp = try ratingOnlyXMP(existing: side, rating: rating)
+            try xmp.write(to: sc, atomically: true, encoding: .utf8)
+            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: "星级 \(rating)")
+        }
+
+        throw MetaError.unsupportedFormat(u.pathExtension)
+    }
+
+    /// 在已有 XMP 上只设置 Rating；没有现成 XMP 时生成一个最小合法包。
+    private static func ratingOnlyXMP(existing: String?, rating: Int) throws -> String {
+        guard let existing, !existing.isEmpty,
+              let data = existing.data(using: .utf8),
+              let doc = try? XMLDocument(data: data, options: []),
+              let root = doc.rootElement(),
+              let desc = firstDescription(root) else {
+            return """
+            \(packetBegin)
+            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="FocusScreener">
+              <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+                <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+                  <xmp:Rating>\(rating)</xmp:Rating>
+                </rdf:Description>
+              </rdf:RDF>
+            </x:xmpmeta>
+            \(packetEnd)
+            """
+        }
+        ensureNS(desc, "xmp", "http://ns.adobe.com/xap/1.0/")
+        if let node = child(desc, "Rating") {
+            node.stringValue = String(rating)
+        } else {
+            let r = XMLElement(name: "xmp:Rating")
+            r.stringValue = String(rating)
+            desc.addChild(r)
+        }
+        return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
     }
 
     // MARK: - JPEG 字节级写入（不重新编码图像数据）
@@ -285,7 +369,7 @@ enum MetadataWriter {
 
     /// 写入前先做一次备份快照，返回备份文件路径；出错时不改动任何文件。
     static func apply(to u: URL, reason: String, addLabel: Bool,
-                      backupDir: URL) throws -> WriteOutcome {
+                      backupDir: URL, rating: Int? = nil) throws -> WriteOutcome {
         let note = makeNote(reason)
         let sc = sidecar(u)
         let fm = FileManager.default
@@ -301,7 +385,8 @@ enum MetadataWriter {
             if let s = side { originals.append("SIDECAR\n" + s) }
             try originals.joined(separator: "\n---\n").write(to: backup, atomically: true, encoding: .utf8)
 
-            let xmp = try mergedXMP(existing: embedded ?? side, note: note, addLabel: addLabel)
+            let xmp = try mergedXMP(existing: embedded ?? side, note: note,
+                                    addLabel: addLabel, rating: rating)
             let newData = try injectXMP(into: data, xmp: xmp)
             try newData.write(to: u, options: .atomic)
             if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
@@ -311,7 +396,8 @@ enum MetadataWriter {
         if isRAW(u) {
             let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
             if let s = side { try s.write(to: backup, atomically: true, encoding: .utf8) }
-            let xmp = try mergedXMP(existing: side, note: note, addLabel: addLabel)
+            let xmp = try mergedXMP(existing: side, note: note,
+                                    addLabel: addLabel, rating: rating)
             try xmp.write(to: sc, atomically: true, encoding: .utf8)
             return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: note)
         }
