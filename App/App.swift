@@ -119,6 +119,8 @@ final class Store: ObservableObject {
     @Published var exifCache: [URL: ExifInfo] = [:]
     /// 对焦点处语义（人脸/鸟/其他），用于题材识别；随 AF 加载后异步算一次。
     @Published var focusCache: [URL: FocusSemantics] = [:]
+    /// 画面中是否有人（不依赖露脸，人体姿态检测），用于无脸人像的题材兜底。
+    @Published var humanCache: [URL: HumanPresence] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
@@ -246,6 +248,7 @@ final class Store: ObservableObject {
         afAttempted = []
         exifCache = [:]
         focusCache = [:]
+        humanCache = [:]
         ratingCache = [:]
         genreOverride = [:]
         heatCache = [:]
@@ -366,6 +369,15 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 人体存在检测（背影/侧身也算人）：算一次缓存住。只影响题材识别的兜底判断。
+    func ensureHuman(for url: URL) {
+        guard humanCache[url] == nil else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let h = HumanPresenceEngine.detect(url: url)
+            DispatchQueue.main.async { self.humanCache[url] = h }
+        }
+    }
+
     func ensureRating(for url: URL) {
         guard ratingCache[url] == nil else { return }
         DispatchQueue.global(qos: .utility).async {
@@ -405,7 +417,7 @@ final class Store: ObservableObject {
         if let g = genreOverride[r.id] { return (g, false, "手动指定") }
         let (g, why) = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
                                               wb: wbCache[r.id], exif: exifCache[r.id],
-                                              focus: focusCache[r.id])
+                                              focus: focusCache[r.id], human: humanCache[r.id])
         return (g, true, why)
     }
 
@@ -507,7 +519,7 @@ final class Store: ObservableObject {
         metrics.removeAll { removedURLs.contains($0.url) }
         for key in removedURLs {
             wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
-            focusCache[key] = nil
+            focusCache[key] = nil; humanCache[key] = nil
             genreOverride[key] = nil
             afLoading.remove(key); afAttempted.remove(key)
             heatCache[key] = nil; baseCache[key] = nil
@@ -1721,6 +1733,7 @@ struct InfoView: View {
             store.ensureAF(for: r.id)
             store.ensureExif(for: r.id)
             store.ensureFocus(for: r.id)
+            store.ensureHuman(for: r.id)
             store.ensureRating(for: r.id)
         }
         .onChange(of: r.id) { u in
@@ -1728,6 +1741,7 @@ struct InfoView: View {
             store.ensureAF(for: u)
             store.ensureExif(for: u)
             store.ensureFocus(for: u)
+            store.ensureHuman(for: u)
             store.ensureRating(for: u)
         }
     }

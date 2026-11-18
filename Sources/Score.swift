@@ -83,7 +83,8 @@ enum ScoreEngine {
     /// 只是「猜测」，界面明确标注并允许用户手动改。
     static func guessGenre(m: PhotoMetrics, af: AFInfo?, wb: WhiteBalanceStats?,
                            exif: ExifInfo?,
-                           focus: FocusSemantics? = nil) -> (PhotoGenre, String) {
+                           focus: FocusSemantics? = nil,
+                           human: HumanPresence? = nil) -> (PhotoGenre, String) {
         var subjectArea = 0.0
         for b in m.bboxes { subjectArea += Double(b.width * b.height) }
 
@@ -114,6 +115,13 @@ enum ScoreEngine {
         if wb?.faceRG != nil || m.subjectSource == "人脸检测" || faceMode {
             let why = faceMode ? "相机用人脸对焦模式" : "检测到人脸"
             return (.portrait, why)
+        }
+
+        // 无脸人像：背影/侧身/低头等没露出脸的题材。用人体姿态检测（不依赖脸），
+        // 放在长焦兜底之前——否则 RF100-400 这类长焦拍的人像会被误判成拍鸟。
+        // 只在「对焦点语义没识别出鸟/风景」时才走到这里，不会把打鸟片里偶尔入镜的人误判。
+        if let human = human, human.isMainSubject {
+            return (.portrait, human.reason)
         }
 
         // 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
