@@ -259,6 +259,35 @@ enum Analyzer {
             ? m.ratio : m.centerRatio
     }
 
+    /// 相机对焦点与 AI 主体区域的空间关系【仅界面提示，不参与判定】。
+    /// 实测：焦点落在主体上并不等于合焦（9 张真废片里有 7 张焦点就在主体上），
+    /// 所以这项只能当旁证/解释，绝不能拿它改判定。返回 (短标签, 说明)。
+    static func afSubjectRelation(_ m: PhotoMetrics, af: AFInfo?) -> (String, String) {
+        guard let af = af, let p = af.points.first, !af.points.isEmpty else {
+            return ("无对焦点数据", "这张照片没有相机对焦点记录，本项仅供参考")
+        }
+        let fc = min(m.cols - 1, max(0, Int(p.cx * Double(m.cols))))
+        let fr = min(m.rows - 1, max(0, Int(p.cy * Double(m.rows))))
+        let onWeight = m.weights[fr * m.cols + fc]
+        var minD = 1.0
+        for r in 0..<m.rows {
+            for c in 0..<m.cols where m.weights[r * m.cols + c] > 0.45 {
+                let cc = (Double(c) + 0.5) / Double(m.cols)
+                let cr = (Double(r) + 0.5) / Double(m.rows)
+                minD = min(minD, hypot(cc - p.cx, cr - p.cy))
+            }
+        }
+        let xPct = Int(p.cx * 100), yPct = Int(p.cy * 100)
+        let pos = "横向\(xPct)%／纵向\(yPct)%"
+        if m.subjectSource == "中心权重" {
+            return ("主体靠推测", "AI 没识别出明确主体（位置靠中心推测），本项意义有限；焦点在\(pos)")
+        }
+        if onWeight > 0.45 || minD < 0.05 {
+            return ("焦点在主体上", "相机对焦点（\(pos)）落在 AI 主体区，对焦意图正确；清不清楚仍以主体清晰度为准")
+        }
+        return ("焦点在主体外", "相机对焦点（\(pos)）在 AI 主体区外，留意焦点是否跑偏；仅作参考，判定仍看锐度")
+    }
+
     /// 独立判定基准：不再从本批照片里找 P75，每张照片用同一把固定标尺。
     /// 400 是在 Canon EOS R6m2/R7 的 50 张真值样本上标定的（对应旧版该批 P75×0.15=426），
     /// 只适用于同类机型/镜头/题材；换设备后需要用真值重新标定这把尺子。

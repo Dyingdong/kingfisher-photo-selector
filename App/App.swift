@@ -902,6 +902,28 @@ struct LeftMouseBridge: NSViewRepresentable {
 
 // MARK: - 右上：预览与缩放
 
+/// 预览区里几种彩色框的图例，放在工具栏下方一行。
+private struct FrameLegend: View {
+    var body: some View {
+        HStack(spacing: 14) {
+            legend(Color.cyan, "青框＝AI 主体")
+            legend(Color.red, "红框＝相机对焦点")
+            legend(Color.yellow, "黄框＝你圈选/放大区")
+        }
+        .font(.caption2)
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+    }
+    @ViewBuilder
+    private func legend(_ c: Color, _ text: String) -> some View {
+        HStack(spacing: 4) {
+            Rectangle().stroke(c, lineWidth: 1.5).frame(width: 11, height: 9)
+            Text(text)
+        }
+    }
+}
+
 /// 相机对焦点叠加层。抽成独立 View 以减小 DetailView.body 的类型检查复杂度。
 private struct AFPointsOverlay: View {
     let points: [FocusPoint]
@@ -1061,6 +1083,8 @@ struct DetailView: View {
                     .font(.caption).foregroundColor(.secondary).lineLimit(1)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
+
+            FrameLegend()
 
             GeometryReader { geo in
                 let aspect = CGFloat(max(m.width, 1)) / CGFloat(max(m.height, 1))
@@ -1404,6 +1428,16 @@ struct InfoView: View {
                     }
                     Text("主体位置：\(subjectLabel(m.subjectSource))")
                         .font(.caption2).foregroundColor(.secondary)
+                    if let af = store.afCache[r.id] {
+                        let rel = Analyzer.afSubjectRelation(m, af: af)
+                        HStack(spacing: 5) {
+                            Text("对焦点与主体：\(rel.0)")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Image(systemName: "info.circle")
+                                .font(.caption2).foregroundColor(.secondary)
+                                .help(rel.1)
+                        }
+                    }
                 }
 
                 Divider()
