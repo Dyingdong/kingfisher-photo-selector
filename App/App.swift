@@ -449,14 +449,19 @@ final class Store: ObservableObject {
                                               wb: wbCache[r.id], exif: exifCache[r.id],
                                               focus: focusCache[r.id], human: humanCache[r.id],
                                               ai: aiCache[r.id].flatMap { $0 })
-        // 纠正记忆：对焦点特征与你手动纠正过的照片相似 → 按你的判断优先。
-        if let focusLabels = focusCache[r.id]?.labels, !focusLabels.isEmpty {
+        // 纠正记忆：算法只在「没有任何强信号、纯兜底判风光」时才让位给记忆。
+        // 权衡原则：算法明确认出东西（人脸/鸟/焦距/对焦点语义）时，那是可复核的证据，
+        // 不能被几条同标签的纠正推翻——真值复盘里一次纠正曾污染 44 张本该自动判的照片。
+        // 而且只在同一机器误判模式下套用（见 GenreMemory.suggest）。
+        if let focusLabels = focusCache[r.id]?.labels, !focusLabels.isEmpty,
+           why.contains("无长焦/人脸的强信号") {
             let names = focusLabels.map { GenreMemory.parseLabel($0) }
-            let query = (top: names.first ?? "", labels: names)
+            let query = (top: names.first ?? "", labels: names,
+                         machineGenre: g.rawValue)
             if let sug = GenreMemory.suggest(query: query, samples: memory),
                let genre = PhotoGenre(rawValue: sug.genre), genre != g {
                 return (genre, true,
-                        "参考了你以往 \(sug.count) 次同特征纠正（判\(sug.genre)）")
+                        "算法没找到明确信号，参考了你以往 \(sug.count) 次同特征纠正（判\(sug.genre)）")
             }
         }
         return (g, true, why)
@@ -619,6 +624,7 @@ final class Store: ObservableObject {
         guard panel.runModal() == .OK, let u = panel.url else { return }
         // 题材记录：纯规则识别 + 最终生效题材 + 是否人工改过，供复核与调规则。
         var genres: [URL: Report.GenreRecord] = [:]
+        var focusMiss: [URL: FocusMissDiagnosis] = [:]
         for r in results {
             let pure = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
                                               wb: wbCache[r.id], exif: exifCache[r.id],
@@ -630,9 +636,10 @@ final class Store: ObservableObject {
                                               finalGenre: final.rawValue,
                                               manualGenre: genreOverride[r.id]?.rawValue,
                                               stars: s.stars, total: Int(s.total.rounded()))
+            focusMiss[r.id] = FocusMiss.diagnose(r.metrics, af: afCache[r.id], verdict: r.verdict)
         }
         let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity,
-                             anchor: anchorHi, genres: genres)
+                             anchor: anchorHi, genres: genres, focusMiss: focusMiss)
         do {
             try csv.write(to: u, atomically: true, encoding: .utf8)
             status = "报告已导出：\(u.path)（可填「人工真值」列后用 verify.py 复核）"
@@ -661,7 +668,7 @@ final class Store: ObservableObject {
                       "人体主体", "人体依据",
                       "自动题材", "题材依据", "最终题材", "人工指定",
                       "AI主体识别", "AI依据", "AI标签",
-                      "纠正记忆条数", "完整路径"]
+                      "纠正记忆条数", "对焦失误提示", "对焦失误说明", "完整路径"]
         var lines = [header.joined(separator: ",")]
         for r in results {
             let m = r.metrics
@@ -704,7 +711,10 @@ final class Store: ObservableObject {
                 Report.q(genreOverride[r.id]?.rawValue ?? ""),
                 Report.q(ai.map { "\($0.kind)" } ?? "未识别"), Report.q(ai?.reason ?? ""),
                 Report.q(ai?.labels.prefix(5).joined(separator: " | ") ?? ""),
-                String(memory.count), Report.q(r.id.path),
+                String(memory.count),
+                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict).short),
+                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict).detail),
+                Report.q(r.id.path),
             ]
             lines.append(row.joined(separator: ","))
         }
@@ -1685,10 +1695,11 @@ private struct ScorePanel: View {
         }
     }
 
-    /// 题材选择 + 识别依据
-    private var genreBlock: some View {
+
+/// 题材选择 + 识别依据
+private var genreBlock: some View {
         VStack(alignment: compact ? .leading : .trailing, spacing: 2) {
-            Picker("", selection: genreBinding) {
+            Picker("题材", selection: genreBinding) {
                 Text("自动识别（\(score.genre.rawValue)）").tag("auto")
                 ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
             }
@@ -1913,12 +1924,21 @@ struct InfoView: View {
                         .font(.caption2).foregroundColor(.secondary)
                     if let af = store.afCache[r.id] {
                         let rel = Analyzer.afSubjectRelation(m, af: af)
+                        let miss = FocusMiss.diagnose(m, af: af, verdict: r.verdict)
                         HStack(spacing: 5) {
                             Text("对焦点与主体：\(rel.0)")
                                 .font(.caption2).foregroundColor(.secondary)
                             Image(systemName: "info.circle")
                                 .font(.caption2).foregroundColor(.secondary)
                                 .help(rel.1)
+                        }
+                        HStack(spacing: 5) {
+                            Text("手动对焦：\(miss.short)")
+                                .font(.caption2)
+                                .foregroundColor(miss.suspected ? .orange : .secondary)
+                            Image(systemName: "info.circle")
+                                .font(.caption2).foregroundColor(.secondary)
+                                .help(miss.detail)
                         }
                     }
                 }
@@ -1936,9 +1956,11 @@ struct InfoView: View {
                             // 改用与「判断依据」一致的自适应网格，放不下自动换行。
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)],
                                       alignment: .leading, spacing: 8) {
-                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f",
-                                     wb.meanR / max(wb.meanG, 1), wb.meanB / max(wb.meanG, 1)),
-                                     "以绿色为 1，红比蓝高偏暖，蓝比红高偏冷，接近 1:1 为中性。")
+                                let rr = wb.meanR / max(wb.meanG, 1)
+                                let bb = wb.meanB / max(wb.meanG, 1)
+                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f  %@",
+                                     rr, bb, colorBiasText(r: rr, b: bb)),
+                                     "以绿色为 1，红比蓝高偏暖（偏黄），蓝比红高偏冷（偏蓝），接近 1:1 为中性。")
                                 if let fr = wb.faceRG, let fb = wb.faceBG {
                                     metricCell("人脸偏色 红:蓝", String(format: "%.2f : %.2f", fr, fb),
                                                "只看人脸区域的红蓝比例，参考肤色是否偏色。")
@@ -1950,9 +1972,11 @@ struct InfoView: View {
                             }
                         } else {
                             HStack(spacing: 16) {
-                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f",
-                                     wb.meanR / max(wb.meanG, 1), wb.meanB / max(wb.meanG, 1)),
-                                     "以绿色为 1，红比蓝高偏暖，蓝比红高偏冷，接近 1:1 为中性。")
+                                let rr = wb.meanR / max(wb.meanG, 1)
+                                let bb = wb.meanB / max(wb.meanG, 1)
+                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f  %@",
+                                     rr, bb, colorBiasText(r: rr, b: bb)),
+                                     "以绿色为 1，红比蓝高偏暖（偏黄），蓝比红高偏冷（偏蓝），接近 1:1 为中性。")
                                 if let fr = wb.faceRG, let fb = wb.faceBG {
                                     metricCell("人脸偏色 红:蓝", String(format: "%.2f : %.2f", fr, fb),
                                                "只看人脸区域的红蓝比例，参考肤色是否偏色。")
@@ -2630,4 +2654,16 @@ struct FocusScreenerApp: App {
         }
         .defaultSize(width: 1060, height: 700)
     }
+}
+
+/// 把「红:蓝」比例（以绿=1）翻成人话结论，直接告诉用户偏黄还是偏蓝。
+/// 红多于蓝 → 暖（偏黄/偏红），蓝多于红 → 冷（偏蓝），接近相等 → 中性。
+/// 阈值 0.06 来自经验：肉眼可察觉的色偏大致从 6% 差异起。
+func colorBiasText(r: Double, b: Double) -> String {
+    let d = r - b
+    if d > 0.20 { return "明显偏黄（暖）" }
+    if d > 0.06 { return "偏黄（暖）" }
+    if d < -0.20 { return "明显偏蓝（冷）" }
+    if d < -0.06 { return "偏蓝（冷）" }
+    return "接近中性"
 }

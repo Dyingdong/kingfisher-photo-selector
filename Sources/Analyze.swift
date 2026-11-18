@@ -349,3 +349,60 @@ enum Analyzer {
         }
     }
 }
+
+
+/// 手动对焦失误诊断【只提示、不改判定、不改评分】。
+/// 场景：相机合焦点落在主体上（或主体附近），但那一点并不锐，画面别处却很锐——
+/// 说明焦点落在了主体前后（手动对焦时没拧到位 / 自动对焦被前景骗了），主体自然虚。
+/// 目的是让用户据此排除这类片子；故意虚化主体的照片也会命中，所以只给线索不自动delete。
+struct FocusMissDiagnosis {
+    let suspected: Bool      // 是否疑似对焦落点失误
+    let short: String        // 短标签
+    let detail: String       // 白话解释
+}
+
+enum FocusMiss {
+    /// 判据（真值复盘后收紧）：
+    /// 1. 必须有相机合焦点数据（无数据不能猜）；
+    /// 2. 画面别处确实很锐（最锐块 ≥ 合格线，说明不是整体发虚）；
+    /// 3. 对焦点处的锐度明显低于最锐处（< 35%，说明焦点没对到实处）；
+    /// 4. 最锐块离合焦点有距离（≥ 8% 画幅，避免把对焦点附近的小抖动当失误）；
+    /// 5. 主体本身不锐（显示锐度比 < 25%，确认主体确实虚了）。
+    static func diagnose(_ m: PhotoMetrics, af: AFInfo?, verdict: Verdict) -> FocusMissDiagnosis {
+        guard let af = af, let p = af.points.first, !af.points.isEmpty else {
+            return FocusMissDiagnosis(suspected: false, short: "无对焦数据",
+                                      detail: "这张照片没有相机合焦点记录，无法判断对焦是否拧到位")
+        }
+        let xPct = Int(p.cx * 100), yPct = Int(p.cy * 100)
+        let pos = "横向\(xPct)%／纵向\(yPct)%"
+        let peak = m.peakBlock
+        guard peak >= Analyzer.independentFloor, m.scores.count == m.cols * m.rows else {
+            return FocusMissDiagnosis(suspected: false, short: "全片偏软",
+                                      detail: "整张照片都不够锐（最锐处 \(Int(peak))），不像是对焦点拧偏，更像整体没对上")
+        }
+        let fc = min(m.cols - 1, max(0, Int(p.cx * Double(m.cols))))
+        let fr = min(m.rows - 1, max(0, Int(p.cy * Double(m.rows))))
+        let focusSharp = m.scores[fr * m.cols + fc]
+        let focusRatio = focusSharp / peak
+        // 最锐块的位置
+        var peakIdx = 0
+        for i in 1..<m.scores.count where m.scores[i] > m.scores[peakIdx] { peakIdx = i }
+        let pc = (Double(peakIdx % m.cols) + 0.5) / Double(m.cols)
+        let pr = (Double(peakIdx / m.cols) + 0.5) / Double(m.rows)
+        let dist = hypot(pc - p.cx, pr - p.cy)
+        let subject = m.displaySubjectRatio
+
+        let miss = verdict.isSuspect && focusRatio < 0.35 && dist >= 0.08 && subject < 0.25
+        if miss {
+            return FocusMissDiagnosis(
+                suspected: true, short: "疑似对焦拧偏",
+                detail: "合焦点在\(pos)，但那一点只有全图最锐处的 \(Int(focusRatio * 100))%；"
+                      + "最锐的地方离合焦点约 \(Int(dist * 100))% 画幅，主体也只有 \(Int(subject * 100))%。"
+                      + "像是手动对焦没拧到位（焦点落在主体前后）。注意：故意虚化主体的照片也会这样，请自行确认")
+        }
+        return FocusMissDiagnosis(
+            suspected: false, short: "未见明显拧偏",
+            detail: "合焦点在\(pos)，焦点处锐度是最锐处的 \(Int(focusRatio * 100))%，"
+                  + "离最锐处约 \(Int(dist * 100))% 画幅。没有明显的对焦点落空迹象")
+    }
+}

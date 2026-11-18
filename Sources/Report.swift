@@ -11,6 +11,8 @@ enum Report {
         // 题材与评分（App 导出时填写；命令行工具没算题材则为空）。
         // 刻意追加在末尾，不打乱前面列的顺序——verify.py / score 探针按列号读人工真值。
         "自动题材", "题材依据", "最终题材", "人工指定", "建议星级", "综合分",
+        // 对焦失误提示（只提示、不改判定）：疑似焦点拧偏时给出线索，供人工排除。
+        "对焦失误提示", "对焦失误说明",
     ]
 
     /// 每张照片的题材/评分摘要，由 App 在导出前算好传入。
@@ -42,7 +44,8 @@ enum Report {
 
     static func csv(_ results: [PhotoResult], hiMin: Double, sensitivity: Double,
                     anchor: Double? = nil,
-                    genres: [URL: GenreRecord] = [:]) -> String {
+                    genres: [URL: GenreRecord] = [:],
+                    focusMiss: [URL: FocusMissDiagnosis] = [:]) -> String {
         var lines = [columns.joined(separator: ",")]
         for r in results {
             let m = r.metrics
@@ -60,6 +63,7 @@ enum Report {
                 q(g?.autoGenre ?? ""), q(g?.reason ?? ""), q(g?.finalGenre ?? ""),
                 q(g?.manualGenre ?? ""),
                 g.map { String($0.stars) } ?? "", g.map { String($0.total) } ?? "",
+                q(focusMiss[r.id]?.short ?? ""), q(focusMiss[r.id]?.detail ?? ""),
             ]
             lines.append(fields.joined(separator: ","))
         }

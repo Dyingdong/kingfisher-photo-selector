@@ -68,17 +68,24 @@ enum GenreMemory {
                                 : display.lowercased()
     }
 
-    /// 匹配条件：top 标签一致且另有 ≥1 个标签重合，或总重合 ≥3 个。
+    /// 匹配条件（收紧后）：top 标签一致且总重合 ≥2，或总重合 ≥3。
+    /// 单个通用标签（如 blue_sky / water）不算数——真值复盘显示旧条件
+    /// 「top 一致 + 重合≥1」让一次「天空片改人像」污染了 44 张本该算法判的照片。
+    /// 另外要求至少 2 条样本支持同一判断（一条纠正不足以推广）。
     /// 返回 nil 表示没有足够相似的纠正样本。
-    static func suggest(query: (top: String, labels: [String]),
+    static func suggest(query: (top: String, labels: [String], machineGenre: String),
                         samples: [GenreCorrectionSample]) -> (genre: String, count: Int)? {
         guard !query.labels.isEmpty else { return nil }
         let matched = samples.filter { s in
+            // 只在同一机器误判模式下套用：用户当时把「机器判拍鸟」纠正成人像，
+            // 就只能影响机器也判拍鸟的照片；机器已判风光的说明场景不同，别覆盖。
+            if !query.machineGenre.isEmpty, !s.machineGenre.isEmpty,
+               s.machineGenre != query.machineGenre { return false }
             let common = Set(s.labels).intersection(query.labels).count
             let topMatch = !s.topLabel.isEmpty && s.topLabel == query.top
-            return (topMatch && common >= 1) || common >= 3
+            return (topMatch && common >= 2) || common >= 3
         }
-        guard !matched.isEmpty else { return nil }
+        guard matched.count >= 2 else { return nil }
         // 按用户判的题材分组取多数；并列时取最近一次。
         var counts: [String: (n: Int, latest: Date)] = [:]
         for s in matched {
@@ -91,7 +98,7 @@ enum GenreMemory {
             $0.value.n != $1.value.n ? $0.value.n < $1.value.n
                                      : $0.value.latest < $1.value.latest
         }
-        guard let best = best else { return nil }
+        guard let best = best, best.value.n >= 2 else { return nil }
         return (best.key, best.value.n)
     }
 
