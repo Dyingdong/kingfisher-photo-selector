@@ -1040,7 +1040,13 @@ struct DetailView: View {
                     .frame(width: fitW, height: fitH)
                     .scaleEffect(scale, anchor: .center)
                     .offset(x: (0.5 - store.zoomCenter.x) * fitW * scale + store.panOffset.width,
-                            y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height)
+                            y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height
+                                // 图片层默认在预览区里居中；但手势换算用的是 (ox, oy)。
+                                // 拖分隔条时预览区高度变化，若靠居中，图片中心会跟着预览区中心
+                                // 上下移动（就是"画面跳动"）。冻结期间 oy 固定，这里补偿掉
+                                // 居中的位置漂移，使渲染位置与 displayedImageRect / oy 完全一致。
+                                // 未冻结时 oy 就等于居中值，补偿为 0，不改变正常行为。
+                                + (oy - (geo.size.height - fitH) / 2))
 
                     if let s = store.dragStart, let c = store.dragCurrent {
                         Rectangle().stroke(store.dragIsZoom ? Color.yellow : Color.cyan, lineWidth: 2)
