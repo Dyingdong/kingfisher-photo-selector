@@ -18,9 +18,46 @@ struct ExifInfo {
     let exposureMode: String?
 
     /// 一行核心参数：ISO 3200 · 1/2000s · f/9 · 672mm
+    /// 佳能半画幅微单的焦距额外带等效值（×1.6），全画幅保持原样。
     var coreLine: String {
-        let parts = [iso.map { "ISO \($0)" }, shutter, aperture, focalLength]
+        let focal = focalLength.map { f in
+            if let eq = equivalentFocal { return "\(f)（\(eq)）" }
+            return f
+        }
+        let parts = [iso.map { "ISO \($0)" }, shutter, aperture, focal]
         return parts.compactMap { $0 }.joined(separator: "  ·  ")
+    }
+
+    /// 等效焦距文本（如「等效 320mm」）。只对佳能 APS-C 半画幅微单显示，
+    /// 全画幅、其他品牌、无焦距数据时返回 nil —— 界面据此完全不显示这一项。
+    /// 目前只支持佳能微单，按机型字符串识别，不猜测其他品牌。
+    var equivalentFocal: String? {
+        guard let model = camera, Self.isCanonAPSCMirrorless(model),
+              let f = Self.focalNumber(focalLength), f > 0 else { return nil }
+        return "等效 \(Int((f * 1.6).rounded()))mm"
+    }
+
+    /// 佳能 APS-C 半画幅微单机型（含 EOS R 系列与 EOS M 系列）。系数统一 1.6。
+    /// 用「去掉空格后的型号串 contains 关键词」判断，能覆盖 Mark II / V 等后缀。
+    private static let canonAPSCTokens = ["R7", "R50", "R10", "R100",
+                                          "M50", "M6", "M10", "M100", "M200", "M5", "M3"]
+    private static func isCanonAPSCMirrorless(_ model: String) -> Bool {
+        let m = model.uppercased().filter { !$0.isWhitespace }
+        // 必须是佳能机型，避免别家型号里恰好含 R5/M5 之类被误判。
+        guard m.contains("CANON") else { return false }
+        return canonAPSCTokens.contains { m.contains($0) }
+    }
+
+    private static func focalNumber(_ s: String?) -> Double? {
+        guard let s = s else { return nil }
+        var cur = ""
+        var best = 0.0
+        func flush() { if let v = Double(cur), v > 0 { best = max(best, v) }; cur = "" }
+        for ch in s {
+            if ch.isNumber || ch == "." { cur.append(ch) } else { flush() }
+        }
+        flush()
+        return best > 0 ? best : nil
     }
 
     /// 次要信息：测光 · 曝光模式 · 白平衡 · 闪光灯

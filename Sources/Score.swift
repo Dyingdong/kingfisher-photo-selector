@@ -74,15 +74,16 @@ enum ScoreEngine {
     // MARK: 题材自动识别
 
     /// 自动猜题材，返回 (题材, 识别依据)。依据会显示在界面上，方便核对为什么这么判。
-    /// 规则按优先级（每条都不依赖主体定位方式，避免「长焦打鸟却因主体框大被判风光」）：
-    /// 1) 明确的人脸信号 → 人像（优先，防止长焦人像被误判成鸟）；
-    /// 2) 打鸟镜头 / 超长焦（≥300mm）→ 拍鸟；
-    /// 3) 中长焦（200~300mm）且有识别主体 → 拍鸟；
-    /// 4) 前景小主体 → 拍鸟；
-    /// 5) 其余 → 风光。
+    /// 规则按优先级 —— 对焦点语义优先（用户要求），其余沿用原有逻辑：
+    /// 1) 对焦点处识别到人脸 / 相机在人脸对焦模式 → 人像；
+    /// 2) 对焦点处识别到鸟或鸟种 → 拍鸟；
+    /// 3) 对焦点处明确识别到别的东西（水面/山/建筑等，典型是「长焦拍风光」）→ 风光；
+    /// 4) 对焦点识别不出来（unknown）才退回原有规则：
+    ///    前景小主体 / 打鸟镜头 / 超长焦 → 拍鸟；有人脸信号 → 人像；其余 → 风光。
     /// 只是「猜测」，界面明确标注并允许用户手动改。
     static func guessGenre(m: PhotoMetrics, af: AFInfo?, wb: WhiteBalanceStats?,
-                           exif: ExifInfo?) -> (PhotoGenre, String) {
+                           exif: ExifInfo?,
+                           focus: FocusSemantics? = nil) -> (PhotoGenre, String) {
         var subjectArea = 0.0
         for b in m.bboxes { subjectArea += Double(b.width * b.height) }
 
@@ -92,26 +93,42 @@ enum ScoreEngine {
             || m.subjectSource == "人脸检测"
             || m.subjectSource == "显著性区域"
 
-        // 1) 人脸优先：长焦也能拍人，先把人像摘出来。
+        // —— 第一优先级：对焦点处的语义判断（只要识别出来了，就以此为准）——
+        if let focus = focus {
+            switch focus.kind {
+            case .face:
+                return (.portrait, focus.reason)
+            case .bird:
+                return (.bird, focus.reason)
+            case .nonBird:
+                // 焦点落在明确非鸟的东西上：典型是长焦拍风光，哪怕镜头是打鸟头也不算拍鸟。
+                return (.landscape, focus.reason)
+            case .unknown:
+                break   // 识别不出来，交回下面的原有规则
+            }
+        }
+
+        // —— 以下为原有规则（对焦点 unknown / 无数据时兜底）——
+        // 人脸优先：长焦也能拍人，先把人像摘出来。
         let faceMode = af?.modeName.contains("人脸") ?? false
         if wb?.faceRG != nil || m.subjectSource == "人脸检测" || faceMode {
             let why = faceMode ? "相机用人脸对焦模式" : "检测到人脸"
             return (.portrait, why)
         }
 
-        // 2) 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
+        // 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
         if lensMax >= 400 || focal >= 300 {
             let bits = [focal > 0 ? "焦距 \(Int(focal))mm" : nil,
                         exif?.lens].compactMap { $0 }
             return (.bird, bits.joined(separator: " · "))
         }
 
-        // 3) 中长焦 200~300mm 且有主体：多数是生态/打鸟。
+        // 中长焦 200~300mm 且有主体：多数是生态/打鸟。
         if focal >= 200 && focal < 300 && hasForeground {
             return (.bird, "中长焦 \(Int(focal))mm 且有识别主体")
         }
 
-        // 4) 前景小主体（小鸟占画面很小一块）。
+        // 前景小主体（小鸟占画面很小一块）。
         if m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.25 {
             return (.bird, "前景主体只占画面 \(Int(subjectArea * 100))%")
         }

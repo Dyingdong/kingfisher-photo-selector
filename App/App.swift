@@ -117,12 +117,16 @@ final class Store: ObservableObject {
     @Published var afLoading: Set<URL> = []
     @Published var afAttempted: Set<URL> = []
     @Published var exifCache: [URL: ExifInfo] = [:]
+    /// 对焦点处语义（人脸/鸟/其他），用于题材识别；随 AF 加载后异步算一次。
+    @Published var focusCache: [URL: FocusSemantics] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
     /// 构图辅助线：九宫格与对角线，各自独立、默认关闭，可同时开启叠加。
     @Published var showThirds = false
     @Published var showDiagonals = false
+    /// 信息区位置：false=预览下方（默认，保持原样）；true=画面最右侧竖排。
+    @Published var infoOnRight = false
     /// 题材人工覆盖：用户改过题材的照片存这里；没有覆盖的自动识别。
     @Published var genreOverride: [URL: PhotoGenre] = [:]
     /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
@@ -241,6 +245,7 @@ final class Store: ObservableObject {
         afLoading = []
         afAttempted = []
         exifCache = [:]
+        focusCache = [:]
         ratingCache = [:]
         genreOverride = [:]
         heatCache = [:]
@@ -352,6 +357,15 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 对焦点语义：算一次缓存住。结果只影响题材识别，不算出来也能用原有规则。
+    func ensureFocus(for url: URL) {
+        guard focusCache[url] == nil else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let s = FocusSemanticsEngine.detect(url: url)
+            DispatchQueue.main.async { self.focusCache[url] = s }
+        }
+    }
+
     func ensureRating(for url: URL) {
         guard ratingCache[url] == nil else { return }
         DispatchQueue.global(qos: .utility).async {
@@ -390,7 +404,8 @@ final class Store: ObservableObject {
     func genre(for r: PhotoResult) -> (PhotoGenre, Bool, String) {
         if let g = genreOverride[r.id] { return (g, false, "手动指定") }
         let (g, why) = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
-                                              wb: wbCache[r.id], exif: exifCache[r.id])
+                                              wb: wbCache[r.id], exif: exifCache[r.id],
+                                              focus: focusCache[r.id])
         return (g, true, why)
     }
 
@@ -492,6 +507,7 @@ final class Store: ObservableObject {
         metrics.removeAll { removedURLs.contains($0.url) }
         for key in removedURLs {
             wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
+            focusCache[key] = nil
             genreOverride[key] = nil
             afLoading.remove(key); afAttempted.remove(key)
             heatCache[key] = nil; baseCache[key] = nil
@@ -1362,6 +1378,8 @@ private struct ScorePanel: View {
     @EnvironmentObject var store: Store
     let r: PhotoResult
     let score: PhotoScore
+    /// 右侧竖排窄栏用紧凑布局；默认 false 保持原样。
+    var compact = false
 
     /// 题材选择：auto 表示恢复自动识别，其余为人工覆盖。
     private var genreBinding: Binding<String> {
@@ -1403,33 +1421,73 @@ private struct ScorePanel: View {
         }
     }
 
+    /// 星星 + 综合分
+    private var starsBlock: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                ForEach(1...5, id: \.self) { n in
+                    Image(systemName: n <= score.stars ? "star.fill" : "star")
+                        .foregroundColor(n <= score.stars ? starColor : .gray)
+                }
+                Text("\(score.stars) 星").font(.headline).foregroundColor(starColor)
+            }
+            Text("综合 \(Int(score.total.rounded())) 分").font(.caption)
+                .foregroundColor(.secondary).monospacedDigit()
+        }
+    }
+
+    /// 「采用建议」按钮 + 当前星级（紧挨星星行右侧，看完星一眼写入）
+    private var adoptBlock: some View {
+        HStack(spacing: 8) {
+            Button {
+                store.setRating(r.id, rating: score.stars)
+            } label: {
+                Label("采用建议：打 \(score.stars) 星", systemImage: "checkmark.circle")
+            }
+            .buttonStyle(.borderedProminent).controlSize(.small)
+            .help("把建议星级写入现有 Bridge 评分（xmp:Rating），随时可在最上面的评分条手动改")
+            if store.ratingCache[r.id] != nil {
+                Text("当前 \(store.ratingCache[r.id]! == -1 ? "拒绝" : "\(store.ratingCache[r.id]!) 星")")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// 题材选择 + 识别依据
+    private var genreBlock: some View {
+        VStack(alignment: compact ? .leading : .trailing, spacing: 2) {
+            Picker("", selection: genreBinding) {
+                Text("自动识别（\(score.genre.rawValue)）").tag("auto")
+                ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+            }
+            .pickerStyle(.menu).frame(width: compact ? 220 : 168)
+            Text(score.genreIsGuess ? "自动识别依据：\(score.genreReason)"
+                                    : "题材已手动指定")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(score.genreIsGuess
+                      ? "软件按「\(score.genreReason)」判为该题材；不准可在上面手动改"
+                      : "你已手动指定题材，评分权重按该题材计算")
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        ForEach(1...5, id: \.self) { n in
-                            Image(systemName: n <= score.stars ? "star.fill" : "star")
-                                .foregroundColor(n <= score.stars ? starColor : .gray)
-                        }
-                        Text("\(score.stars) 星").font(.headline).foregroundColor(starColor)
+            Group {
+                if compact {
+                    // 右侧窄栏：星星、按钮、题材依次分行，避免挤在一起。
+                    VStack(alignment: .leading, spacing: 8) {
+                        starsBlock
+                        adoptBlock
+                        genreBlock
                     }
-                    Text("综合 \(Int(score.total.rounded())) 分").font(.caption)
-                        .foregroundColor(.secondary).monospacedDigit()
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Picker("", selection: genreBinding) {
-                        Text("自动识别（\(score.genre.rawValue)）").tag("auto")
-                        ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+                } else {
+                    HStack(alignment: .center, spacing: 12) {
+                        starsBlock
+                        adoptBlock
+                        Spacer()
+                        genreBlock
                     }
-                    .pickerStyle(.menu).frame(width: 168)
-                    Text(score.genreIsGuess ? "自动识别依据：\(score.genreReason)"
-                                            : "题材已手动指定")
-                        .font(.caption2).foregroundColor(.secondary)
-                        .help(score.genreIsGuess
-                              ? "软件按「\(score.genreReason)」判为该题材；不准可在上面手动改"
-                              : "你已手动指定题材，评分权重按该题材计算")
                 }
             }
 
@@ -1439,25 +1497,13 @@ private struct ScorePanel: View {
                 ForEach(score.parts) { p in bar(p) }
             }
 
-            HStack(spacing: 10) {
-                Button {
-                    store.setRating(r.id, rating: score.stars)
-                } label: {
-                    Label("采用建议：打 \(score.stars) 星", systemImage: "checkmark.circle")
-                }
-                .buttonStyle(.borderedProminent).controlSize(.small)
-                .help("把上面的建议星级写入现有 Bridge 评分（xmp:Rating），随时可在最上面的评分条手动改")
-
-                if store.ratingCache[r.id] != nil {
-                    Text("当前 \(store.ratingCache[r.id]! == -1 ? "拒绝" : "\(store.ratingCache[r.id]!) 星")")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer()
-                if r.verdict.isSuspect {
+            if r.verdict.isSuspect {
+                HStack(spacing: 10) {
                     Button(store.excluded.contains(r.id) ? "已排除写入" : "排除写入") {
                         store.toggleExclude(r.id)
                     }
                     .buttonStyle(.borderless).font(.caption)
+                    Spacer()
                 }
             }
 
@@ -1474,13 +1520,15 @@ private struct ScorePanel: View {
 struct InfoView: View {
     @EnvironmentObject var store: Store
     let r: PhotoResult
+    /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
+    var compact = false
 
     private func cell(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundColor(.secondary)
-            Text(value).font(.callout).monospacedDigit().lineLimit(1)
+            Text(title).font(compact ? .caption2 : .caption2).foregroundColor(.secondary)
+            Text(value).font(compact ? .caption : .callout).monospacedDigit().lineLimit(1)
         }
-        .frame(minWidth: 120, alignment: .leading)
+        .frame(minWidth: compact ? 96 : 120, alignment: .leading)
     }
 
     /// 通俗命名的指标格：鼠标悬停显示大白话解释。
@@ -1553,11 +1601,22 @@ struct InfoView: View {
                         if !exif.coreLine.isEmpty {
                             Text(exif.coreLine).font(.callout).monospacedDigit()
                         }
-                        HStack(spacing: 16) {
-                            cell("相机", exif.camera ?? "—")
-                            cell("镜头", exif.lens ?? "—")
-                            cell("曝光补偿", exif.exposureBias ?? "—")
-                            cell("拍摄时间", exif.dateTime ?? "—")
+                        if compact {
+                            LazyVGrid(columns: [GridItem(.flexible(minimum: 120), spacing: 10),
+                                                GridItem(.flexible(minimum: 120))],
+                                      alignment: .leading, spacing: 8) {
+                                cell("相机", exif.camera ?? "—")
+                                cell("镜头", exif.lens ?? "—")
+                                cell("曝光补偿", exif.exposureBias ?? "—")
+                                cell("拍摄时间", exif.dateTime ?? "—")
+                            }
+                        } else {
+                            HStack(spacing: 16) {
+                                cell("相机", exif.camera ?? "—")
+                                cell("镜头", exif.lens ?? "—")
+                                cell("曝光补偿", exif.exposureBias ?? "—")
+                                cell("拍摄时间", exif.dateTime ?? "—")
+                            }
                         }
                         if !exif.detailLine.isEmpty {
                             Text(exif.detailLine).font(.caption2).foregroundColor(.secondary)
@@ -1570,7 +1629,7 @@ struct InfoView: View {
                 Divider()
 
                 // 3) 综合评分：建议星级 + 题材 + 各维度，替换原合焦结论块
-                ScorePanel(r: r, score: store.score(for: r))
+                ScorePanel(r: r, score: store.score(for: r), compact: compact)
 
                 Divider()
 
@@ -1661,12 +1720,14 @@ struct InfoView: View {
             store.ensureWB(for: r.id)
             store.ensureAF(for: r.id)
             store.ensureExif(for: r.id)
+            store.ensureFocus(for: r.id)
             store.ensureRating(for: r.id)
         }
         .onChange(of: r.id) { u in
             store.ensureWB(for: u)
             store.ensureAF(for: u)
             store.ensureExif(for: u)
+            store.ensureFocus(for: u)
             store.ensureRating(for: u)
         }
     }
@@ -1736,6 +1797,36 @@ struct ShortcutsView: View {
 struct ContentView: View {
     @EnvironmentObject var store: Store
 
+    /// 预览窗格：选中照片时是 DetailView，否则是空态提示。两种布局共用。
+    @ViewBuilder
+    private var previewPane: some View {
+        if let id = store.selected,
+           let r = store.results.first(where: { $0.id == id }) {
+            DetailView(r: r)
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .font(.system(size: 44)).foregroundColor(.secondary)
+                Text("拖入照片文件夹即可开始筛选")
+                    .foregroundColor(.secondary)
+                Text("RAW 原片不会被修改，只生成同名 .xmp 侧车")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// 信息窗格：compact=true 时元素紧凑排列（用于右侧竖排窄栏）。
+    @ViewBuilder
+    private func infoPane(compact: Bool) -> some View {
+        if let id = store.selected,
+           let r = store.results.first(where: { $0.id == id }) {
+            InfoView(r: r, compact: compact)
+        } else {
+            Text("选中照片后显示清晰度、白平衡等信息")
+                .foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -1745,6 +1836,11 @@ struct ContentView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
+                Button(store.infoOnRight ? "信息区：右侧" : "信息区：下方") {
+                    store.infoOnRight.toggle()
+                }
+                .font(.caption)
+                .help("切换信息区位置：默认在预览下方；点一下竖排到画面最右侧")
                 Button("快捷键") { store.showShortcuts = true }.font(.caption)
                 Button("选择文件夹") { pickFolder() }
                 Button("导出 CSV 报告") { store.exportCSV() }
@@ -1769,61 +1865,54 @@ struct ContentView: View {
                 .frame(minWidth: 90, idealWidth: 100, maxWidth: 240)
                 .frame(maxHeight: .infinity)
 
-                // 预览区弹性 + 信息区固定高度 + 可拖动分隔条。
-                // 高度完全由 store.infoHeight 驱动：导入新素材时重置为默认值（显示到合焦），
-                // 同序列内切照片/重算不动它 → 用户调好的比例一直保持。
-                GeometryReader { region in
-                    let totalH = region.size.height
-                    let dividerH: CGFloat = 8
-                    let minTop: CGFloat = 200
-                    let minBottom: CGFloat = 170
-                    let maxBottom = max(minBottom, totalH - dividerH - minTop)
-                    let bottomH = min(max(store.infoHeight, minBottom), maxBottom)
-                    let topH = max(minTop, totalH - dividerH - bottomH)
-                    // 每帧把分隔条几何交给左键桥接（非 @Published，不触发重算）。
-                    // 分隔条拖动已改由 AppKit 绝对坐标处理，不再用 SwiftUI DragGesture。
-                    let _ = store.setDividerContext(bottomH: bottomH, min: minBottom, max: maxBottom)
-                    VStack(spacing: 0) {
-                        Group {
-                            if let id = store.selected,
-                               let r = store.results.first(where: { $0.id == id }) {
-                                DetailView(r: r)
-                            } else {
-                                VStack(spacing: 10) {
-                                    Image(systemName: "photo.on.rectangle.angled")
-                                        .font(.system(size: 44)).foregroundColor(.secondary)
-                                    Text("拖入照片文件夹即可开始筛选")
-                                        .foregroundColor(.secondary)
-                                    Text("RAW 原片不会被修改，只生成同名 .xmp 侧车")
-                                        .font(.caption).foregroundColor(.secondary)
-                                }
+                // 右侧区域两种布局：
+                // - 默认（infoOnRight=false）：预览在上、信息区在下、可拖分隔条 —— 完全保持原样；
+                // - infoOnRight=true：预览占中间、信息区竖排到最右侧，宽度可拖。
+                Group {
+                    if store.infoOnRight {
+                        HSplitView {
+                            previewPane
+                                .frame(minWidth: 420, idealWidth: 760, maxWidth: .infinity)
+                                .frame(maxHeight: .infinity)
+                            infoPane(compact: true)
+                                .frame(minWidth: 300, idealWidth: 380, maxWidth: 560)
+                                .frame(maxHeight: .infinity)
+                        }
+                    } else {
+                        // 预览区弹性 + 信息区固定高度 + 可拖动分隔条。
+                        // 高度完全由 store.infoHeight 驱动：导入新素材时重置为默认值（显示到合焦），
+                        // 同序列内切照片/重算不动它 → 用户调好的比例一直保持。
+                        GeometryReader { region in
+                            let totalH = region.size.height
+                            let dividerH: CGFloat = 8
+                            let minTop: CGFloat = 200
+                            let minBottom: CGFloat = 170
+                            let maxBottom = max(minBottom, totalH - dividerH - minTop)
+                            let bottomH = min(max(store.infoHeight, minBottom), maxBottom)
+                            let topH = max(minTop, totalH - dividerH - bottomH)
+                            // 每帧把分隔条几何交给左键桥接（非 @Published，不触发重算）。
+                            // 分隔条拖动已改由 AppKit 绝对坐标处理，不再用 SwiftUI DragGesture。
+                            let _ = store.setDividerContext(bottomH: bottomH, min: minBottom, max: maxBottom)
+                            VStack(spacing: 0) {
+                                previewPane
+                                    .frame(height: topH)
+                                    .frame(maxWidth: .infinity)
+
+                                // 分隔条仅作视觉；拖动由 DetailView 内的左键桥接统一处理。
+                                Rectangle()
+                                    .fill(Color.gray.opacity(0.28))
+                                    .frame(height: dividerH)
+                                    .frame(maxWidth: .infinity)
+                                    .onHover { hovering in
+                                        if hovering { NSCursor.resizeUpDown.push() }
+                                        else { NSCursor.resizeUpDown.pop() }
+                                    }
+
+                                infoPane(compact: false)
+                                    .frame(height: bottomH)
+                                    .frame(maxWidth: .infinity)
                             }
                         }
-                        .frame(height: topH)
-                        .frame(maxWidth: .infinity)
-
-                        // 分隔条仅作视觉；拖动由 DetailView 内的左键桥接统一处理。
-                        // 这样手势基准是 AppKit 绝对坐标，不会因视图随 infoHeight 移动而漂移。
-                        Rectangle()
-                            .fill(Color.gray.opacity(0.28))
-                            .frame(height: dividerH)
-                            .frame(maxWidth: .infinity)
-                            .onHover { hovering in
-                                if hovering { NSCursor.resizeUpDown.push() }
-                                else { NSCursor.resizeUpDown.pop() }
-                            }
-
-                        Group {
-                            if let id = store.selected,
-                               let r = store.results.first(where: { $0.id == id }) {
-                                InfoView(r: r)
-                            } else {
-                                Text("选中照片后显示清晰度、白平衡等信息")
-                                    .foregroundColor(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
-                        }
-                        .frame(height: bottomH)
-                        .frame(maxWidth: .infinity)
                     }
                 }
                 .frame(minWidth: 480, idealWidth: 820, maxWidth: .infinity)
