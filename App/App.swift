@@ -42,6 +42,7 @@ enum DragAction {
     case zoom      // 框选放大
     case subject   // 圈选主体重判
     case pan       // 平移画面（按住左键拖动 / 空格）
+    case divider   // 拖动分隔条（在预览区外、下方的 8pt 区域）
 }
 
 /// 用户可自定义的快捷键，持久化到 UserDefaults。
@@ -124,6 +125,11 @@ final class Store: ObservableObject {
     /// 拖分隔条期间锁定照片的显示高度与相对预览区顶部的偏移，
     /// 使照片不随预览区高度伸缩（这是"拖分区时画面跳动"的来源）。
     @Published var frozenFit: (height: CGFloat, top: CGFloat)?
+    /// 分隔条拖动上下文：由外层 GeometryReader 每帧写入，供 AppKit 事件桥接读取。
+    /// 非 @Published —— 写值不触发 body 重算，避免布局/事件互相反馈。
+    var dividerInfoHeight: CGFloat = Store.defaultInfoHeight
+    var dividerMinBottom: CGFloat = 170
+    var dividerMaxBottom: CGFloat = 2000
     /// 预览区每帧记录的自然 fit（非 @Published，避免赋值触发 UI 重算）。
     /// 分隔条按下时冻结它，即可得到"拖动前一刻"的照片尺寸。
     var lastNaturalFit: (height: CGFloat, top: CGFloat)?
@@ -133,6 +139,13 @@ final class Store: ObservableObject {
     }
     func freezeCurrentFit() { frozenFit = lastNaturalFit }
     func endFitFreeze() { frozenFit = nil }
+    /// 外层布局每帧写入分隔条的当前几何，供左键桥接做绝对坐标换算。
+    /// 非 @Published：写值本身不触发 UI 重算。
+    func setDividerContext(bottomH: CGFloat, min: CGFloat, max: CGFloat) {
+        dividerInfoHeight = bottomH
+        dividerMinBottom = min
+        dividerMaxBottom = max
+    }
     /// 可自定义的快捷键（框选放大 / 圈选主体的修饰键）。
     @Published var shortcuts = ShortcutSettings.load()
     /// 快捷键设置面板是否显示。
@@ -704,8 +717,13 @@ enum LeftMouseGesture {
 struct LeftMouseBridge: NSViewRepresentable {
     var zoomFlag: NSEvent.ModifierFlags
     var subjectFlag: NSEvent.ModifierFlags
-    /// 返回 true 时完全放行左键事件（正在拖动分隔条），避免误判为平移。
+    /// 返回 true 时完全放行左键事件，避免误判为平移。
     var isSuppressed: () -> Bool = { false }
+    /// 分隔条拖动：按下时返回当前信息区高度作为绝对基准。
+    var dividerBegin: () -> CGFloat = { 0 }
+    /// 传入由鼠标绝对位移算出的目标高度，外部负责 clamp 并写入状态。
+    var dividerDrag: (CGFloat) -> Void = { _ in }
+    var dividerEnd: () -> Void = {}
     var onGesture: (LeftMouseGesture) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -721,6 +739,9 @@ struct LeftMouseBridge: NSViewRepresentable {
         c?.subjectFlag = subjectFlag
         c?.isSuppressed = isSuppressed
         c?.onGesture = onGesture
+        c?.dividerBegin = dividerBegin
+        c?.dividerDrag = dividerDrag
+        c?.dividerEnd = dividerEnd
     }
 
     final class Coordinator {
@@ -728,6 +749,9 @@ struct LeftMouseBridge: NSViewRepresentable {
         var subjectFlag: NSEvent.ModifierFlags = .control
         var isSuppressed: (() -> Bool)?
         var onGesture: ((LeftMouseGesture) -> Void)?
+        var dividerBegin: (() -> CGFloat)?
+        var dividerDrag: ((CGFloat) -> Void)?
+        var dividerEnd: (() -> Void)?
     }
 
     final class LeftMouseNSView: NSView {
@@ -739,6 +763,9 @@ struct LeftMouseBridge: NSViewRepresentable {
         private var action: DragAction?
         private var start: CGPoint?
         private var last: CGPoint?
+        /// 分隔条拖动的绝对基准：起始鼠标 y（预览区坐标）与起始信息区高度。
+        private var dividerStartY: CGFloat = 0
+        private var dividerStartH: CGFloat = 0
         /// 双击的第二下按下已处理，紧随其后的 mouseUp 直接吞掉，避免孤儿事件。
         private var swallowNextUp = false
 
@@ -765,12 +792,37 @@ struct LeftMouseBridge: NSViewRepresentable {
                 matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
             ) { [weak self] e in
                 guard let self, let win = self.window, e.window === win else { return e }
+                let p = self.convert(e.locationInWindow, from: nil)
+                guard self.bounds.width > 0 else { return e }
+
+                // 分隔条紧贴在预览区正下方（dividerH=8），给 14pt 命中容差。
+                // 用 AppKit 绝对坐标处理：SwiftUI DragGesture 的位移基准会随
+                // 承载视图移动而漂移，正是"拖分隔条时信息区与画面来回跳"的根因。
+                let inDivider = p.x >= 0 && p.x <= self.bounds.width && p.y >= -10 && p.y < 0
+                if inDivider, e.type == .leftMouseDown {
+                    self.action = .divider
+                    self.dividerStartY = p.y
+                    self.dividerStartH = self.coordinator?.dividerBegin?() ?? 0
+                    return nil
+                }
+                if self.action == .divider {
+                    switch e.type {
+                    case .leftMouseDragged:
+                        // AppKit 坐标 y 向上：鼠标上移 → 信息区变高（与旧手势语义一致）。
+                        self.coordinator?.dividerDrag?(self.dividerStartH + (p.y - self.dividerStartY))
+                    case .leftMouseUp:
+                        self.action = nil
+                        self.coordinator?.dividerEnd?()
+                    default: break
+                    }
+                    return nil
+                }
+
                 // 正在拖动分隔条时完全放行，避免被误判为"平移画面"。
                 if self.coordinator?.isSuppressed?() == true { return e }
                 // 用桥接视图自身 bounds 判断，范围严格等于预览区（不吞分隔条/信息区事件）；
                 // 坐标转左上原点后与 GeometryReader 的 fitW/fitH 同一基准。
-                let p = self.convert(e.locationInWindow, from: nil)
-                guard self.bounds.width > 0, self.bounds.contains(p) else { return e }
+                guard self.bounds.contains(p) else { return e }
                 let topLeft = CGPoint(x: p.x, y: self.bounds.height - p.y)
                 switch e.type {
                 case .leftMouseDown:
@@ -831,7 +883,10 @@ struct LeftMouseBridge: NSViewRepresentable {
 
         @objc private func resign() {
             spaceHeld = false
-            if action != nil, let s = start {
+            if action == .divider {
+                action = nil
+                coordinator?.dividerEnd?()
+            } else if action != nil, let s = start {
                 coordinator?.onGesture?(.ended(s))
                 action = nil; start = nil; last = nil
             }
@@ -848,6 +903,25 @@ struct LeftMouseBridge: NSViewRepresentable {
 }
 
 // MARK: - 右上：预览与缩放
+
+/// 相机对焦点叠加层。抽成独立 View 以减小 DetailView.body 的类型检查复杂度。
+private struct AFPointsOverlay: View {
+    let points: [FocusPoint]
+    let fitW: CGFloat
+    let fitH: CGFloat
+    let scale: CGFloat
+
+    var body: some View {
+        ForEach(Array(points.enumerated()), id: \.offset) { _, p in
+            Rectangle()
+                .stroke(Color.red, lineWidth: 2 / scale)
+                .background(Color.red.opacity(0.10))
+                .frame(width: max(CGFloat(p.w) * fitW, 10 / scale),
+                       height: max(CGFloat(p.h) * fitH, 10 / scale))
+                .position(x: CGFloat(p.cx) * fitW, y: CGFloat(p.cy) * fitH)
+        }
+    }
+}
 
 struct DetailView: View {
     @EnvironmentObject var store: Store
@@ -1021,14 +1095,7 @@ struct DetailView: View {
                         }
                         // 相机记录的实际对焦点（红色），来自 RAW MakerNote
                         if store.showAFPoints, let af = store.afCache[r.id] {
-                            ForEach(Array(af.points.enumerated()), id: \.offset) { _, p in
-                                Rectangle()
-                                    .stroke(Color.red, lineWidth: 2 / scale)
-                                    .background(Color.red.opacity(0.10))
-                                    .frame(width: max(p.w * fitW, 10 / scale),
-                                           height: max(p.h * fitH, 10 / scale))
-                                    .position(x: p.cx * fitW, y: p.cy * fitH)
-                            }
+                            AFPointsOverlay(points: af.points, fitW: fitW, fitH: fitH, scale: scale)
                         }
                         if let sel = store.selectionRect, store.zoom > 1 {
                             Rectangle().stroke(Color.yellow, lineWidth: 1.5 / scale)
@@ -1094,7 +1161,20 @@ struct DetailView: View {
                     LeftMouseBridge(
                         zoomFlag: store.shortcuts.zoom.flag,
                         subjectFlag: store.shortcuts.subject.flag,
-                        isSuppressed: { store.isDividerDragging }
+                        isSuppressed: { store.isDividerDragging },
+                        dividerBegin: {
+                            store.isDividerDragging = true
+                            store.freezeCurrentFit()
+                            return store.dividerInfoHeight
+                        },
+                        dividerDrag: { next in
+                            store.infoHeight = min(max(next, store.dividerMinBottom),
+                                                   store.dividerMaxBottom)
+                        },
+                        dividerEnd: {
+                            store.isDividerDragging = false
+                            store.endFitFreeze()
+                        }
                     ) { g in
                         switch g {
                         case .began(let action, let p):
@@ -1493,6 +1573,9 @@ struct ContentView: View {
                     let maxBottom = max(minBottom, totalH - dividerH - minTop)
                     let bottomH = min(max(store.infoHeight, minBottom), maxBottom)
                     let topH = max(minTop, totalH - dividerH - bottomH)
+                    // 每帧把分隔条几何交给左键桥接（非 @Published，不触发重算）。
+                    // 分隔条拖动已改由 AppKit 绝对坐标处理，不再用 SwiftUI DragGesture。
+                    let _ = store.setDividerContext(bottomH: bottomH, min: minBottom, max: maxBottom)
                     VStack(spacing: 0) {
                         Group {
                             if let id = store.selected,
@@ -1512,32 +1595,16 @@ struct ContentView: View {
                         .frame(height: topH)
                         .frame(maxWidth: .infinity)
 
+                        // 分隔条仅作视觉；拖动由 DetailView 内的左键桥接统一处理。
+                        // 这样手势基准是 AppKit 绝对坐标，不会因视图随 infoHeight 移动而漂移。
                         Rectangle()
                             .fill(Color.gray.opacity(0.28))
                             .frame(height: dividerH)
                             .frame(maxWidth: .infinity)
-                            .contentShape(Rectangle())
                             .onHover { hovering in
                                 if hovering { NSCursor.resizeUpDown.push() }
                                 else { NSCursor.resizeUpDown.pop() }
                             }
-                            .gesture(DragGesture(minimumDistance: 0)
-                                .onChanged { g in
-                                    if !store.isDividerDragging {
-                                        // 用实际显示高度（已被窗口 clamp 过）作基准，
-                                        // 避免默认高度超出可用空间时第一次拖动突然跳变。
-                                        store.dividerStartHeight = bottomH
-                                        store.isDividerDragging = true
-                                        // 冻结照片当前尺寸，拖分区时照片不跟着伸缩。
-                                        store.freezeCurrentFit()
-                                    }
-                                    // 向上拖（translation<0）→ 信息区变高
-                                    store.infoHeight = min(max(store.dividerStartHeight - g.translation.height, minBottom), maxBottom)
-                                }
-                                .onEnded { _ in
-                                    store.isDividerDragging = false
-                                    store.endFitFreeze()
-                                })
 
                         Group {
                             if let id = store.selected,
