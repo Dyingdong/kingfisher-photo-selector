@@ -386,20 +386,21 @@ final class Store: ObservableObject {
 
     // MARK: - 综合评分
 
-    /// 当前题材：用户改过用覆盖值，否则自动识别。
-    func genre(for r: PhotoResult) -> (PhotoGenre, Bool) {
-        if let g = genreOverride[r.id] { return (g, false) }
-        let g = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
-                                       wb: wbCache[r.id], exif: exifCache[r.id])
-        return (g, true)
+    /// 当前题材：用户改过用覆盖值，否则自动识别。返回 (题材, 是否自动, 识别依据)。
+    func genre(for r: PhotoResult) -> (PhotoGenre, Bool, String) {
+        if let g = genreOverride[r.id] { return (g, false, "手动指定") }
+        let (g, why) = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
+                                              wb: wbCache[r.id], exif: exifCache[r.id])
+        return (g, true, why)
     }
 
     /// 立即算一张照片的综合评分。af/wb/exif 若尚未读到，用它当时已有的数据算，
     /// 读到后 InfoView 会随 @Published 变化自动重算，无需缓存。
     func score(for r: PhotoResult) -> PhotoScore {
-        let (g, guess) = genre(for: r)
+        let (g, guess, why) = genre(for: r)
         return ScoreEngine.score(r, af: afCache[r.id], wb: wbCache[r.id],
-                                 exif: exifCache[r.id], genre: g, genreIsGuess: guess)
+                                 exif: exifCache[r.id], genre: g,
+                                 genreIsGuess: guess, genreReason: why)
     }
 
     func setGenre(_ g: PhotoGenre?, for url: URL) {
@@ -1423,9 +1424,12 @@ private struct ScorePanel: View {
                         ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
                     }
                     .pickerStyle(.menu).frame(width: 168)
-                    Text(score.genreIsGuess ? "题材是软件猜的，可手动改"
+                    Text(score.genreIsGuess ? "自动识别依据：\(score.genreReason)"
                                             : "题材已手动指定")
                         .font(.caption2).foregroundColor(.secondary)
+                        .help(score.genreIsGuess
+                              ? "软件按「\(score.genreReason)」判为该题材；不准可在上面手动改"
+                              : "你已手动指定题材，评分权重按该题材计算")
                 }
             }
 

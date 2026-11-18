@@ -37,6 +37,7 @@ struct ScorePart: Identifiable {
 struct PhotoScore {
     let genre: PhotoGenre
     let genreIsGuess: Bool      // true = 软件自动识别，false = 用户手动指定
+    let genreReason: String     // 自动识别依据（人看了能核对）
     let stars: Int              // 建议星级 1...5，直接对应现有 Bridge 5 星层
     let total: Double           // 0~100，加权总分
     let parts: [ScorePart]
@@ -72,28 +73,53 @@ enum ScoreEngine {
 
     // MARK: 题材自动识别
 
-    /// 自动猜题材，返回 (题材, 是否自动)。规则按优先级：
-    /// 1) 前景小主体 / 长焦 → 拍鸟；2) 人脸或人脸对焦模式 → 人像；3) 其余 → 风光。
+    /// 自动猜题材，返回 (题材, 识别依据)。依据会显示在界面上，方便核对为什么这么判。
+    /// 规则按优先级（每条都不依赖主体定位方式，避免「长焦打鸟却因主体框大被判风光」）：
+    /// 1) 明确的人脸信号 → 人像（优先，防止长焦人像被误判成鸟）；
+    /// 2) 打鸟镜头 / 超长焦（≥300mm）→ 拍鸟；
+    /// 3) 中长焦（200~300mm）且有识别主体 → 拍鸟；
+    /// 4) 前景小主体 → 拍鸟；
+    /// 5) 其余 → 风光。
     /// 只是「猜测」，界面明确标注并允许用户手动改。
     static func guessGenre(m: PhotoMetrics, af: AFInfo?, wb: WhiteBalanceStats?,
-                           exif: ExifInfo?) -> PhotoGenre {
+                           exif: ExifInfo?) -> (PhotoGenre, String) {
         var subjectArea = 0.0
         for b in m.bboxes { subjectArea += Double(b.width * b.height) }
 
         let focal = exif.flatMap { parseFocal($0.focalLength) } ?? 0
-        let smallForeground = m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.25
-        let longLens = focal >= 200
-
-        if smallForeground || (longLens && m.subjectSource == "前景主体") {
-            return .bird
-        }
-        let hasFace = (wb?.faceRG != nil)
+        let lensMax = exif.flatMap { $0.lens }.flatMap { parseLensMaxFocal($0) } ?? 0
+        let hasForeground = m.subjectSource == "前景主体"
             || m.subjectSource == "人脸检测"
-            || (af?.modeName.contains("人脸") ?? false)
-        if hasFace { return .portrait }
-        return .landscape
+            || m.subjectSource == "显著性区域"
+
+        // 1) 人脸优先：长焦也能拍人，先把人像摘出来。
+        let faceMode = af?.modeName.contains("人脸") ?? false
+        if wb?.faceRG != nil || m.subjectSource == "人脸检测" || faceMode {
+            let why = faceMode ? "相机用人脸对焦模式" : "检测到人脸"
+            return (.portrait, why)
+        }
+
+        // 2) 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
+        if lensMax >= 400 || focal >= 300 {
+            let bits = [focal > 0 ? "焦距 \(Int(focal))mm" : nil,
+                        exif?.lens].compactMap { $0 }
+            return (.bird, bits.joined(separator: " · "))
+        }
+
+        // 3) 中长焦 200~300mm 且有主体：多数是生态/打鸟。
+        if focal >= 200 && focal < 300 && hasForeground {
+            return (.bird, "中长焦 \(Int(focal))mm 且有识别主体")
+        }
+
+        // 4) 前景小主体（小鸟占画面很小一块）。
+        if m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.25 {
+            return (.bird, "前景主体只占画面 \(Int(subjectArea * 100))%")
+        }
+
+        return (.landscape, "无长焦/人脸的强信号")
     }
 
+    /// 从格式化焦距串（如 "600mm" / "208mm"）取数值。
     private static func parseFocal(_ s: String?) -> Double? {
         guard let s = s else { return nil }
         let nums = s.split(whereSeparator: { !$0.isNumber && $0 != "." })
@@ -101,6 +127,23 @@ enum ScoreEngine {
             if let v = Double(n), v >= 10 { return v }
         }
         return nil
+    }
+
+    /// 从镜头型号（如 "RF200-800mm F6.3-9 IS USM"）取最大焦距端，
+    /// 用来识别打鸟镜头。取所有整数里的最大值：200-800→800，24-105→105。
+    private static func parseLensMaxFocal(_ s: String) -> Double? {
+        var best = 0.0
+        var cur = ""
+        func flush() {
+            if let v = Double(cur), v >= 10 { best = max(best, v) }
+            cur = ""
+        }
+        for ch in s {
+            if ch.isNumber || ch == "." { cur.append(ch) }
+            else { flush() }
+        }
+        flush()
+        return best > 0 ? best : nil
     }
 
     // MARK: 各维度打分
@@ -182,7 +225,8 @@ enum ScoreEngine {
 
     /// 主入口：算出建议星级与全部可解释维度。af / wb / exif 可为 nil（缺失的维度不参与加权）。
     static func score(_ r: PhotoResult, af: AFInfo?, wb: WhiteBalanceStats?,
-                      exif: ExifInfo?, genre: PhotoGenre, genreIsGuess: Bool) -> PhotoScore {
+                      exif: ExifInfo?, genre: PhotoGenre, genreIsGuess: Bool,
+                      genreReason: String = "") -> PhotoScore {
         let m = r.metrics
         let clarity = clarityScore(m)
         let overall = overallScore(m)
@@ -242,7 +286,8 @@ enum ScoreEngine {
         }
         if genreIsGuess { tips.append("题材是软件猜的，不对的话在上面手动改成正确题材。") }
 
-        return PhotoScore(genre: genre, genreIsGuess: genreIsGuess, stars: stars,
+        return PhotoScore(genre: genre, genreIsGuess: genreIsGuess,
+                          genreReason: genreReason, stars: stars,
                           total: total, parts: parts, headline: headline, tips: tips)
     }
 

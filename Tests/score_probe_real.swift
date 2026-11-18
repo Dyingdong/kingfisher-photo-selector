@@ -36,14 +36,15 @@ for f in files {
     let wb = WhiteBalance.analyze(url)
     let af = AFReader.read(url)
     let exif = ExifInfo.read(url)
-    let genre = ScoreEngine.guessGenre(m: m, af: af, wb: wb, exif: exif)
-    let s = ScoreEngine.score(r, af: af, wb: wb, exif: exif, genre: genre, genreIsGuess: true)
+    let (genre, genreWhy) = ScoreEngine.guessGenre(m: m, af: af, wb: wb, exif: exif)
+    let s = ScoreEngine.score(r, af: af, wb: wb, exif: exif, genre: genre,
+                              genreIsGuess: true, genreReason: genreWhy)
     func part(_ id: String) -> String {
         s.parts.first { $0.id == id }.map { String(Int($0.score)) } ?? "-"
     }
     let name = (f as NSString).deletingPathExtension
     let t = truth[f] ?? truth[name] ?? "?"
-    print("\(f),\(t),\(genre.rawValue),\(s.stars),\(Int(s.total.rounded())),\(part("clarity")),\(part("overall")),\(part("focus")),\(part("color")),\(v.rawValue)")
+    print("\(f),\(t),\(genre.rawValue),\(s.stars),\(Int(s.total.rounded())),\(part("clarity")),\(part("overall")),\(part("focus")),\(part("color")),\(v.rawValue),\(genreWhy)")
     if t.contains("废") { badCount += 1; if s.stars <= 2 { starBad += 1 } }
     else if t.contains("好") { goodCount += 1; if s.stars >= 3 { starGood += 1 } }
 }
