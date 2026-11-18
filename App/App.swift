@@ -117,6 +117,8 @@ final class Store: ObservableObject {
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
+    /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
+    @Published var dividerStartHeight: CGFloat = 0
     /// 正在拖动分隔条：左键桥接据此放行事件，避免把分隔条拖动误判为平移。
     @Published var isDividerDragging = false
     /// 拖分隔条期间锁定照片的显示高度与相对预览区顶部的偏移，
@@ -1440,9 +1442,6 @@ struct ShortcutsView: View {
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
-    /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
-    @State private var dividerStartHeight: CGFloat = 0
-    @State private var isDividerDragging = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1518,20 +1517,18 @@ struct ContentView: View {
                             }
                             .gesture(DragGesture(minimumDistance: 0)
                                 .onChanged { g in
-                                    if !isDividerDragging {
+                                    if !store.isDividerDragging {
                                         // 用实际显示高度（已被窗口 clamp 过）作基准，
                                         // 避免默认高度超出可用空间时第一次拖动突然跳变。
-                                        dividerStartHeight = bottomH
-                                        isDividerDragging = true
+                                        store.dividerStartHeight = bottomH
                                         store.isDividerDragging = true
                                         // 冻结照片当前尺寸，拖分区时照片不跟着伸缩。
                                         store.freezeCurrentFit()
                                     }
                                     // 向上拖（translation<0）→ 信息区变高
-                                    store.infoHeight = min(max(dividerStartHeight - g.translation.height, minBottom), maxBottom)
+                                    store.infoHeight = min(max(store.dividerStartHeight - g.translation.height, minBottom), maxBottom)
                                 }
                                 .onEnded { _ in
-                                    isDividerDragging = false
                                     store.isDividerDragging = false
                                     store.endFitFreeze()
                                 })
