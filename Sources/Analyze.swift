@@ -359,6 +359,29 @@ struct FocusMissDiagnosis {
     let suspected: Bool      // 是否疑似对焦落点失误
     let short: String        // 短标签
     let detail: String       // 白话解释
+    let focusMethod: String  // 对焦方式：手动 / 自动 / 未知（用户定义的判定）
+}
+
+/// 对焦方式判定（用户定义规则）：
+/// - 没有镜头信息 → 一定是手动对焦（自动对焦相机一定会记录镜头）；
+/// - 有镜头信息但没有对焦点数据 → 也是手动对焦（自动对焦会记录 AF 点）；
+/// - 相机 AFAreaMode=0（ExifTool 的 Manual）→ 手动对焦；
+/// - 其余 → 自动对焦。
+/// 这是「这台相机当时是不是靠人拧焦环」的最可靠近似，用于解释为何主体会因
+/// 手动拧偏而虚——不同自动对焦失败，手动对焦失误是可以靠提示排除的。
+enum FocusMethod {
+    static func judge(lens: String?, af: AFInfo?) -> (isManual: Bool, text: String) {
+        if lens == nil || (lens?.isEmpty ?? true) {
+            return (true, "手动对焦（没记录镜头信息，自动对焦相机会记录）")
+        }
+        guard let af = af else {
+            return (true, "手动对焦（有镜头信息但没有对焦点记录）")
+        }
+        if af.mode == 0 {
+            return (true, "手动对焦（相机记录为 Manual 对焦模式）")
+        }
+        return (false, "自动对焦（相机记录为「\(af.modeName)」）")
+    }
 }
 
 enum FocusMiss {
@@ -368,17 +391,35 @@ enum FocusMiss {
     /// 3. 对焦点处的锐度明显低于最锐处（< 35%，说明焦点没对到实处）；
     /// 4. 最锐块离合焦点有距离（≥ 8% 画幅，避免把对焦点附近的小抖动当失误）；
     /// 5. 主体本身不锐（显示锐度比 < 25%，确认主体确实虚了）。
-    static func diagnose(_ m: PhotoMetrics, af: AFInfo?, verdict: Verdict) -> FocusMissDiagnosis {
+    static func diagnose(_ m: PhotoMetrics, af: AFInfo?, verdict: Verdict,
+                         lens: String? = nil) -> FocusMissDiagnosis {
+        let method = FocusMethod.judge(lens: lens, af: af)
+        let manualNote = method.isManual ? "；这张是手动对焦，焦点需人工拧准，失误更常见" : ""
+
         guard let af = af, let p = af.points.first, !af.points.isEmpty else {
-            return FocusMissDiagnosis(suspected: false, short: "无对焦数据",
-                                      detail: "这张照片没有相机合焦点记录，无法判断对焦是否拧到位")
+            // 没有 AF 点：若是手动对焦，用「主体虚 + 别处锐」给一条更实用的提示。
+            // 没有对焦点坐标，无法算焦点偏移，只能提示主体清晰度这一可核对信号。
+            if method.isManual, verdict.isSuspect, m.peakBlock >= Analyzer.independentFloor,
+               m.displaySubjectRatio < 0.25 {
+                return FocusMissDiagnosis(
+                    suspected: true, short: "手动对焦：主体偏虚",
+                    detail: "\(method.text)。相机没有合焦点记录，无法判断焦点落在哪里；"
+                          + "但主体清晰度只有最锐处的 \(Int(m.displaySubjectRatio * 100))%，"
+                          + "而画面别处有清晰区域（最锐处 \(Int(m.peakBlock))）。"
+                          + "像是手动对焦没拧到位。故意虚化主体的照片也会这样，请自行确认",
+                                      focusMethod: method.text)
+            }
+            return FocusMissDiagnosis(suspected: false, short: method.isManual ? "手动对焦·无焦点数据" : "无对焦数据",
+                                      detail: "\(method.text)。相机没有合焦点记录，无法判断对焦是否拧到位",
+                                      focusMethod: method.text)
         }
         let xPct = Int(p.cx * 100), yPct = Int(p.cy * 100)
         let pos = "横向\(xPct)%／纵向\(yPct)%"
         let peak = m.peakBlock
         guard peak >= Analyzer.independentFloor, m.scores.count == m.cols * m.rows else {
             return FocusMissDiagnosis(suspected: false, short: "全片偏软",
-                                      detail: "整张照片都不够锐（最锐处 \(Int(peak))），不像是对焦点拧偏，更像整体没对上")
+                                      detail: "整张照片都不够锐（最锐处 \(Int(peak))），不像是对焦点拧偏，更像整体没对上\(manualNote)",
+                                      focusMethod: method.text)
         }
         let fc = min(m.cols - 1, max(0, Int(p.cx * Double(m.cols))))
         let fr = min(m.rows - 1, max(0, Int(p.cy * Double(m.rows))))
@@ -398,11 +439,13 @@ enum FocusMiss {
                 suspected: true, short: "疑似对焦拧偏",
                 detail: "合焦点在\(pos)，但那一点只有全图最锐处的 \(Int(focusRatio * 100))%；"
                       + "最锐的地方离合焦点约 \(Int(dist * 100))% 画幅，主体也只有 \(Int(subject * 100))%。"
-                      + "像是手动对焦没拧到位（焦点落在主体前后）。注意：故意虚化主体的照片也会这样，请自行确认")
+                      + "像是手动对焦没拧到位（焦点落在主体前后）。注意：故意虚化主体的照片也会这样，请自行确认\(manualNote)",
+                focusMethod: method.text)
         }
         return FocusMissDiagnosis(
             suspected: false, short: "未见明显拧偏",
             detail: "合焦点在\(pos)，焦点处锐度是最锐处的 \(Int(focusRatio * 100))%，"
-                  + "离最锐处约 \(Int(dist * 100))% 画幅。没有明显的对焦点落空迹象")
+                  + "离最锐处约 \(Int(dist * 100))% 画幅。没有明显的对焦点落空迹象\(manualNote)",
+            focusMethod: method.text)
     }
 }

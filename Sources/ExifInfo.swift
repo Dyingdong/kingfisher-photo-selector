@@ -61,6 +61,41 @@ struct ExifInfo {
         return best > 0 ? best : nil
     }
 
+    /// 快门安全性：实际快门 vs 安全快门（1/等效焦距）。
+    /// 返回 nil 表示数据不足（无快门/无焦距）无法判断。
+    /// isSlow=true 表示快门明显慢于安全快门，手持容易因抖动发虚——
+    /// 这是「拍糊」的一个可核对原因，和「没对上焦」是两回事。
+    var shutterSafety: (isSlow: Bool, text: String)? {
+        guard let sec = Self.shutterSeconds(shutter), sec > 0,
+              let focal = Self.focalNumber(focalLength), focal > 0 else { return nil }
+        // 安全快门用等效焦距：APS-C ×1.6 后安全快门相应变快。
+        let effective = equivalentFocal.flatMap { Self.focalNumber($0) } ?? focal
+        let safe = 1.0 / effective
+        // 慢于安全快门 1 档以上（0.5 秒规则取 1 档，减少误报）才算「偏慢」。
+        let isSlow = sec > safe * 2
+        let actual = shutter ?? "?"
+        let text = isSlow
+            ? "快门 \(actual)，比安全快门 1/\(Int(effective))s 慢约 \(Self.stops(sec / safe)) 档；手持容易手抖发虚，可放大看主体边缘是否有同向拖影"
+            : "快门 \(actual)，快于安全快门 1/\(Int(effective))s，手抖导致发虚的可能性小"
+        return (isSlow, text)
+    }
+
+    private static func shutterSeconds(_ s: String?) -> Double? {
+        guard let s = s else { return nil }
+        if s.hasPrefix("1/") {
+            let den = String(s.dropFirst(2)).trimmingCharacters(in: CharacterSet(charactersIn: "s"))
+            return Double(den).flatMap { $0 > 0 ? 1.0 / $0 : nil }
+        }
+        let num = s.trimmingCharacters(in: CharacterSet(charactersIn: "s"))
+        return Double(num)
+    }
+
+    private static func stops(_ ratio: Double) -> String {
+        guard ratio > 1 else { return "0" }
+        let v = log(ratio) / log(2)
+        return String(format: "%.1f", v)
+    }
+
     /// 次要信息：测光 · 曝光模式 · 白平衡 · 闪光灯
     var detailLine: String {
         var parts: [String] = []

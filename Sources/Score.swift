@@ -97,6 +97,12 @@ enum ScoreEngine {
             || m.subjectSource == "人脸检测"
             || m.subjectSource == "显著性区域"
 
+        // 景区/聚会照：检测到 2 个人以上且「人是主体」时，更可能是景区里
+        // 近处游客被误当主体（真值 JD5A0666 景区：3 人 52%、实际是风光；
+        // JD5A0667：2 人 40%、风光）。真正的人像合影里人分散、 singly 高度小，
+        // isMainSubject=0，不受此规则影响（真值 JD5A8533：4 人 30%、人像）。
+        let crowdScene = (human?.count ?? 0) >= 2 && (human?.isMainSubject ?? false)
+
         // —— 第一优先级：对焦点处的语义判断（只要识别出来了，就以此为准）——
         if let focus = focus {
             switch focus.kind {
@@ -110,12 +116,18 @@ enum ScoreEngine {
                 // a) 画面主体确认是人 → 人站在天空/山水前也是人像，别被对焦点落空带偏；
                 // b) 超长焦（≥400mm）且分割出明确前景小主体 → 多为站在地面/枝头的鸟，
                 //    分类没认出往往只是因为裁块被草地/泥土淹没。
-                if let human = human, human.isMainSubject
-                    || (human.hasPerson && human.bodyHeightRatio >= 0.22) {
+                if let human = human, !crowdScene,
+                   human.isMainSubject || (human.hasPerson && human.bodyHeightRatio >= 0.22) {
                     return (.portrait, human.reason)
                 }
+                // 超长焦 + 极小前景主体（<8%）才可能是枝头小鸟；花朵/山体这类
+                // 大主体即便在 800/1600mm 下也是风光，不该被焦距硬判成鸟。
                 if focal >= 400 && m.subjectSource == "前景主体" {
-                    return (.bird, "\(focus.reason)，但超长焦下分割出明确小主体，更可能是鸟")
+                    var area = 0.0
+                    for b in m.bboxes { area += Double(b.width * b.height) }
+                    if area > 0 && area < 0.08 {
+                        return (.bird, "\(focus.reason)，但超长焦下分割出极小主体（\(Int(area * 100))%），更可能是鸟")
+                    }
                 }
                 return (.landscape, focus.reason)
             case .unknown:
@@ -147,7 +159,8 @@ enum ScoreEngine {
         // 无脸人像：背影/侧身/低头等没露出脸的题材。用人体姿态检测（不依赖脸），
         // 放在长焦兜底之前——否则 RF100-400 这类长焦拍的人像会被误判成拍鸟。
         // 只在「对焦点语义没识别出鸟/风景」时才走到这里，不会把打鸟片里偶尔入镜的人误判。
-        if let human = human, human.isMainSubject {
+        // crowdScene（≥3 人）排除：景区里一群游客不该当人像主体。
+        if let human = human, human.isMainSubject, !crowdScene {
             return (.portrait, human.reason)
         }
 
@@ -155,20 +168,27 @@ enum ScoreEngine {
         // 也大概率是环境人像，不该落到长焦/小主体规则里判成拍鸟。
         // 高度门槛 22%：再低就分不清风景照里的游客了（实测点缀小人 16%~21%）。
         if let human = human, human.hasPerson, human.bodyHeightRatio >= 0.22,
-           focal >= 10, focal < 300 {
+           focal >= 10, focal < 300, !crowdScene {
             return (.portrait, human.reason)
         }
 
-        // 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
-        if lensMax >= 400 || focal >= 300 {
+        // —— 长焦兜底：走到这里说明对焦点语义、AI 主体识别都没有认出鸟 ——
+        // 用户明确要求：长焦镜头没识别到鸟，那就是风光，不能靠焦距硬判拍鸟。
+        // 唯一的例外：超长焦 + 极小前景主体（<8% 画幅，典型是远处枝头的小鸟），
+        // 这类鸟小到检测器认不出，但占比特征很有辨识度。花朵(24%)、雪山(58%)
+        // 这类大主体一律判风光。
+        let teleLens = lensMax >= 400 || focal >= 300
+        let tinyForeground = m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.08
+        if teleLens && tinyForeground {
             let bits = [focal > 0 ? "焦距 \(Int(focal))mm" : nil,
                         exif?.lens].compactMap { $0 }
-            return (.bird, bits.joined(separator: " · "))
+            return (.bird, bits.joined(separator: " · ") + "，且有极小前景主体（\(Int(subjectArea * 100))%），像远处的鸟")
         }
-
-        // 中长焦 200~300mm 且有主体：多数是生态/打鸟。
-        if focal >= 200 && focal < 300 && hasForeground {
-            return (.bird, "中长焦 \(Int(focal))mm 且有识别主体")
+        if teleLens || (focal >= 200 && hasForeground) {
+            let why = teleLens
+                ? "焦距 \(Int(focal))mm 但没识别到鸟，按风光处理"
+                : "中长焦 \(Int(focal))mm 但没识别到鸟，按风光处理"
+            return (.landscape, why)
         }
 
         // 前景小主体（小鸟占画面很小一块）。需要百毫米以上焦距：

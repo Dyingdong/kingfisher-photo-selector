@@ -636,7 +636,8 @@ final class Store: ObservableObject {
                                               finalGenre: final.rawValue,
                                               manualGenre: genreOverride[r.id]?.rawValue,
                                               stars: s.stars, total: Int(s.total.rounded()))
-            focusMiss[r.id] = FocusMiss.diagnose(r.metrics, af: afCache[r.id], verdict: r.verdict)
+            focusMiss[r.id] = FocusMiss.diagnose(r.metrics, af: afCache[r.id], verdict: r.verdict,
+                                                  lens: exifCache[r.id]?.lens)
         }
         let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity,
                              anchor: anchorHi, genres: genres, focusMiss: focusMiss)
@@ -712,8 +713,10 @@ final class Store: ObservableObject {
                 Report.q(ai.map { "\($0.kind)" } ?? "未识别"), Report.q(ai?.reason ?? ""),
                 Report.q(ai?.labels.prefix(5).joined(separator: " | ") ?? ""),
                 String(memory.count),
-                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict).short),
-                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict).detail),
+                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict,
+                                            lens: exifCache[r.id]?.lens).short),
+                Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict,
+                                            lens: exifCache[r.id]?.lens).detail),
                 Report.q(r.id.path),
             ]
             lines.append(row.joined(separator: ","))
@@ -1698,12 +1701,18 @@ private struct ScorePanel: View {
 
 /// 题材选择 + 识别依据
 private var genreBlock: some View {
-        VStack(alignment: compact ? .leading : .trailing, spacing: 2) {
-            Picker("题材", selection: genreBinding) {
-                Text("自动识别（\(score.genre.rawValue)）").tag("auto")
-                ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+        VStack(alignment: .leading, spacing: 2) {
+            // 用独立 Text 做「题材」标签：系统 Picker 的 label 在 menu 样式下会
+            // 缩进、和上方面板文字对不齐（用户实测）；拆开后整体 HStack 左对齐。
+            HStack(spacing: 6) {
+                Text("题材").font(.caption2).foregroundColor(.secondary)
+                Picker("", selection: genreBinding) {
+                    Text("自动识别（\(score.genre.rawValue)）").tag("auto")
+                    ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+                }
+                .pickerStyle(.menu).frame(width: compact ? 200 : 168, alignment: .leading)
             }
-            .pickerStyle(.menu).frame(width: compact ? 220 : 168)
+            .frame(maxWidth: .infinity, alignment: .leading)
             Text(score.genreIsGuess ? "自动识别依据：\(score.genreReason)"
                                     : "题材已手动指定")
                 .font(.caption2).foregroundColor(.secondary)
@@ -1746,7 +1755,9 @@ private var genreBlock: some View {
             Text(score.headline).font(.callout)
 
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(score.parts) { p in bar(p) }
+                // 白平衡/曝光只在人像题材显示（用户要求）：其他题材权重本就为 0，
+                // 留着只会占地方、让人误以为参与了评分。
+                ForEach(score.parts.filter { score.genre == .portrait || $0.id != "color" }) { p in bar(p) }
             }
 
             if r.verdict.isSuspect {
@@ -1775,18 +1786,21 @@ struct InfoView: View {
     /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
     var compact = false
 
-    private func cell(_ title: String, _ value: String, limit: Int = 1) -> some View {
+    private func cell(_ title: String, _ value: String, limit: Int = 1,
+                      help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title).font(.caption2).foregroundColor(.secondary)
             Text(value).font(compact ? .caption : .callout).monospacedDigit()
                 .lineLimit(limit).fixedSize(horizontal: false, vertical: limit > 1)
+                // 值被 lineLimit 省略时，悬停仍看到完整内容（用户要求）。
+                .help(help ?? value)
         }
         .frame(minWidth: compact ? 96 : 120, alignment: .leading)
     }
 
-    /// 通俗命名的指标格：鼠标悬停显示大白话解释。
+    /// 通俗命名的指标格：鼠标悬停即时显示大白话解释（解释 + 实际值一起给出）。
     private func metricCell(_ title: String, _ value: String, _ tip: String) -> some View {
-        cell(title, value).help(tip)
+        cell(title, value, help: nil).instantHelp("\(value)\n\n\(tip)")
     }
 
     private func sectionTitle(_ s: String) -> some View {
@@ -1891,7 +1905,8 @@ struct InfoView: View {
                         .foregroundColor(verdictColor(r.verdict))
                     Text("合焦判定：\(r.verdict.rawValue)").font(.caption)
                         .foregroundColor(verdictColor(r.verdict))
-                    Text("· \(r.reason)").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    Text("· \(r.reason)").font(.caption2).foregroundColor(.secondary)
+                        .lineLimit(1).help(r.reason)
                 }
 
                 Divider()
@@ -1924,28 +1939,46 @@ struct InfoView: View {
                         .font(.caption2).foregroundColor(.secondary)
                     if let af = store.afCache[r.id] {
                         let rel = Analyzer.afSubjectRelation(m, af: af)
-                        let miss = FocusMiss.diagnose(m, af: af, verdict: r.verdict)
                         HStack(spacing: 5) {
                             Text("对焦点与主体：\(rel.0)")
                                 .font(.caption2).foregroundColor(.secondary)
                             Image(systemName: "info.circle")
                                 .font(.caption2).foregroundColor(.secondary)
-                                .help(rel.1)
+                                .instantHelp(rel.1)
                         }
+                    }
+                    let miss = FocusMiss.diagnose(m, af: store.afCache[r.id], verdict: r.verdict,
+                                                  lens: store.exifCache[r.id]?.lens)
+                    if let exif = store.exifCache[r.id],
+                       let shutter = exif.shutterSafety, shutter.isSlow {
                         HStack(spacing: 5) {
-                            Text("手动对焦：\(miss.short)")
-                                .font(.caption2)
-                                .foregroundColor(miss.suspected ? .orange : .secondary)
+                            Image(systemName: "clock.badge.exclamationmark")
+                                .font(.caption2).foregroundColor(.orange)
+                            Text("快门偏慢，可能手抖发虚").font(.caption2).foregroundColor(.orange)
                             Image(systemName: "info.circle")
                                 .font(.caption2).foregroundColor(.secondary)
-                                .help(miss.detail)
+                                .instantHelp(shutter.text)
                         }
+                    }
+                    HStack(spacing: 5) {
+                        Text("对焦方式：\(miss.focusMethod)")
+                            .font(.caption2).foregroundColor(.secondary)
+                            .lineLimit(1).help(miss.focusMethod)
+                    }
+                    HStack(spacing: 5) {
+                        Text("手动对焦：\(miss.short)")
+                            .font(.caption2)
+                            .foregroundColor(miss.suspected ? .orange : .secondary)
+                        Image(systemName: "info.circle")
+                            .font(.caption2).foregroundColor(.secondary)
+                            .instantHelp(miss.detail)
                     }
                 }
 
                 Divider()
 
-                // 5) 白平衡 / 曝光参考
+                // 5) 白平衡 / 曝光参考：仅人像题材显示（用户要求）
+                if store.genre(for: r).0 == .portrait {
                 VStack(alignment: .leading, spacing: 4) {
                     sectionTitle("白平衡 / 曝光参考")
                     if let wb {
@@ -1992,10 +2025,12 @@ struct InfoView: View {
                         Text("正在读取白平衡统计…").font(.caption).foregroundColor(.secondary)
                     }
                 }
+                }
 
                 Text("灰块 = 该处纹理太少、无法判断。热力图只是相对参考，不是相机的 K 值或测光表。")
                     .font(.caption2).foregroundColor(.secondary)
-                Text(r.id.path).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                Text(r.id.path).font(.caption2).foregroundColor(.secondary)
+                    .lineLimit(1).help(r.id.path)
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2666,4 +2701,44 @@ func colorBiasText(r: Double, b: Double) -> String {
     if d < -0.20 { return "明显偏蓝（冷）" }
     if d < -0.06 { return "偏蓝（冷）" }
     return "接近中性"
+}
+
+/// 即时悬停提示：系统 .help() 要等约 1 秒才弹、鼠标一动就消失，用户觉得「不灵敏」。
+/// 这个修饰器用 onHover 在鼠标进入的那一刻就显示气泡，离开立刻消失，可停留阅读。
+/// 气泡锚定在视图上方、宽度受限自动换行；只用于信息区的解释文字。
+struct InstantHelp: ViewModifier {
+    let text: String
+    @State private var showing = false
+    func body(content: Content) -> some View {
+        content
+            .onHover { showing = $0 }
+            .overlay(alignment: .top) {
+                if showing {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(text)
+                            .font(.caption)
+                            .foregroundColor(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .frame(maxWidth: 280, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+                            .shadow(radius: 4)
+                    )
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.35)))
+                    .zIndex(100)
+                    .allowsHitTesting(false)
+                    .offset(y: -10)
+                }
+            }
+    }
+}
+
+extension View {
+    /// 即时悬停提示（替代判断依据区的 .help）。
+    func instantHelp(_ text: String) -> some View {
+        modifier(InstantHelp(text: text))
+    }
 }
