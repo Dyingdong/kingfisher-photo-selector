@@ -120,6 +120,11 @@ final class Store: ObservableObject {
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
+    /// 构图辅助线：九宫格与对角线，各自独立、默认关闭，可同时开启叠加。
+    @Published var showThirds = false
+    @Published var showDiagonals = false
+    /// 题材人工覆盖：用户改过题材的照片存这里；没有覆盖的自动识别。
+    @Published var genreOverride: [URL: PhotoGenre] = [:]
     /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
     @Published var dividerStartHeight: CGFloat = 0
     /// 正在拖动分隔条：左键桥接据此放行事件，避免把分隔条拖动误判为平移。
@@ -237,6 +242,7 @@ final class Store: ObservableObject {
         afAttempted = []
         exifCache = [:]
         ratingCache = [:]
+        genreOverride = [:]
         heatCache = [:]
         baseCache = [:]
         selectionRatio = nil
@@ -378,6 +384,29 @@ final class Store: ObservableObject {
         }
     }
 
+    // MARK: - 综合评分
+
+    /// 当前题材：用户改过用覆盖值，否则自动识别。
+    func genre(for r: PhotoResult) -> (PhotoGenre, Bool) {
+        if let g = genreOverride[r.id] { return (g, false) }
+        let g = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
+                                       wb: wbCache[r.id], exif: exifCache[r.id])
+        return (g, true)
+    }
+
+    /// 立即算一张照片的综合评分。af/wb/exif 若尚未读到，用它当时已有的数据算，
+    /// 读到后 InfoView 会随 @Published 变化自动重算，无需缓存。
+    func score(for r: PhotoResult) -> PhotoScore {
+        let (g, guess) = genre(for: r)
+        return ScoreEngine.score(r, af: afCache[r.id], wb: wbCache[r.id],
+                                 exif: exifCache[r.id], genre: g, genreIsGuess: guess)
+    }
+
+    func setGenre(_ g: PhotoGenre?, for url: URL) {
+        if let g = g { genreOverride[url] = g }
+        else { genreOverride.removeValue(forKey: url) }
+    }
+
     func ensureFullPreview(for url: URL) {
         if fullPreviewURL == url {
             if fullPreview != nil { return }
@@ -462,6 +491,7 @@ final class Store: ObservableObject {
         metrics.removeAll { removedURLs.contains($0.url) }
         for key in removedURLs {
             wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
+            genreOverride[key] = nil
             afLoading.remove(key); afAttempted.remove(key)
             heatCache[key] = nil; baseCache[key] = nil
         }
@@ -924,6 +954,43 @@ private struct FrameLegend: View {
     }
 }
 
+/// 构图辅助线：九宫格（三分线）+ 对角线，可分别开关、同时开启则叠加。
+/// 用 Path 按 fitW/fitH 画，放在与主图同一 transform 里，缩放平移都不会错位。
+private struct CompositionGuides: View {
+    let fitW: CGFloat
+    let fitH: CGFloat
+    let thirds: Bool
+    let diagonals: Bool
+    let scale: CGFloat
+
+    var body: some View {
+        GeometryReader { _ in
+            Path { path in
+                if thirds {
+                    for i in 1..<3 {
+                        let x = fitW * CGFloat(i) / 3
+                        let y = fitH * CGFloat(i) / 3
+                        path.move(to: CGPoint(x: x, y: 0))
+                        path.addLine(to: CGPoint(x: x, y: fitH))
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: fitW, y: y))
+                    }
+                }
+                if diagonals {
+                    path.move(to: .zero)
+                    path.addLine(to: CGPoint(x: fitW, y: fitH))
+                    path.move(to: CGPoint(x: fitW, y: 0))
+                    path.addLine(to: CGPoint(x: 0, y: fitH))
+                }
+            }
+            .stroke(Color.white.opacity(0.75), lineWidth: 1 / scale)
+            .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
+            .allowsHitTesting(false)
+        }
+        .frame(width: fitW, height: fitH)
+    }
+}
+
 /// 相机对焦点叠加层。抽成独立 View 以减小 DetailView.body 的类型检查复杂度。
 private struct AFPointsOverlay: View {
     let points: [FocusPoint]
@@ -1074,6 +1141,8 @@ struct DetailView: View {
             HStack(spacing: 12) {
                 Toggle("锐度热力图", isOn: $store.showHeatmap)
                 Toggle("对焦点", isOn: $store.showAFPoints)
+                Toggle("九宫格", isOn: $store.showThirds)
+                Toggle("对角线", isOn: $store.showDiagonals)
                 Button("－") { store.zoomOut() }.frame(width: 26)
                 Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
                 Button("＋") { store.zoomIn() }.frame(width: 26)
@@ -1118,6 +1187,10 @@ struct DetailView: View {
                         if store.showAFPoints, let af = store.afCache[r.id] {
                             AFPointsOverlay(points: af.points, fitW: fitW, fitH: fitH, scale: scale)
                         }
+                        CompositionGuides(fitW: fitW, fitH: fitH,
+                                          thirds: store.showThirds,
+                                          diagonals: store.showDiagonals,
+                                          scale: scale)
                         if let sel = store.selectionRect, store.zoom > 1 {
                             Rectangle().stroke(Color.yellow, lineWidth: 1.5 / scale)
                                 .frame(width: sel.width * fitW, height: sel.height * fitH)
@@ -1280,6 +1353,118 @@ struct DetailView: View {
     }
 }
 
+// MARK: - 综合评分区（替换原合焦块）
+
+/// 综合评分面板：建议星级 + 题材（自动/手动）+ 各维度得分条 + 采用建议写入 Bridge 星级。
+/// 抽成独立 View 以减小 InfoView.body 的类型检查复杂度。
+private struct ScorePanel: View {
+    @EnvironmentObject var store: Store
+    let r: PhotoResult
+    let score: PhotoScore
+
+    /// 题材选择：auto 表示恢复自动识别，其余为人工覆盖。
+    private var genreBinding: Binding<String> {
+        Binding(
+            get: { score.genreIsGuess ? "auto" : score.genre.rawValue },
+            set: { value in
+                if value == "auto" { store.setGenre(nil, for: r.id) }
+                else { store.setGenre(PhotoGenre(rawValue: value), for: r.id) }
+            }
+        )
+    }
+
+    private var starColor: Color {
+        switch score.stars {
+        case 5, 4: return .green
+        case 3: return .orange
+        default: return .red
+        }
+    }
+
+    private func bar(_ part: ScorePart) -> some View {
+        let col: Color = part.score >= 70 ? .green : (part.score >= 40 ? .orange : .red)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(part.name).font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Text(part.weight > 0 ? String(format: "%.0f 分 · 占 %.0f%%", part.score, part.weight * 100)
+                                     : String(format: "%.0f 分", part.score))
+                    .font(.caption2).monospacedDigit().foregroundColor(.secondary)
+            }
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.gray.opacity(0.18)).frame(height: 5)
+                    Capsule().fill(col).frame(width: g.size.width * CGFloat(part.score / 100), height: 5)
+                }
+            }
+            .frame(height: 5)
+            .help(part.detail)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        ForEach(1...5, id: \.self) { n in
+                            Image(systemName: n <= score.stars ? "star.fill" : "star")
+                                .foregroundColor(n <= score.stars ? starColor : .gray)
+                        }
+                        Text("\(score.stars) 星").font(.headline).foregroundColor(starColor)
+                    }
+                    Text("综合 \(Int(score.total.rounded())) 分").font(.caption)
+                        .foregroundColor(.secondary).monospacedDigit()
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Picker("", selection: genreBinding) {
+                        Text("自动识别（\(score.genre.rawValue)）").tag("auto")
+                        ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+                    }
+                    .pickerStyle(.menu).frame(width: 168)
+                    Text(score.genreIsGuess ? "题材是软件猜的，可手动改"
+                                            : "题材已手动指定")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+
+            Text(score.headline).font(.callout)
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(score.parts) { p in bar(p) }
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    store.setRating(r.id, rating: score.stars)
+                } label: {
+                    Label("采用建议：打 \(score.stars) 星", systemImage: "checkmark.circle")
+                }
+                .buttonStyle(.borderedProminent).controlSize(.small)
+                .help("把上面的建议星级写入现有 Bridge 评分（xmp:Rating），随时可在最上面的评分条手动改")
+
+                if store.ratingCache[r.id] != nil {
+                    Text("当前 \(store.ratingCache[r.id]! == -1 ? "拒绝" : "\(store.ratingCache[r.id]!) 星")")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                if r.verdict.isSuspect {
+                    Button(store.excluded.contains(r.id) ? "已排除写入" : "排除写入") {
+                        store.toggleExclude(r.id)
+                    }
+                    .buttonStyle(.borderless).font(.caption)
+                }
+            }
+
+            Text("评分口径：\(score.genre.rule)").font(.caption2).foregroundColor(.secondary)
+            ForEach(score.tips, id: \.self) { t in
+                Text("· \(t)").font(.caption2).foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
 // MARK: - 右下：指标信息
 
 struct InfoView: View {
@@ -1380,24 +1565,19 @@ struct InfoView: View {
 
                 Divider()
 
-                // 3) 合焦：醒目的结论 + 大白话原因
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Image(systemName: r.verdict.isSuspect ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                            .font(.title3)
-                            .foregroundColor(verdictColor(r.verdict))
-                        Text(r.verdict.rawValue)
-                            .font(.headline)
-                            .foregroundColor(verdictColor(r.verdict))
-                        if r.verdict.isSuspect {
-                            Button(store.excluded.contains(r.id) ? "已排除写入" : "排除写入") {
-                                store.toggleExclude(r.id)
-                            }
-                            .buttonStyle(.borderless).font(.caption)
-                        }
-                        Spacer()
-                    }
-                    Text(r.reason).font(.callout)
+                // 3) 综合评分：建议星级 + 题材 + 各维度，替换原合焦结论块
+                ScorePanel(r: r, score: store.score(for: r))
+
+                Divider()
+
+                // 3b) 合焦结论：保留供复核，降级为一行（判定仍独立于评分）
+                HStack(spacing: 6) {
+                    Image(systemName: r.verdict.isSuspect ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(verdictColor(r.verdict))
+                    Text("合焦判定：\(r.verdict.rawValue)").font(.caption)
+                        .foregroundColor(verdictColor(r.verdict))
+                    Text("· \(r.reason)").font(.caption2).foregroundColor(.secondary).lineLimit(1)
                 }
 
                 Divider()
