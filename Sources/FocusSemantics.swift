@@ -59,6 +59,19 @@ enum FocusSemanticsEngine {
         // 对焦点处已明确认出鸟或人脸 → 直接采用。
         if result.kind == .bird || result.kind == .face { return result }
 
+        // 兜底零：长焦镜头下对焦点落在天空/云上，不足以断定是风光——
+        // 飞鸟大多以天空为背景，焦点落空非常常见（实测：鸟群、悬停飞鹰片
+        // 大量因「对焦点处是蓝天」被误判成风光）。降级为 unknown，交回
+        // 动物检测兜底与焦距规则。水面/陆地/山等仍维持风光结论。
+        if result.kind == .nonBird && telephoto {
+            let sceneIDs = result.labels.map { ident(of: $0) }
+            if sceneIDs.contains(where: { Self.isSkyLabel($0) }) {
+                result = FocusSemantics(kind: .unknown,
+                                        reason: "对焦点处是天空/云，长焦镜头下不排除拍鸟",
+                                        labels: result.labels)
+            }
+        }
+
         if telephoto {
             // 兜底一：对焦点裁块跑动物检测。小飞鸟被蓝天淹没、分类认不出时，
             // 动物检测器常常仍能检出（实测飞鸭 66%）。
@@ -219,6 +232,18 @@ enum FocusSemanticsEngine {
     private static func isLandscapeLabel(_ id: String) -> Bool {
         let s = id.lowercased()
         return landscapeWords.contains { s == $0 || s.hasSuffix("_\($0)") }
+    }
+
+    /// 天空类标签：长焦+对焦点落天空时不作为「风光」的强证据。
+    private static func isSkyLabel(_ id: String) -> Bool {
+        let s = id.lowercased()
+        return s == "sky" || s == "blue_sky" || s == "cloud" || s == "cloudy" || s == "horizon"
+    }
+
+    /// 从 "blue_sky 96%" 这类标签串里取标签名。
+    private static func ident(of label: String) -> String {
+        let parts = label.split(separator: " ")
+        return parts.isEmpty ? label : String(parts[0])
     }
 
     /// 常见分类标签的中文名，没收录就保留英文（保持可核对，不臆造）。

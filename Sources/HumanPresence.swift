@@ -49,13 +49,51 @@ enum HumanPresenceEngine {
             let ys = good.map { Double($0.location.y) }
             bestHeight = max(bestHeight, (ys.max() ?? 0) - (ys.min() ?? 0))
         }
-        guard personCount > 0 else { return .none }
+        guard personCount > 0 else { return personSegmentFallback(image) }
         let main = bestHeight >= mainSubjectHeight
         let why = main
             ? "检测到 \(personCount) 个人，人占画面较大（高度 \(Int(bestHeight * 100))%，背影/侧身也算）"
             : "检测到 \(personCount) 个人但很小（高度 \(Int(bestHeight * 100))%），更像风景里的人"
         return HumanPresence(hasPerson: true, isMainSubject: main, count: personCount,
                              bodyHeightRatio: bestHeight, reason: why)
+    }
+
+    /// 人体分割兜底：姿态关键点一个都没检出（人被芦苇/道具遮挡、低头蜷缩等）
+    /// 时，用 VNGeneratePersonSegmentationRequest 再试一次。分割能认出「这里
+    /// 有人形」，只是不知道具体关节。占画面 ≥30% 才算主体——门槛再低会把
+    /// 风景里的大块岩石/雕塑误判成人。
+    private static func personSegmentFallback(_ image: CGImage) -> HumanPresence {
+        let req = VNGeneratePersonSegmentationRequest()
+        req.qualityLevel = .accurate
+        req.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        try? handler.perform([req])
+        guard let buf = req.results?.first?.pixelBuffer,
+              let ratio = maskRatio(buf) else { return .none }
+        guard ratio >= 0.12 else { return .none }
+        let main = ratio >= 0.30
+        let why = main
+            ? "人体分割检测到人，占画面 \(Int(ratio * 100))%（姿态关键点没检出，可能被遮挡）"
+            : "人体分割检测到人但只占画面 \(Int(ratio * 100))%，更像风景里的人"
+        return HumanPresence(hasPerson: true, isMainSubject: main, count: 1,
+                             bodyHeightRatio: ratio, reason: why)
+    }
+
+    /// 统计单通道掩码里前景像素占比。
+    private static func maskRatio(_ buf: CVPixelBuffer) -> Double? {
+        let w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf)
+        CVPixelBufferLockBaseAddress(buf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
+        let bpr = CVPixelBufferGetBytesPerRow(buf)
+        var sum = 0
+        for row in 0..<h {
+            let ptr = base.advanced(by: row * bpr)
+            for col in 0..<w where ptr.load(fromByteOffset: col, as: UInt8.self) > 128 {
+                sum += 1
+            }
+        }
+        return Double(sum) / Double(w * h)
     }
 
     /// 从文件加载缩略图后检测，供 Store 异步调用。

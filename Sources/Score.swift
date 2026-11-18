@@ -106,6 +106,17 @@ enum ScoreEngine {
                 return (.bird, focus.reason)
             case .nonBird:
                 // 焦点落在明确非鸟的东西上：典型是长焦拍风光，哪怕镜头是打鸟头也不算拍鸟。
+                // 两个例外（均来自真值复盘）：
+                // a) 画面主体确认是人 → 人站在天空/山水前也是人像，别被对焦点落空带偏；
+                // b) 超长焦（≥400mm）且分割出明确前景小主体 → 多为站在地面/枝头的鸟，
+                //    分类没认出往往只是因为裁块被草地/泥土淹没。
+                if let human = human, human.isMainSubject
+                    || (human.hasPerson && human.bodyHeightRatio >= 0.22) {
+                    return (.portrait, human.reason)
+                }
+                if focal >= 400 && m.subjectSource == "前景主体" {
+                    return (.bird, "\(focus.reason)，但超长焦下分割出明确小主体，更可能是鸟")
+                }
                 return (.landscape, focus.reason)
             case .unknown:
                 break   // 识别不出来，交回下面的原有规则
@@ -140,6 +151,14 @@ enum ScoreEngine {
             return (.portrait, human.reason)
         }
 
+        // 有人 + 中短焦段（<300mm）：即使人在画面里不算大（背影/低头/被遮挡），
+        // 也大概率是环境人像，不该落到长焦/小主体规则里判成拍鸟。
+        // 高度门槛 22%：再低就分不清风景照里的游客了（实测点缀小人 16%~21%）。
+        if let human = human, human.hasPerson, human.bodyHeightRatio >= 0.22,
+           focal >= 10, focal < 300 {
+            return (.portrait, human.reason)
+        }
+
         // 打鸟镜头或超长焦：RF200-800 / 100-500 / 150-600 这类，或实际焦距≥300mm。
         if lensMax >= 400 || focal >= 300 {
             let bits = [focal > 0 ? "焦距 \(Int(focal))mm" : nil,
@@ -152,8 +171,11 @@ enum ScoreEngine {
             return (.bird, "中长焦 \(Int(focal))mm 且有识别主体")
         }
 
-        // 前景小主体（小鸟占画面很小一块）。
-        if m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.25 {
+        // 前景小主体（小鸟占画面很小一块）。需要百毫米以上焦距：
+        // 广角/标准镜头下画面里的小前景多是枯木、岩石、远处的点景人，
+        // 真值里 24~63mm 的风光片大量被这条规则误判成拍鸟。
+        if m.subjectSource == "前景主体" && subjectArea > 0 && subjectArea < 0.25
+            && focal >= 100 {
             return (.bird, "前景主体只占画面 \(Int(subjectArea * 100))%")
         }
 
@@ -197,17 +219,32 @@ enum ScoreEngine {
     /// 达到 60% 即算满分——对焦准确时主体本就是最锐的一块。
     /// 用户圈选主体后（manual 非 nil，圈选区相对最锐块的比值），以圈选为准——
     /// 用户指定了主体在哪，自动检测就该让位；否则圈选后清晰度不变，用户会困惑。
-    private static func clarityScore(_ m: PhotoMetrics, manual: Double? = nil) -> (Double, String) {
+    /// 对焦点处确认是鸟时，把对焦点所在分块也纳入——主体框没框准（鸟被枝叶
+    /// 遮住、显著性框到树枝上）时，相机对焦的鸟才是真主体。
+    private static func clarityScore(_ m: PhotoMetrics, manual: Double? = nil,
+                                     af: AFInfo? = nil,
+                                     focus: FocusSemantics? = nil) -> (Double, String) {
         if let manual = manual {
             let s = clamp(manual / 0.60 * 100)
             return (s, String(format: "你圈选的主体区域清晰度是最锐处的 %.0f%%（人工指定，覆盖自动识别）",
                               manual * 100))
         }
         let trusted = m.subjectSource == "前景主体" || m.subjectSource == "人脸检测"
-        let rel = trusted ? m.displaySubjectRatio
+        var rel = trusted ? m.displaySubjectRatio
                           : max(m.displaySubjectRatio, m.displayCenterRatio)
+        var who = trusted ? "主体" : "中心区（没识别出明确主体）"
+        // 对焦点确认是鸟：对焦点块锐度与主体框取较大者，框没框准时不冤枉鸟。
+        if focus?.kind == .bird, let p = af?.points.first, !m.scores.isEmpty,
+           m.peakBlock > 0 {
+            let c = min(m.cols - 1, max(0, Int(p.cx * Double(m.cols))))
+            let r = min(m.rows - 1, max(0, Int(p.cy * Double(m.rows))))
+            let afRel = m.scores[r * m.cols + c] / m.peakBlock
+            if afRel > rel {
+                rel = afRel
+                who = "对焦点处（识别到鸟）"
+            }
+        }
         let s = clamp(rel / 0.60 * 100)
-        let who = trusted ? "主体" : "中心区（没识别出明确主体）"
         return (s, String(format: "%@清晰度是最锐处的 %.0f%%", who, rel * 100))
     }
 
@@ -275,9 +312,10 @@ enum ScoreEngine {
     static func score(_ r: PhotoResult, af: AFInfo?, wb: WhiteBalanceStats?,
                       exif: ExifInfo?, genre: PhotoGenre, genreIsGuess: Bool,
                       genreReason: String = "",
-                      manualSubjectRatio: Double? = nil) -> PhotoScore {
+                      manualSubjectRatio: Double? = nil,
+                      focus: FocusSemantics? = nil) -> PhotoScore {
         let m = r.metrics
-        let clarity = clarityScore(m, manual: manualSubjectRatio)
+        let clarity = clarityScore(m, manual: manualSubjectRatio, af: af, focus: focus)
         let overall = overallScore(m)
         let focus = focusScore(m, verdict: r.verdict, af: af)
         let color = wbScore(wb)

@@ -470,7 +470,8 @@ final class Store: ObservableObject {
         return ScoreEngine.score(r, af: afCache[r.id], wb: wbCache[r.id],
                                  exif: exifCache[r.id], genre: g,
                                  genreIsGuess: guess, genreReason: why,
-                                 manualSubjectRatio: selectionDisplayRatio)
+                                 manualSubjectRatio: selectionDisplayRatio,
+                                 focus: focusCache[r.id])
     }
 
     func setGenre(_ g: PhotoGenre?, for url: URL) {
@@ -2382,6 +2383,10 @@ struct FocusScreenerApp: App {
             if trimmed.hasPrefix("UILOAD ") {
                 Self.pendingLoad = String(trimmed.dropFirst("UILOAD ".count))
                 try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+            } else if trimmed.hasPrefix("SCOREPROBE ") {
+                Self.runScoreProbe(dir: String(trimmed.dropFirst("SCOREPROBE ".count)))
+                try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+                exit(0)
             } else {
                 probeDir = trimmed
                 try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
@@ -2396,6 +2401,74 @@ struct FocusScreenerApp: App {
     /// UILOAD 调试入口：启动后自动载入该目录（仅 /tmp/genreprobe_trigger.txt 触发）。
     static var pendingLoad: String? = nil
 
+    /// 50 张真值回归（Tests/score_probe_real.swift 的 App 进程版——终端没有
+    /// 「下载」文件夹权限，真值样本在下载目录里只能由 App 进程读）。
+    /// 真值 CSV 固定 /tmp/scoreprobe/truth.csv（文件名,人工真值 两列）。
+    /// trigger 写 "SCOREPROBE <照片目录>"，输出 /tmp/scoreprobe_out.txt。
+    static func runScoreProbe(dir: String) {
+        var out = "文件名,人工真值,题材,建议星级,总分,主体清晰度,整体锐度,对焦,白平衡,判定\n"
+        var starGood = 0, goodCount = 0, starBad = 0, badCount = 0
+        func flush() {
+            var all = out
+            all += "\n好片 \(goodCount) 张：\(starGood) 张评 3 星以上；废片 \(badCount) 张：\(starBad) 张评 2 星以下\n"
+            try? all.write(toFile: "/tmp/scoreprobe_out.txt", atomically: true, encoding: .utf8)
+        }
+        defer { flush() }
+        // 先落一个头——即便中途出问题也能看出探针启动过。
+        flush()
+        guard let truthText = try? String(contentsOfFile: "/tmp/scoreprobe/truth.csv",
+                                          encoding: .utf8) else {
+            out += "真值 CSV 读取失败：/tmp/scoreprobe/truth.csv\n"
+            return
+        }
+        var truth: [String: String] = [:]
+        for row in truthText.split(separator: "\n").dropFirst() {
+            let cols = String(row).split(separator: ",", omittingEmptySubsequences: false)
+            if cols.count >= 2 {
+                truth[String(cols[0]).trimmingCharacters(in: .whitespaces)] =
+                    String(cols[1]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        let fm = FileManager.default
+        let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter {
+            MetadataWriter.rawExts.contains(($0 as NSString).pathExtension.lowercased())
+        }.sorted()
+        if files.isEmpty {
+            out += "目录无 RAW 文件或不可读：\(dir)\n"
+            return
+        }
+        for f in files {
+            let url = URL(fileURLWithPath: (dir as NSString).appendingPathComponent(f))
+            guard let m = Analyzer.analyze(url) else { continue }
+            let hiMin = Analyzer.independentThreshold()
+            let (v, _) = Analyzer.classify(m, hiMin: hiMin)
+            let r = PhotoResult(id: url, metrics: m, verdict: v, reason: "")
+            let wb = WhiteBalance.analyze(url)
+            let af = AFReader.read(url)
+            let exif = ExifInfo.read(url)
+            let focus = FocusSemanticsEngine.detect(url: url, subjectBoxes: m.bboxes)
+            let human = HumanPresenceEngine.detect(url: url)
+            let (genre, genreWhy) = ScoreEngine.guessGenre(m: m, af: af, wb: wb,
+                                                           exif: exif, focus: focus,
+                                                           human: human)
+            let s = ScoreEngine.score(r, af: af, wb: wb, exif: exif, genre: genre,
+                                      genreIsGuess: true, genreReason: genreWhy,
+                                      focus: focus)
+            func part(_ id: String) -> String {
+                s.parts.first { $0.id == id }.map { String(Int($0.score)) } ?? "-"
+            }
+            let name = (f as NSString).deletingPathExtension
+            let t = truth[f] ?? truth[name] ?? "?"
+            out += "\(f),\(t),\(genre.rawValue),\(s.stars),\(Int(s.total.rounded()))," +
+                   "\(part("clarity")),\(part("overall")),\(part("focus"))," +
+                   "\(part("color")),\(v.rawValue),\(genreWhy)\n"
+            if t.contains("废") { badCount += 1; if s.stars <= 2 { starBad += 1 } }
+            else if t.contains("好") { goodCount += 1; if s.stars >= 3 { starGood += 1 } }
+            flush()
+        }
+        print(out)
+    }
+
     /// 回归探针：递归扫描目录，按路径真值核对题材与星级。
     /// 真值取自路径成分：题材=拍鸟/风光/人像；好坏=好片/废片（好片应 ≥3 星，废片应 ≤2 星）。
     /// 输出 /tmp/genreprobe_out.txt。仅开发期使用。
@@ -2407,12 +2480,24 @@ struct FocusScreenerApp: App {
         }
         let fm = FileManager.default
         let root = URL(fileURLWithPath: dir)
+        // 递归收集 RAW。不要用 fm.enumerator：TCC 场景下它会被静默拦成空，
+        // contentsOfDirectory 则能正常触发/命中「文件与文件夹」授权。
         var files: [URL] = []
-        if let e = fm.enumerator(at: root, includingPropertiesForKeys: nil,
-                                 options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-            for case let u as URL in e
-            where MetadataWriter.rawExts.contains(u.pathExtension.lowercased()) {
-                files.append(u)
+        var queue: [URL] = [root]
+        while let dirURL = queue.popLast() {
+            let items = ((try? fm.contentsOfDirectory(atPath: dirURL.path)) ?? [])
+                .sorted()
+            for item in items {
+                let child = dirURL.appendingPathComponent(item)
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: child.path, isDirectory: &isDir) {
+                    if isDir.boolValue {
+                        queue.append(child)
+                    } else if MetadataWriter.rawExts.contains(
+                        (item as NSString).pathExtension.lowercased()) {
+                        files.append(child)
+                    }
+                }
             }
         }
         files.sort { $0.lastPathComponent < $1.lastPathComponent }
@@ -2433,14 +2518,24 @@ struct FocusScreenerApp: App {
         out += String(format: "批次基准 %.1f\n", hiMin)
 
         var goodOK = 0, goodTotal = 0, badOK = 0, badTotal = 0, genreMiss = 0
+        // 诊断 CSV：每张的相对路径、真值、预测、分项得分、关键中间量。
+        let csvHeader = "relpath,truth,genre,reason,ai,human,verdict,stars,total," +
+            "clarity,overall,focus,color,globalHi,peakBlock,subjectScore,ratio,centerRatio," +
+            "softRatio,spread,reblur,subjectReblur,subjectSource,bboxCount,bboxMax,focal"
+        var csvRows: [String] = [csvHeader]
+        let caseDir = URL(fileURLWithPath: "/tmp/genreprobe_cases")
+        try? FileManager.default.createDirectory(at: caseDir, withIntermediateDirectories: true)
+        let rawDir = caseDir.appendingPathComponent("raw")
+        try? FileManager.default.createDirectory(at: rawDir, withIntermediateDirectories: true)
         for u in files {
             guard let m = metricsByURL[u] else { continue }
             let af = AFReader.read(u)
             let exif = ExifInfo.read(u)
+            let wb = WhiteBalance.analyze(u)
             let focus = FocusSemanticsEngine.detect(url: u, subjectBoxes: m.bboxes)
             let human = HumanPresenceEngine.detect(url: u)
             let ai = AISubjectEngine.detect(url: u)
-            let (genre, why) = ScoreEngine.guessGenre(m: m, af: af, wb: nil,
+            let (genre, why) = ScoreEngine.guessGenre(m: m, af: af, wb: wb,
                                                       exif: exif, focus: focus,
                                                       human: human, ai: ai)
             let comps = u.pathComponents
@@ -2452,8 +2547,9 @@ struct FocusScreenerApp: App {
             let (verdict, _) = Analyzer.classify(m, hiMin: hiMin, subjectOverride: nil)
             let fake = PhotoResult(id: u, metrics: m, verdict: verdict,
                                    reason: "", overrideRect: nil)
-            let s = ScoreEngine.score(fake, af: af, wb: nil, exif: exif,
-                                      genre: genre, genreIsGuess: true, genreReason: why)
+            let s = ScoreEngine.score(fake, af: af, wb: wb, exif: exif,
+                                      genre: genre, genreIsGuess: true, genreReason: why,
+                                      focus: focus)
             var flag = ""
             if let truth = truth, truth != genre.rawValue {
                 flag += " ⚠题材应为\(truth)"
@@ -2471,8 +2567,60 @@ struct FocusScreenerApp: App {
             out += " 题材=\(genre.rawValue)（\(why)）"
             out += " AI=\(ai.map { "\($0.kind)" } ?? "nil")"
             out += " \(s.stars)星/\(Int(s.total.rounded()))分\(flag.isEmpty ? "" : flag)\n"
+
+            // 指标全零（解码异常）→ 把原文件复制出来供离线排查。
+            if m.globalHi <= 0 {
+                try? FileManager.default.copyItem(at: u, to: rawDir.appendingPathComponent(u.lastPathComponent))
+            }
+
+            // CSV 行
+            let rel = u.path.dropFirst(root.path.count + 1)
+            func esc(_ v: String) -> String { v.contains(",") ? "\"\(v)\"" : v }
+            func partScore(_ id: String) -> String {
+                if let p = s.parts.first(where: { $0.id == id }) {
+                    return String(format: "%.0f", p.score)
+                }
+                return ""
+            }
+            func num(_ v: Double) -> String { String(format: "%.2f", v) }
+            let truthStr = (truth ?? "-") + "|" + (isGood ? "好片" : isBad ? "废片" : "-")
+            let humanStr: String
+            if let h = human, h.hasPerson {
+                humanStr = "人\(h.count)个/主\(h.isMainSubject ? 1 : 0)/高\(Int(h.bodyHeightRatio * 100))%"
+            } else {
+                humanStr = "无人"
+            }
+            let bboxMax = m.bboxes.map { $0.width * $0.height }.max() ?? 0
+            let focal = exif?.focalLength ?? ""
+            csvRows.append([
+                esc(String(rel)), esc(truthStr), esc(genre.rawValue), esc(why),
+                ai.map { "\($0.kind)|\($0.reason)" } ?? "nil", esc(humanStr),
+                verdict.rawValue, "\(s.stars)", String(format: "%.0f", s.total),
+                partScore("clarity"), partScore("overall"), partScore("focus"),
+                partScore("color"), num(m.globalHi), num(m.peakBlock), num(m.subjectScore),
+                num(m.ratio), num(m.centerRatio), num(m.softRatio), num(m.spread),
+                num(m.reblurRatio), num(m.subjectReblur), esc(m.subjectSource),
+                "\(m.bboxes.count)", num(bboxMax), focal
+            ].joined(separator: ","))
+
+            // 报警案例：把预览图复制到 /tmp/genreprobe_cases，便于人工看图。
+            if !flag.isEmpty, let img = m.preview {
+                var tag = "OTHER"
+                if flag.contains("题材应为") { tag = "GENRE" }
+                if flag.contains("好片仅") { tag = "GOOD" + s.stars.description + "star" }
+                else if flag.contains("废片") { tag = "BAD" + s.stars.description + "star" }
+                let base = u.deletingPathExtension().lastPathComponent
+                let name = "\(tag)_\(base).jpg"
+                let rep = NSBitmapImageRep(cgImage: img)
+                if let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                    try? data.write(to: caseDir.appendingPathComponent(name))
+                }
+            }
         }
+        try? csvRows.joined(separator: "\n").write(
+            toFile: "/tmp/genreprobe_cases/diag.csv", atomically: true, encoding: .utf8)
         out += "\n汇总：好片达标 \(goodOK)/\(goodTotal)，废片压住 \(badOK)/\(badTotal)，题材不符 \(genreMiss)\n"
+        out += "诊断明细与案例图：/tmp/genreprobe_cases/diag.csv\n"
         print(out)
     }
 
