@@ -121,6 +121,8 @@ final class Store: ObservableObject {
     @Published var focusCache: [URL: FocusSemantics] = [:]
     /// 画面中是否有人（不依赖露脸，人体姿态检测），用于无脸人像的题材兜底。
     @Published var humanCache: [URL: HumanPresence] = [:]
+    /// AI 主体识别缓存：分割+分类较慢，异步算一次；nil 占位表示「进行中」。
+    @Published var aiCache: [URL: AISubject?] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
@@ -260,6 +262,7 @@ final class Store: ObservableObject {
         exifCache = [:]
         focusCache = [:]
         humanCache = [:]
+        aiCache = [:]
         ratingCache = [:]
         genreOverride = [:]
         heatCache = [:]
@@ -390,6 +393,20 @@ final class Store: ObservableObject {
         }
     }
 
+    /// AI 主体识别（前景实例分割 + 逐主体分类）：算一次缓存住。
+    /// 与对焦点语义互补——对焦点认不出时看画面主体本身是什么。
+    /// macOS 14 以下没有分割 API，结果是 nil，识别链退回原有规则。
+    func ensureAI(for url: URL) {
+        guard aiCache[url] == nil else { return }
+        aiCache[url] = AISubject(kind: .none, reason: "AI 主体识别进行中…", labels: [])
+        DispatchQueue.global(qos: .utility).async {
+            let s = AISubjectEngine.detect(url: url)
+            DispatchQueue.main.async {
+                self.aiCache[url] = s ?? AISubject(kind: .none, reason: "本机系统不支持前景分割（需 macOS 14+）", labels: [])
+            }
+        }
+    }
+
     func ensureRating(for url: URL) {
         guard ratingCache[url] == nil else { return }
         DispatchQueue.global(qos: .utility).async {
@@ -430,7 +447,8 @@ final class Store: ObservableObject {
         if let g = genreOverride[r.id] { return (g, false, "手动指定") }
         let (g, why) = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
                                               wb: wbCache[r.id], exif: exifCache[r.id],
-                                              focus: focusCache[r.id], human: humanCache[r.id])
+                                              focus: focusCache[r.id], human: humanCache[r.id],
+                                              ai: aiCache[r.id].flatMap { $0 })
         // 纠正记忆：对焦点特征与你手动纠正过的照片相似 → 按你的判断优先。
         if let focusLabels = focusCache[r.id]?.labels, !focusLabels.isEmpty {
             let names = focusLabels.map { GenreMemory.parseLabel($0) }
@@ -446,11 +464,13 @@ final class Store: ObservableObject {
 
     /// 立即算一张照片的综合评分。af/wb/exif 若尚未读到，用它当时已有的数据算，
     /// 读到后 InfoView 会随 @Published 变化自动重算，无需缓存。
+    /// 用户圈选过主体时，把圈选区清晰度传进去——主体清晰度按圈选算，否则圈选后不变化。
     func score(for r: PhotoResult) -> PhotoScore {
         let (g, guess, why) = genre(for: r)
         return ScoreEngine.score(r, af: afCache[r.id], wb: wbCache[r.id],
                                  exif: exifCache[r.id], genre: g,
-                                 genreIsGuess: guess, genreReason: why)
+                                 genreIsGuess: guess, genreReason: why,
+                                 manualSubjectRatio: selectionDisplayRatio)
     }
 
     func setGenre(_ g: PhotoGenre?, for url: URL) {
@@ -596,10 +616,101 @@ final class Store: ObservableObject {
         panel.nameFieldStringValue = "摄影筛选报告.csv"
         panel.allowedContentTypes = [UTType.commaSeparatedText]
         guard panel.runModal() == .OK, let u = panel.url else { return }
-        let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity, anchor: anchorHi)
+        // 题材记录：纯规则识别 + 最终生效题材 + 是否人工改过，供复核与调规则。
+        var genres: [URL: Report.GenreRecord] = [:]
+        for r in results {
+            let pure = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
+                                              wb: wbCache[r.id], exif: exifCache[r.id],
+                                              focus: focusCache[r.id], human: humanCache[r.id],
+                                              ai: aiCache[r.id].flatMap { $0 })
+            let (final, _, why) = genre(for: r)
+            let s = score(for: r)
+            genres[r.id] = Report.GenreRecord(autoGenre: pure.0.rawValue, reason: why,
+                                              finalGenre: final.rawValue,
+                                              manualGenre: genreOverride[r.id]?.rawValue,
+                                              stars: s.stars, total: Int(s.total.rounded()))
+        }
+        let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity,
+                             anchor: anchorHi, genres: genres)
         do {
             try csv.write(to: u, atomically: true, encoding: .utf8)
             status = "报告已导出：\(u.path)（可填「人工真值」列后用 verify.py 复核）"
+        } catch { status = "导出失败：\(error.localizedDescription)" }
+    }
+
+    // MARK: 开发模式调试导出
+
+    /// 开发模式：设置环境变量 FOCUSSCREENER_DEV=1 启动才显示「导出调试 CSV」。
+    /// 发布版没有这个按钮，也不写任何调试文件。
+    let devMode = ProcessInfo.processInfo.environment["FOCUSSCREENER_DEV"] == "1"
+
+    /// 调试 CSV：每张照片的全部中间参数（合焦判定依据、各维度分数与依据、
+    /// 对焦点语义标签、人体检测、题材判定链），用于对照真值调阈值。
+    func exportDebugCSV() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "调试记录.csv"
+        panel.allowedContentTypes = [UTType.commaSeparatedText]
+        guard panel.runModal() == .OK, let u = panel.url else { return }
+        let header = ["文件名", "判定", "判定原因", "建议星级", "综合分",
+                      "主体清晰度分", "主体清晰度依据", "整体锐度分", "整体锐度依据",
+                      "对焦准确度分", "对焦准确度依据", "白平衡分", "白平衡依据",
+                      "热力图合格线", "最锐区P99", "最清楚处", "偏软占比", "重模糊比",
+                      "拖影", "主体虚化", "主体定位", "主体清晰度显示值", "中心清晰度显示值",
+                      "对焦点数", "对焦模式", "对焦点语义", "语义依据", "语义top标签",
+                      "人体主体", "人体依据",
+                      "自动题材", "题材依据", "最终题材", "人工指定",
+                      "AI主体识别", "AI依据", "AI标签",
+                      "纠正记忆条数", "完整路径"]
+        var lines = [header.joined(separator: ",")]
+        for r in results {
+            let m = r.metrics
+            let s = score(for: r)
+            let pure = ScoreEngine.guessGenre(m: m, af: afCache[r.id], wb: wbCache[r.id],
+                                              exif: exifCache[r.id], focus: focusCache[r.id],
+                                              human: humanCache[r.id],
+                                              ai: aiCache[r.id].flatMap { $0 })
+            let (final, _, why) = genre(for: r)
+            let af = afCache[r.id]
+            let focus = focusCache[r.id]
+            let human = humanCache[r.id]
+            let ai = aiCache[r.id].flatMap { $0 }
+            // 各维度分与依据按固定列位取（白平衡在非人像题材可能缺失）。
+            func part(_ id: String) -> (String, String) {
+                if let p = s.parts.first(where: { $0.id == id }) {
+                    return (String(Int(p.score.rounded())), Report.q(p.detail))
+                }
+                return ("", Report.q("该题材未计此维度"))
+            }
+            let row = [
+                Report.q(r.id.lastPathComponent), Report.q(r.verdict.rawValue), Report.q(r.reason),
+                String(s.stars), String(Int(s.total.rounded())),
+                part("clarity").0, part("clarity").1,
+                part("overall").0, part("overall").1,
+                part("focus").0, part("focus").1,
+                part("color").0, part("color").1,
+                Report.f(Analyzer.referenceThreshold(metrics, sensitivity: sensitivity, anchor: anchorHi), 1),
+                Report.f(m.globalHi, 1), Report.f(m.scores.max() ?? 0, 1),
+                Report.f(m.softRatio), Report.f(m.reblurRatio), Report.f(m.anisotropy, 2), Report.f(m.subjectReblur),
+                Report.q(m.subjectSource),
+                Report.f(m.displaySubjectRatio), Report.f(m.displayCenterRatio),
+                String(af?.points.count ?? 0), Report.q(af?.modeName ?? ""),
+                Report.q(focus.map { "\($0.kind)" } ?? "未识别"),
+                Report.q(focus?.reason ?? ""),
+                Report.q(focus?.labels.prefix(5).joined(separator: " | ") ?? ""),
+                Report.q(human.map { $0.isMainSubject ? "是" : "否" } ?? "未检测"),
+                Report.q(human?.reason ?? ""),
+                Report.q(pure.0.rawValue), Report.q(why), Report.q(final.rawValue),
+                Report.q(genreOverride[r.id]?.rawValue ?? ""),
+                Report.q(ai.map { "\($0.kind)" } ?? "未识别"), Report.q(ai?.reason ?? ""),
+                Report.q(ai?.labels.prefix(5).joined(separator: " | ") ?? ""),
+                String(memory.count), Report.q(r.id.path),
+            ]
+            lines.append(row.joined(separator: ","))
+        }
+        let csv = "\u{FEFF}" + lines.joined(separator: "\n") + "\n"
+        do {
+            try csv.write(to: u, atomically: true, encoding: .utf8)
+            status = "调试记录已导出：\(u.path)"
         } catch { status = "导出失败：\(error.localizedDescription)" }
     }
 }
@@ -1817,18 +1928,39 @@ struct InfoView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     sectionTitle("白平衡 / 曝光参考")
                     if let wb {
-                        HStack(spacing: 16) {
-                            metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f",
+                        if compact {
+                            // 窄栏必须换行：HStack 四格 minWidth 96 最少要 432pt，
+                            // 人像时多出「人脸偏色」格就会超出窄栏宽度，内容被居中后
+                            // 左右各溢出一段，左边直接画到预览区上（用户实测的重叠）。
+                            // 改用与「判断依据」一致的自适应网格，放不下自动换行。
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)],
+                                      alignment: .leading, spacing: 8) {
+                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f",
                                      wb.meanR / max(wb.meanG, 1), wb.meanB / max(wb.meanG, 1)),
                                      "以绿色为 1，红比蓝高偏暖，蓝比红高偏冷，接近 1:1 为中性。")
-                            if let fr = wb.faceRG, let fb = wb.faceBG {
-                                metricCell("人脸偏色 红:蓝", String(format: "%.2f : %.2f", fr, fb),
-                                           "只看人脸区域的红蓝比例，参考肤色是否偏色。")
+                                if let fr = wb.faceRG, let fb = wb.faceBG {
+                                    metricCell("人脸偏色 红:蓝", String(format: "%.2f : %.2f", fr, fb),
+                                               "只看人脸区域的红蓝比例，参考肤色是否偏色。")
+                                }
+                                metricCell("过曝面积", String(format: "%.2f%%", wb.highlightClip * 100),
+                                           "亮到没有细节的面积占比，太高说明高光溢出。")
+                                metricCell("死黑面积", String(format: "%.2f%%", wb.shadowClip * 100),
+                                           "暗到没有细节的面积占比。")
                             }
-                            metricCell("过曝面积", String(format: "%.2f%%", wb.highlightClip * 100),
-                                       "亮到没有细节的面积占比，太高说明高光溢出。")
-                            metricCell("死黑面积", String(format: "%.2f%%", wb.shadowClip * 100),
-                                       "暗到没有细节的面积占比。")
+                        } else {
+                            HStack(spacing: 16) {
+                                metricCell("整体偏色 红:蓝", String(format: "%.2f : %.2f",
+                                     wb.meanR / max(wb.meanG, 1), wb.meanB / max(wb.meanG, 1)),
+                                     "以绿色为 1，红比蓝高偏暖，蓝比红高偏冷，接近 1:1 为中性。")
+                                if let fr = wb.faceRG, let fb = wb.faceBG {
+                                    metricCell("人脸偏色 红:蓝", String(format: "%.2f : %.2f", fr, fb),
+                                               "只看人脸区域的红蓝比例，参考肤色是否偏色。")
+                                }
+                                metricCell("过曝面积", String(format: "%.2f%%", wb.highlightClip * 100),
+                                           "亮到没有细节的面积占比，太高说明高光溢出。")
+                                metricCell("死黑面积", String(format: "%.2f%%", wb.shadowClip * 100),
+                                           "暗到没有细节的面积占比。")
+                            }
                         }
                         Text(wb.summary).font(.caption).foregroundColor(.secondary)
                     } else {
@@ -1850,6 +1982,7 @@ struct InfoView: View {
             store.ensureExif(for: r.id)
             store.ensureFocus(for: r.id, subjectBoxes: r.metrics.bboxes)
             store.ensureHuman(for: r.id)
+            store.ensureAI(for: r.id)
             store.ensureRating(for: r.id)
         }
         .onChange(of: r.id) { u in
@@ -1862,6 +1995,7 @@ struct InfoView: View {
                 store.ensureFocus(for: u)
             }
             store.ensureHuman(for: u)
+            store.ensureAI(for: u)
             store.ensureRating(for: u)
         }
     }
@@ -1977,8 +2111,23 @@ struct ContentView: View {
                 .help("切换信息区位置：默认在预览下方；点一下竖排到画面最右侧")
                 Button("快捷键") { store.showShortcuts = true }.font(.caption)
                 Button("选择文件夹") { pickFolder() }
+                .onAppear {
+                    // UILOAD 调试入口：启动后自动载入指定目录（仅开发期，trigger 文件触发）。
+                    if let dir = FocusScreenerApp.pendingLoad {
+                        FocusScreenerApp.pendingLoad = nil
+                        store.onlySuspect = false   // 调试复现用：显示全部，不被过滤清空
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            store.scan(folder: URL(fileURLWithPath: dir))
+                        }
+                    }
+                }
                 Button("导出 CSV 报告") { store.exportCSV() }
                     .disabled(store.results.isEmpty)
+                if store.devMode {
+                    Button("导出调试 CSV") { store.exportDebugCSV() }
+                        .disabled(store.results.isEmpty)
+                        .help("开发模式：导出全部中间参数（合焦依据、各维度分数、对焦点语义标签、题材判定链），用于对照真值调阈值。设置环境变量 FOCUSSCREENER_DEV=1 才显示。")
+                }
             }.padding(12)
 
             Divider()
@@ -2035,6 +2184,8 @@ struct ContentView: View {
                                 infoPane(compact: true)
                                     .frame(width: rightW)
                                     .frame(maxHeight: .infinity)
+                                    // 保险：任何将来超宽的内容都不许画到分隔条/预览区上。
+                                    .clipped()
                             }
                         }
                     } else {
@@ -2220,14 +2371,21 @@ struct FocusScreenerApp: App {
         // 隐藏的复核模式：--genreprobe <目录>，或 /tmp/genreprobe_trigger.txt
         // （内容为目录路径）。在 App 进程里跑（继承 App 对素材文件夹的读取权限），
         // 打印主体框 / 对焦点语义 / 最终题材到 /tmp/genreprobe_out.txt，仅开发期使用。
+        // trigger 文件以 "UILOAD " 开头则不跑探针，改为启动后自动载入该目录到界面。
         var probeDir: String? = nil
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--genreprobe"), i + 1 < args.count {
             probeDir = args[i + 1]
         } else if let t = try? String(contentsOfFile: "/tmp/genreprobe_trigger.txt",
                                       encoding: .utf8) {
-            probeDir = t.trimmingCharacters(in: .whitespacesAndNewlines)
-            try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+            let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("UILOAD ") {
+                Self.pendingLoad = String(trimmed.dropFirst("UILOAD ".count))
+                try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+            } else {
+                probeDir = trimmed
+                try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+            }
         }
         if let dir = probeDir, !dir.isEmpty {
             Self.runGenreProbe(dir: dir)
@@ -2235,45 +2393,86 @@ struct FocusScreenerApp: App {
         }
     }
 
+    /// UILOAD 调试入口：启动后自动载入该目录（仅 /tmp/genreprobe_trigger.txt 触发）。
+    static var pendingLoad: String? = nil
+
+    /// 回归探针：递归扫描目录，按路径真值核对题材与星级。
+    /// 真值取自路径成分：题材=拍鸟/风光/人像；好坏=好片/废片（好片应 ≥3 星，废片应 ≤2 星）。
+    /// 输出 /tmp/genreprobe_out.txt。仅开发期使用。
     static func runGenreProbe(dir: String) {
-        // 输出同时落到 /tmp，方便经 `open` 启动（无终端 stdout）时取结果。
         var out = ""
         defer {
             try? out.write(toFile: "/tmp/genreprobe_out.txt", atomically: true,
                            encoding: .utf8)
         }
         let fm = FileManager.default
-        let files = (try? fm.contentsOfDirectory(atPath: dir))?.filter {
-            MetadataWriter.rawExts.contains(($0 as NSString).pathExtension.lowercased())
-        }.sorted() ?? []
-        out += "文件数 \(files.count)\n"
-        for f in files {
-            let url = URL(fileURLWithPath: (dir as NSString).appendingPathComponent(f))
-            guard let m = Analyzer.analyze(url) else {
-                out += "\(f): Analyzer 失败\n"
-                continue
+        let root = URL(fileURLWithPath: dir)
+        var files: [URL] = []
+        if let e = fm.enumerator(at: root, includingPropertiesForKeys: nil,
+                                 options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
+            for case let u as URL in e
+            where MetadataWriter.rawExts.contains(u.pathExtension.lowercased()) {
+                files.append(u)
             }
-            out += "== \(f)\n"
-            out += "   subjectSource=\(m.subjectSource) 主体框数=\(m.bboxes.count)\n"
-            for b in m.bboxes.prefix(6) {
-                out += String(format: "   box x=%.3f y=%.3f w=%.3f h=%.3f\n",
-                              b.minX, b.minY, b.width, b.height)
-            }
-            let af = AFReader.read(url)
-            if let p = af?.points.first {
-                out += String(format: "   对焦点 cx=%.3f cy=%.3f mode=%@\n",
-                              p.cx, p.cy, af?.modeName ?? "-")
-            } else {
-                out += "   无对焦点数据\n"
-            }
-            let focus = FocusSemanticsEngine.detect(url: url, subjectBoxes: m.bboxes)
-            out += "   kind=\(focus.map { "\($0.kind)" } ?? "nil")  reason=\(focus?.reason ?? "-")\n"
-            out += "   labels=\(focus?.labels.prefix(6) ?? [])\n"
-            let exif = ExifInfo.read(url)
-            let (genre, why) = ScoreEngine.guessGenre(m: m, af: af, wb: nil,
-                                                      exif: exif, focus: focus, human: nil)
-            out += "   ⇒ 题材=\(genre.rawValue)（\(why)）\n"
         }
+        files.sort { $0.lastPathComponent < $1.lastPathComponent }
+        out += "文件数 \(files.count)\n"
+
+        // 第一遍：全量分析，算批次基准。
+        var metricsByURL: [URL: PhotoMetrics] = [:]
+        var metrics: [PhotoMetrics] = []
+        for u in files {
+            if let m = Analyzer.analyze(u) {
+                metricsByURL[u] = m
+                metrics.append(m)
+            } else {
+                out += "\(u.lastPathComponent): Analyzer 失败\n"
+            }
+        }
+        let hiMin = Analyzer.referenceThreshold(metrics, sensitivity: 1.0, anchor: nil)
+        out += String(format: "批次基准 %.1f\n", hiMin)
+
+        var goodOK = 0, goodTotal = 0, badOK = 0, badTotal = 0, genreMiss = 0
+        for u in files {
+            guard let m = metricsByURL[u] else { continue }
+            let af = AFReader.read(u)
+            let exif = ExifInfo.read(u)
+            let focus = FocusSemanticsEngine.detect(url: u, subjectBoxes: m.bboxes)
+            let human = HumanPresenceEngine.detect(url: u)
+            let ai = AISubjectEngine.detect(url: u)
+            let (genre, why) = ScoreEngine.guessGenre(m: m, af: af, wb: nil,
+                                                      exif: exif, focus: focus,
+                                                      human: human, ai: ai)
+            let comps = u.pathComponents
+            let truth = comps.contains("拍鸟") ? "拍鸟"
+                      : comps.contains("人像") ? "人像"
+                      : comps.contains("风光") ? "风光" : nil
+            let isGood = comps.contains("好片")
+            let isBad = comps.contains("废片")
+            let (verdict, _) = Analyzer.classify(m, hiMin: hiMin, subjectOverride: nil)
+            let fake = PhotoResult(id: u, metrics: m, verdict: verdict,
+                                   reason: "", overrideRect: nil)
+            let s = ScoreEngine.score(fake, af: af, wb: nil, exif: exif,
+                                      genre: genre, genreIsGuess: true, genreReason: why)
+            var flag = ""
+            if let truth = truth, truth != genre.rawValue {
+                flag += " ⚠题材应为\(truth)"
+                genreMiss += 1
+            }
+            if isGood {
+                goodTotal += 1
+                if s.stars >= 3 { goodOK += 1 } else { flag += " ⚠好片仅\(s.stars)星" }
+            }
+            if isBad {
+                badTotal += 1
+                if s.stars <= 2 { badOK += 1 } else { flag += " ⚠废片\(s.stars)星" }
+            }
+            out += "== \(u.lastPathComponent) [\(comps.count >= 2 ? comps[comps.count - 2] : "")]"
+            out += " 题材=\(genre.rawValue)（\(why)）"
+            out += " AI=\(ai.map { "\($0.kind)" } ?? "nil")"
+            out += " \(s.stars)星/\(Int(s.total.rounded()))分\(flag.isEmpty ? "" : flag)\n"
+        }
+        out += "\n汇总：好片达标 \(goodOK)/\(goodTotal)，废片压住 \(badOK)/\(badTotal)，题材不符 \(genreMiss)\n"
         print(out)
     }
 

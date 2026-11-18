@@ -86,7 +86,8 @@ enum ScoreEngine {
     static func guessGenre(m: PhotoMetrics, af: AFInfo?, wb: WhiteBalanceStats?,
                            exif: ExifInfo?,
                            focus: FocusSemantics? = nil,
-                           human: HumanPresence? = nil) -> (PhotoGenre, String) {
+                           human: HumanPresence? = nil,
+                           ai: AISubject? = nil) -> (PhotoGenre, String) {
         var subjectArea = 0.0
         for b in m.bboxes { subjectArea += Double(b.width * b.height) }
 
@@ -108,6 +109,19 @@ enum ScoreEngine {
                 return (.landscape, focus.reason)
             case .unknown:
                 break   // 识别不出来，交回下面的原有规则
+            }
+        }
+
+        // —— 第二优先级：AI 主体识别（前景分割抠出主体再分类）——
+        // 对焦点语义认不出时，看画面主体本身是什么。背景被抠掉后不受蓝天/水面干扰。
+        if let ai = ai {
+            switch ai.kind {
+            case .face:
+                return (.portrait, ai.reason)
+            case .bird:
+                return (.bird, ai.reason)
+            case .other, .none:
+                break   // 没认出人或鸟，交回下面的规则
             }
         }
 
@@ -181,7 +195,14 @@ enum ScoreEngine {
 
     /// 主体清晰度：主体（或推测主体时的中心区）相对全图最锐块的比例。
     /// 达到 60% 即算满分——对焦准确时主体本就是最锐的一块。
-    private static func clarityScore(_ m: PhotoMetrics) -> (Double, String) {
+    /// 用户圈选主体后（manual 非 nil，圈选区相对最锐块的比值），以圈选为准——
+    /// 用户指定了主体在哪，自动检测就该让位；否则圈选后清晰度不变，用户会困惑。
+    private static func clarityScore(_ m: PhotoMetrics, manual: Double? = nil) -> (Double, String) {
+        if let manual = manual {
+            let s = clamp(manual / 0.60 * 100)
+            return (s, String(format: "你圈选的主体区域清晰度是最锐处的 %.0f%%（人工指定，覆盖自动识别）",
+                              manual * 100))
+        }
         let trusted = m.subjectSource == "前景主体" || m.subjectSource == "人脸检测"
         let rel = trusted ? m.displaySubjectRatio
                           : max(m.displaySubjectRatio, m.displayCenterRatio)
@@ -253,9 +274,10 @@ enum ScoreEngine {
     /// 主入口：算出建议星级与全部可解释维度。af / wb / exif 可为 nil（缺失的维度不参与加权）。
     static func score(_ r: PhotoResult, af: AFInfo?, wb: WhiteBalanceStats?,
                       exif: ExifInfo?, genre: PhotoGenre, genreIsGuess: Bool,
-                      genreReason: String = "") -> PhotoScore {
+                      genreReason: String = "",
+                      manualSubjectRatio: Double? = nil) -> PhotoScore {
         let m = r.metrics
-        let clarity = clarityScore(m)
+        let clarity = clarityScore(m, manual: manualSubjectRatio)
         let overall = overallScore(m)
         let focus = focusScore(m, verdict: r.verdict, af: af)
         let color = wbScore(wb)

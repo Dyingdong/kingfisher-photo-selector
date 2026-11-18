@@ -25,6 +25,7 @@ SRC=(
     "$ROOT/Sources/ExifInfo.swift"
     "$ROOT/Sources/FocusSemantics.swift"
     "$ROOT/Sources/HumanPresence.swift"
+    "$ROOT/Sources/AISubject.swift"
     "$ROOT/Sources/GenreMemory.swift"
     "$ROOT/Sources/Score.swift"
 )
@@ -33,7 +34,11 @@ FLAGS=(-O -swift-version 5 -target arm64-apple-macosx13.0)
 # GUI App
 swiftc "${FLAGS[@]}" "${SRC[@]}" "$ROOT/App/App.swift" \
     -o "$APP/Contents/MacOS/FocusScreener"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+# 稳定的指定要求（identifier 固定）：这样 TCC 对「下载」文件夹的授权在
+# 重新编译后依然有效（否则 ad-hoc 签名每次都变，授权会失效）。
+codesign --force --deep --sign - \
+    --requirements '=designated => identifier "local.workbuddy.focusscreener"' \
+    "$APP" >/dev/null 2>&1 || codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
 echo "BUILT: $APP"
 
 # 命令行工具（与 App 共用同一套判定与报告格式，供离线复核 / 自动化验证）

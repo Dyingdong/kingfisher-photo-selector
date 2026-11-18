@@ -184,7 +184,7 @@ enum FocusSemanticsEngine {
         return image.cropping(to: CGRect(x: x, y: y, width: side, height: side))
     }
 
-    // MARK: 标签判定
+    // MARK: 标签判定（AI 主体识别引擎共用，故开放为 internal）
 
     /// ImageNet 里的鸟类标签：通用词 + 常见鸟种/部位。
     private static let birdWords = ["bird", "robin", "hummingbird", "eagle", "vulture",
@@ -194,7 +194,7 @@ enum FocusSemanticsEngine {
         "turkey", "peacock", "jay", "magpie", "finch", "sparrow", "warbler", "wren",
         "dove", "pigeon", "cuckoo", "kingfisher", "woodpecker", "flicker", "plover",
         "sandpiper", "oystercatcher", "bittern", "limpkin", "spoonbill", "frigatebird"]
-    private static func isBirdLabel(_ id: String) -> Bool {
+    static func isBirdLabel(_ id: String) -> Bool {
         let s = id.lowercased()
         return birdWords.contains { s == $0 || s.hasSuffix("_\($0)") || s.contains($0) }
     }
@@ -202,6 +202,13 @@ enum FocusSemanticsEngine {
     private static func isFaceLabel(_ id: String) -> Bool {
         let s = id.lowercased()
         return s.contains("face") || s.contains("human") || s == "person"
+    }
+    /// 供 AI 主体识别引擎使用
+    static func faceLabelConfidence(in tops: [VNClassificationObservation]) -> VNClassificationObservation? {
+        tops.first { Self.isFaceLabel($0.identifier) && $0.confidence >= 0.20 }
+    }
+    static func birdLabelConfidence(in tops: [VNClassificationObservation]) -> VNClassificationObservation? {
+        tops.first { Self.isBirdLabel($0.identifier) && $0.confidence >= 0.20 }
     }
 
     /// 大场景自然风景标签（用于判定「长焦拍风光」）。刻意不含结构/树木/栅栏。
