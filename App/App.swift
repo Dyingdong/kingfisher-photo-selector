@@ -369,10 +369,11 @@ final class Store: ObservableObject {
     }
 
     /// 对焦点语义：算一次缓存住。结果只影响题材识别，不算出来也能用原有规则。
-    func ensureFocus(for url: URL) {
+    /// 传入主体检测框：对焦点没认出鸟时，拿主体框再复核一次能不能认出鸟。
+    func ensureFocus(for url: URL, subjectBoxes: [CGRect] = []) {
         guard focusCache[url] == nil else { return }
         DispatchQueue.global(qos: .utility).async {
-            let s = FocusSemanticsEngine.detect(url: url)
+            let s = FocusSemanticsEngine.detect(url: url, subjectBoxes: subjectBoxes)
             DispatchQueue.main.async { self.focusCache[url] = s }
         }
     }
@@ -1068,6 +1069,9 @@ private struct AFPointsOverlay: View {
 struct DetailView: View {
     @EnvironmentObject var store: Store
     let r: PhotoResult
+    /// 右侧竖排布局时预览区较窄：工具栏换成两行、提示文字收进悬停说明，
+    /// 否则一整行（开关 + 缩放 + 一长串提示）超出预览区宽度，会画到信息区上。
+    var compact = false
 
     /// 图像当前在容器坐标系里的显示矩形。
     /// 视图先以自身中心 scaleEffect，再叠加 offset，所以显示矩形的左上角要
@@ -1193,20 +1197,41 @@ struct DetailView: View {
     var body: some View {
         let m = r.metrics
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Toggle("锐度热力图", isOn: $store.showHeatmap)
-                Toggle("对焦点", isOn: $store.showAFPoints)
-                Toggle("九宫格", isOn: $store.showThirds)
-                Toggle("对角线", isOn: $store.showDiagonals)
-                Button("－") { store.zoomOut() }.frame(width: 26)
-                Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
-                Button("＋") { store.zoomIn() }.frame(width: 26)
-                Button("复位") { store.resetZoom() }.font(.caption)
-                Spacer()
-                Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原")
-                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+            if compact {
+                // 右侧窄栏：开关一行、缩放一行，保证最窄时也不超出预览区宽度。
+                HStack(spacing: 12) {
+                    Toggle("锐度热力图", isOn: $store.showHeatmap)
+                    Toggle("对焦点", isOn: $store.showAFPoints)
+                    Toggle("九宫格", isOn: $store.showThirds)
+                    Toggle("对角线", isOn: $store.showDiagonals)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 4)
+                HStack(spacing: 12) {
+                    Button("－") { store.zoomOut() }.frame(width: 26)
+                    Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
+                    Button("＋") { store.zoomIn() }.frame(width: 26)
+                    Button("复位") { store.resetZoom() }.font(.caption)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.bottom, 4)
+                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原")
+            } else {
+                HStack(spacing: 12) {
+                    Toggle("锐度热力图", isOn: $store.showHeatmap)
+                    Toggle("对焦点", isOn: $store.showAFPoints)
+                    Toggle("九宫格", isOn: $store.showThirds)
+                    Toggle("对角线", isOn: $store.showDiagonals)
+                    Button("－") { store.zoomOut() }.frame(width: 26)
+                    Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
+                    Button("＋") { store.zoomIn() }.frame(width: 26)
+                    Button("复位") { store.resetZoom() }.font(.caption)
+                    Spacer()
+                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原")
+                        .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
             }
-            .padding(.horizontal, 12).padding(.vertical, 6)
 
             FrameLegend()
 
@@ -1647,20 +1672,17 @@ struct InfoView: View {
                             Text(exif.coreLine).font(.callout).monospacedDigit()
                         }
                         if compact {
-                            // 窄栏规整排版：短值两列一行；镜头名长，整行放、最多两行不截断。
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(alignment: .top, spacing: 14) {
-                                    cell("相机", exif.camera ?? "—")
-                                    cell("曝光补偿", exif.exposureBias ?? "—")
-                                }
+                            // 窄栏规整排版：相机与镜头同一行（镜头长、最多两行不截断）；
+                            // 曝光补偿已并入上面核心参数行；拍摄时间整行。
+                            HStack(alignment: .top, spacing: 14) {
+                                cell("相机", exif.camera ?? "—")
                                 cell("镜头", exif.lens ?? "—", limit: 2)
-                                cell("拍摄时间", exif.dateTime ?? "—")
                             }
+                            cell("拍摄时间", exif.dateTime ?? "—")
                         } else {
                             HStack(spacing: 16) {
                                 cell("相机", exif.camera ?? "—")
                                 cell("镜头", exif.lens ?? "—")
-                                cell("曝光补偿", exif.exposureBias ?? "—")
                                 cell("拍摄时间", exif.dateTime ?? "—")
                             }
                         }
@@ -1766,7 +1788,7 @@ struct InfoView: View {
             store.ensureWB(for: r.id)
             store.ensureAF(for: r.id)
             store.ensureExif(for: r.id)
-            store.ensureFocus(for: r.id)
+            store.ensureFocus(for: r.id, subjectBoxes: r.metrics.bboxes)
             store.ensureHuman(for: r.id)
             store.ensureRating(for: r.id)
         }
@@ -1774,7 +1796,11 @@ struct InfoView: View {
             store.ensureWB(for: u)
             store.ensureAF(for: u)
             store.ensureExif(for: u)
-            store.ensureFocus(for: u)
+            if let nr = store.results.first(where: { $0.id == u }) {
+                store.ensureFocus(for: u, subjectBoxes: nr.metrics.bboxes)
+            } else {
+                store.ensureFocus(for: u)
+            }
             store.ensureHuman(for: u)
             store.ensureRating(for: u)
         }
@@ -1850,7 +1876,7 @@ struct ContentView: View {
     private var previewPane: some View {
         if let id = store.selected,
            let r = store.results.first(where: { $0.id == id }) {
-            DetailView(r: r)
+            DetailView(r: r, compact: store.infoOnRight)
         } else {
             VStack(spacing: 10) {
                 Image(systemName: "photo.on.rectangle.angled")
@@ -2129,6 +2155,68 @@ struct ContentView: View {
 @main
 struct FocusScreenerApp: App {
     @StateObject private var store = Store()
+
+    init() {
+        // 隐藏的复核模式：--genreprobe <目录>，或 /tmp/genreprobe_trigger.txt
+        // （内容为目录路径）。在 App 进程里跑（继承 App 对素材文件夹的读取权限），
+        // 打印主体框 / 对焦点语义 / 最终题材到 /tmp/genreprobe_out.txt，仅开发期使用。
+        var probeDir: String? = nil
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--genreprobe"), i + 1 < args.count {
+            probeDir = args[i + 1]
+        } else if let t = try? String(contentsOfFile: "/tmp/genreprobe_trigger.txt",
+                                      encoding: .utf8) {
+            probeDir = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            try? FileManager.default.removeItem(atPath: "/tmp/genreprobe_trigger.txt")
+        }
+        if let dir = probeDir, !dir.isEmpty {
+            Self.runGenreProbe(dir: dir)
+            exit(0)
+        }
+    }
+
+    static func runGenreProbe(dir: String) {
+        // 输出同时落到 /tmp，方便经 `open` 启动（无终端 stdout）时取结果。
+        var out = ""
+        defer {
+            try? out.write(toFile: "/tmp/genreprobe_out.txt", atomically: true,
+                           encoding: .utf8)
+        }
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(atPath: dir))?.filter {
+            MetadataWriter.rawExts.contains(($0 as NSString).pathExtension.lowercased())
+        }.sorted() ?? []
+        out += "文件数 \(files.count)\n"
+        for f in files {
+            let url = URL(fileURLWithPath: (dir as NSString).appendingPathComponent(f))
+            guard let m = Analyzer.analyze(url) else {
+                out += "\(f): Analyzer 失败\n"
+                continue
+            }
+            out += "== \(f)\n"
+            out += "   subjectSource=\(m.subjectSource) 主体框数=\(m.bboxes.count)\n"
+            for b in m.bboxes.prefix(6) {
+                out += String(format: "   box x=%.3f y=%.3f w=%.3f h=%.3f\n",
+                              b.minX, b.minY, b.width, b.height)
+            }
+            let af = AFReader.read(url)
+            if let p = af?.points.first {
+                out += String(format: "   对焦点 cx=%.3f cy=%.3f mode=%@\n",
+                              p.cx, p.cy, af?.modeName ?? "-")
+            } else {
+                out += "   无对焦点数据\n"
+            }
+            let focus = FocusSemanticsEngine.detect(url: url, subjectBoxes: m.bboxes)
+            out += "   kind=\(focus.map { "\($0.kind)" } ?? "nil")  reason=\(focus?.reason ?? "-")\n"
+            out += "   labels=\(focus?.labels.prefix(6) ?? [])\n"
+            let exif = ExifInfo.read(url)
+            let (genre, why) = ScoreEngine.guessGenre(m: m, af: af, wb: nil,
+                                                      exif: exif, focus: focus, human: nil)
+            out += "   ⇒ 题材=\(genre.rawValue)（\(why)）\n"
+        }
+        print(out)
+    }
+
     var body: some Scene {
         WindowGroup("摄影照片筛选工具") {
             ContentView().environmentObject(store)

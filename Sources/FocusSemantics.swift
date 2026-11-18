@@ -17,17 +17,28 @@ struct FocusSemantics {
     let labels: [String]    // top 标签，供界面悬停查看
 }
 
-/// 对焦点局部语义识别。做法：以相机记录的对焦点为中心，裁一块画面（默认边长约 25%），
-/// 对裁块跑 Vision 的 ImageNet 风格分类，看 top 结果里有没有人脸/鸟/其他明确物体。
+/// 对焦点局部语义识别。做法：以相机记录的对焦点为中心裁一块画面（边长约 30%），
+/// 跑 Vision 分类，看 top 结果里有没有人脸/鸟/其他明确物体；认不出鸟时再用
+/// 专门的动物检测（VNRecognizeAnimalsRequest）和主体框交叉复核兜底。
 ///
-/// 边界（务必如实）：Vision 没有专门的「鸟身体部位」检测器，这里用的是通用图像分类，
-/// 对大而清楚的鸟识别率高（实测鹭 0.63），对很小/复杂背景的鸟会漏。因此：
-/// - 只有「明确识别到鸟」时才据此判拍鸟；
-/// - 识别不出时返回 unknown，交回原有规则，绝不硬猜；
+/// 边界（务必如实）：
+/// - 通用分类对大而清楚的鸟识别率高（实测鹭 0.63），对很小/纯蓝天的飞鸟会漏
+///   （实测飞鸭裁块只有蓝天 96%）；
+/// - 动物检测能认出分类漏掉的小飞鸟（实测 66%），但它分不清猫狗鸟，
+///   所以只在长焦镜头（焦距≥200mm 或镜头长焦端≥300mm）时启用兜底——
+///   长焦对着的动物绝大多数是鸟，也避免公园里拍到狗被误判成拍鸟；
+/// - 只有「明确识别到」才推翻，识别不出一律交回原有规则，绝不硬猜；
 /// - 结果仅决定题材权重，不影响合焦结论。
 enum FocusSemanticsEngine {
-    /// 检测对焦点处的语义。af 为相机对焦点（归一化左上原点）；image 为原图或缩略图。
-    static func detect(image: CGImage, af: AFInfo?) -> FocusSemantics {
+    /// 动物检测置信度门槛：实测小飞鸟 66%，纯风景裁块无结果，0.40 稳妥。
+    private static let animalThreshold: Double = 0.40
+
+    /// 检测对焦点处的语义。af 为相机对焦点（归一化左上原点）；image 为缩略图。
+    /// subjectBoxes 为主体检测框（归一化、左下原点，同 PhotoMetrics.bboxes）；
+    /// telephoto 表示当前是长焦镜头（允许动物检测兜底）。
+    static func detect(image: CGImage, af: AFInfo?,
+                       subjectBoxes: [CGRect] = [],
+                       telephoto: Bool = false) -> FocusSemantics {
         guard let af = af, let p = af.points.first else {
             return FocusSemantics(kind: .unknown, reason: "无相机对焦点数据", labels: [])
         }
@@ -37,16 +48,49 @@ enum FocusSemanticsEngine {
                                   labels: [])
         }
 
-        guard let crop = cropAround(image: image, cx: p.cx, cy: p.cy) else {
-            return FocusSemantics(kind: .unknown, reason: "对焦点区域无法裁剪", labels: [])
+        let focusCrop = cropAround(image: image, cx: p.cx, cy: p.cy)
+        var result: FocusSemantics
+        if let crop = focusCrop {
+            result = classify(crop: crop, fallbackReason: "对焦点区域识别不出明确内容")
+        } else {
+            result = FocusSemantics(kind: .unknown, reason: "对焦点区域无法裁剪", labels: [])
         }
+
+        // 对焦点处已明确认出鸟或人脸 → 直接采用。
+        if result.kind == .bird || result.kind == .face { return result }
+
+        if telephoto {
+            // 兜底一：对焦点裁块跑动物检测。小飞鸟被蓝天淹没、分类认不出时，
+            // 动物检测器常常仍能检出（实测飞鸭 66%）。
+            if let crop = focusCrop, let conf = animalConfidence(in: crop), conf >= animalThreshold {
+                return FocusSemantics(
+                    kind: .bird,
+                    reason: "对焦点处识别到：\(Self.cnName("bird")) (\(Int((conf * 100).rounded()))%)",
+                    labels: result.labels)
+            }
+            // 兜底二：对焦点没认出鸟（判成风景/认不出），拿主体检测框再复核。
+            // 主体分割框往往正框在鸟身上，逐框跑动物检测和分类。
+            if let hit = birdInSubjectBoxes(image: image, boxes: subjectBoxes) {
+                let pct = Int((hit.confidence * 100).rounded())
+                let why = hit.byAnimal
+                      ? "对焦点处没认出鸟，但画面主体处检测到动物 (\(pct)%)，长焦镜头下多为鸟"
+                      : "对焦点处没认出鸟，但画面主体处识别到：\(Self.cnName(hit.identifier)) (\(pct)%)"
+                return FocusSemantics(kind: .bird, reason: why, labels: hit.labels)
+            }
+        }
+        return result
+    }
+
+    /// 对一块裁剪图跑分类，返回按置信度过滤后的 top 标签。
+    private static func classify(crop: CGImage,
+                                 fallbackReason: String) -> FocusSemantics {
         let req = VNClassifyImageRequest()
         let handler = VNImageRequestHandler(cgImage: crop, options: [:])
         try? handler.perform([req])
         let obs = (req.results ?? []).filter { $0.confidence >= 0.05 }.prefix(12)
         let tops = Array(obs)
         guard !tops.isEmpty else {
-            return FocusSemantics(kind: .unknown, reason: "对焦点区域识别不出明确内容", labels: [])
+            return FocusSemantics(kind: .unknown, reason: fallbackReason, labels: [])
         }
         let labels = tops.map { "\($0.identifier) \(Int(($0.confidence * 100).rounded()))%" }
 
@@ -73,6 +117,43 @@ enum FocusSemanticsEngine {
         return FocusSemantics(kind: .unknown, reason: "对焦点处识别不明确", labels: labels)
     }
 
+    /// 裁块动物检测：检出即返回最高置信度（Vision 动物检测支持猫/狗/鸟等）。
+    private static func animalConfidence(in crop: CGImage) -> Double? {
+        let req = VNRecognizeAnimalsRequest()
+        let handler = VNImageRequestHandler(cgImage: crop, options: [:])
+        try? handler.perform([req])
+        guard let results = req.results, !results.isEmpty else { return nil }
+        return Double(results.map { $0.confidence }.max() ?? 0)
+    }
+
+    /// 在主体检测框里找鸟：逐个（最多前 3 大的框）裁块，先跑动物检测、
+    /// 再跑分类找鸟种标签。识别到即返回；找不到返回 nil，不硬猜。
+    private static func birdInSubjectBoxes(image: CGImage,
+                                           boxes: [CGRect]) -> (confidence: Double,
+                                                                identifier: String,
+                                                                labels: [String],
+                                                                byAnimal: Bool)? {
+        guard !boxes.isEmpty else { return nil }
+        let sorted = boxes.sorted { $0.width * $0.height > $1.width * $1.height }.prefix(3)
+        for box in sorted {
+            guard let crop = cropAroundBox(image: image, box: box) else { continue }
+            // 动物检测：对分类认不出的小飞鸟更稳。
+            if let conf = animalConfidence(in: crop), conf >= animalThreshold {
+                return (conf, "bird", [], true)
+            }
+            // 分类兜底：能认出鸟种就认鸟种。
+            let req = VNClassifyImageRequest()
+            let handler = VNImageRequestHandler(cgImage: crop, options: [:])
+            try? handler.perform([req])
+            let tops = (req.results ?? []).filter { $0.confidence >= 0.05 }.prefix(12)
+            if let hit = tops.first(where: { Self.isBirdLabel($0.identifier) && $0.confidence >= 0.20 }) {
+                let labels = tops.map { "\($0.identifier) \(Int(($0.confidence * 100).rounded()))%" }
+                return (Double(hit.confidence), hit.identifier, labels, false)
+            }
+        }
+        return nil
+    }
+
     /// 以对焦点为中心裁一块正方形，边长取画面短边的 focusSpan 比例，并保证最小像素数。
     private static let focusSpan = 0.30
     private static func cropAround(image: CGImage, cx: Double, cy: Double) -> CGImage? {
@@ -84,6 +165,22 @@ enum FocusSemanticsEngine {
         x = max(0, min(x, w - side))
         y = max(0, min(y, h - side))
         guard side > 0, w >= side, h >= side else { return image }
+        return image.cropping(to: CGRect(x: x, y: y, width: side, height: side))
+    }
+
+    /// 以主体框为中心裁一块正方形：边长框最长边的 2.4 倍（留足鸟的翅膀/周围上下文），
+    /// 最短不低于 160 像素，保证小到只有几十像素的飞鸟也能凑出可检测的裁块。
+    private static func cropAroundBox(image: CGImage, box: CGRect) -> CGImage? {
+        let w = image.width, h = image.height
+        let bwPx = box.width * CGFloat(w), bhPx = box.height * CGFloat(h)
+        let side = max(160, Int(max(bwPx, bhPx) * 2.4))
+        let cx = (box.minX + box.width / 2) * CGFloat(w)          // Vision 坐标 x 与像素一致
+        let cyTop = (1 - box.minY - box.height / 2) * CGFloat(h)  // y 翻转成左上原点
+        var x = Int(cx) - side / 2
+        var y = Int(cyTop) - side / 2
+        x = max(0, min(x, w - side))
+        y = max(0, min(y, h - side))
+        guard side > 0, side <= w, side <= h else { return image }
         return image.cropping(to: CGRect(x: x, y: y, width: side, height: side))
     }
 
@@ -137,15 +234,42 @@ enum FocusSemanticsEngine {
     }
 
     /// 从 RAW/JPG 载入缩略图后检测。供 Store 异步调用。
-    static func detect(url: URL) -> FocusSemantics? {
+    /// subjectBoxes 为主体检测框（归一化、左下原点），用于对焦点没认出鸟时的交叉复核。
+    static func detect(url: URL, subjectBoxes: [CGRect] = []) -> FocusSemantics? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 1024
+            kCGImageSourceThumbnailMaxPixelSize: 2048
         ]
         guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
         let af = AFReader.read(url)
-        return detect(image: img, af: af)
+        let exif = ExifInfo.read(url)
+        return detect(image: img, af: af, subjectBoxes: subjectBoxes,
+                      telephoto: isTelephoto(exif))
+    }
+
+    /// 是否长焦：实际焦距≥200mm，或镜头型号里的长焦端≥300mm。
+    /// 长焦时才允许动物检测兜底（避免普通焦段拍到猫狗被误判拍鸟）。
+    private static func isTelephoto(_ exif: ExifInfo?) -> Bool {
+        guard let exif = exif else { return false }
+        let focal = exif.focalLength.flatMap { maxNumber(in: $0) } ?? 0
+        let lensMax = exif.lens.flatMap { maxNumber(in: $0) } ?? 0
+        return focal >= 200 || lensMax >= 300
+    }
+
+    /// 从「800mm」「RF100-400mm F5.6-8」这类串里取最大的数字。
+    private static func maxNumber(in s: String) -> Double? {
+        var best = 0.0
+        var cur = ""
+        func flush() {
+            if let v = Double(cur), v >= 10 { best = max(best, v) }
+            cur = ""
+        }
+        for ch in s {
+            if ch.isNumber || ch == "." { cur.append(ch) } else { flush() }
+        }
+        flush()
+        return best > 0 ? best : nil
     }
 }

@@ -17,14 +17,15 @@ struct ExifInfo {
     let metering: String?
     let exposureMode: String?
 
-    /// 一行核心参数：ISO 3200 · 1/2000s · f/9 · 672mm
+    /// 一行核心参数：ISO 3200 · 1/2000s · f/9 · 672mm · +0.3EV
     /// 佳能半画幅微单的焦距额外带等效值（×1.6），全画幅保持原样。
+    /// 曝光补偿并到这一行末尾，不再单独占一格（用户要求与 ISO/光圈同排）。
     var coreLine: String {
         let focal = focalLength.map { f in
             if let eq = equivalentFocal { return "\(f)（\(eq)）" }
             return f
         }
-        let parts = [iso.map { "ISO \($0)" }, shutter, aperture, focal]
+        let parts = [iso.map { "ISO \($0)" }, shutter, aperture, focal, exposureBias]
         return parts.compactMap { $0 }.joined(separator: "  ·  ")
     }
 

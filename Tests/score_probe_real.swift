@@ -36,7 +36,7 @@ for f in files {
     let wb = WhiteBalance.analyze(url)
     let af = AFReader.read(url)
     let exif = ExifInfo.read(url)
-    let focus = FocusSemanticsEngine.detect(url: url)
+    let focus = FocusSemanticsEngine.detect(url: url, subjectBoxes: m.bboxes)
     let human = HumanPresenceEngine.detect(url: url)
     let (genre, genreWhy) = ScoreEngine.guessGenre(m: m, af: af, wb: wb, exif: exif, focus: focus, human: human)
     let s = ScoreEngine.score(r, af: af, wb: wb, exif: exif, genre: genre,
