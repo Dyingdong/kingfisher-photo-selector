@@ -127,8 +127,12 @@ final class Store: ObservableObject {
     /// 构图辅助线：九宫格与对角线，各自独立、默认关闭，可同时开启叠加。
     @Published var showThirds = false
     @Published var showDiagonals = false
-    /// 信息区位置：false=预览下方（默认，保持原样）；true=画面最右侧竖排。
-    @Published var infoOnRight = false
+    /// 信息区位置：true=画面最右侧竖排（默认）；false=预览下方（原布局，可切回）。
+    /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
+    /// 默认改为右侧布局（2026-11-18 用户要求），可在顶部按钮切回下方。
+    @Published var infoOnRight = true
+    /// 右侧布局时信息区的宽度：默认固定值，拖动分隔条可调小/调大，批内记住。
+    @Published var infoWidth: CGFloat = 380
     /// 题材人工覆盖：用户改过题材的照片存这里；没有覆盖的自动识别。
     @Published var genreOverride: [URL: PhotoGenre] = [:]
     /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
@@ -137,15 +141,19 @@ final class Store: ObservableObject {
     @Published var isDividerDragging = false
     /// 分隔条拖动上下文：由外层 GeometryReader 每帧写入，供 AppKit 事件桥接读取。
     /// 非 @Published —— 写值不触发 body 重算，避免布局/事件互相反馈。
-    var dividerInfoHeight: CGFloat = Store.defaultInfoHeight
-    var dividerMinBottom: CGFloat = 170
-    var dividerMaxBottom: CGFloat = 2000
+    /// axis 决定拖动的是高度（下方布局，用鼠标 y）还是宽度（右侧布局，用鼠标 x）。
+    enum DividerAxis { case height, width }
+    var dividerAxis: DividerAxis = .height
+    var dividerValue: CGFloat = Store.defaultInfoHeight
+    var dividerMin: CGFloat = 170
+    var dividerMax: CGFloat = 2000
     /// 外层布局每帧写入分隔条的当前几何，供左键桥接做绝对坐标换算。
     /// 非 @Published：写值本身不触发 UI 重算。
-    func setDividerContext(bottomH: CGFloat, min: CGFloat, max: CGFloat) {
-        dividerInfoHeight = bottomH
-        dividerMinBottom = min
-        dividerMaxBottom = max
+    func setDividerContext(axis: DividerAxis, value: CGFloat, min: CGFloat, max: CGFloat) {
+        dividerAxis = axis
+        dividerValue = value
+        dividerMin = min
+        dividerMax = max
     }
     /// 可自定义的快捷键（框选放大 / 圈选主体的修饰键）。
     @Published var shortcuts = ShortcutSettings.load()
@@ -770,9 +778,11 @@ struct LeftMouseBridge: NSViewRepresentable {
     var subjectFlag: NSEvent.ModifierFlags
     /// 返回 true 时完全放行左键事件，避免误判为平移。
     var isSuppressed: () -> Bool = { false }
-    /// 分隔条拖动：按下时返回当前信息区高度作为绝对基准。
+    /// 分隔条拖动：按下时返回当前信息区高度/宽度作为绝对基准。
     var dividerBegin: () -> CGFloat = { 0 }
-    /// 传入由鼠标绝对位移算出的目标高度，外部负责 clamp 并写入状态。
+    /// 当前分隔条方向：true=垂直条（右侧布局，拖宽度用鼠标 x）；false=水平条（下方布局，拖高度用鼠标 y）。
+    var dividerIsVertical: () -> Bool = { false }
+    /// 传入由鼠标绝对位移算出的目标高度/宽度，外部负责 clamp 并写入状态。
     var dividerDrag: (CGFloat) -> Void = { _ in }
     var dividerEnd: () -> Void = {}
     var onGesture: (LeftMouseGesture) -> Void
@@ -791,6 +801,7 @@ struct LeftMouseBridge: NSViewRepresentable {
         c?.isSuppressed = isSuppressed
         c?.onGesture = onGesture
         c?.dividerBegin = dividerBegin
+        c?.dividerIsVertical = dividerIsVertical
         c?.dividerDrag = dividerDrag
         c?.dividerEnd = dividerEnd
     }
@@ -801,6 +812,7 @@ struct LeftMouseBridge: NSViewRepresentable {
         var isSuppressed: (() -> Bool)?
         var onGesture: ((LeftMouseGesture) -> Void)?
         var dividerBegin: (() -> CGFloat)?
+        var dividerIsVertical: (() -> Bool)?
         var dividerDrag: ((CGFloat) -> Void)?
         var dividerEnd: (() -> Void)?
     }
@@ -814,9 +826,11 @@ struct LeftMouseBridge: NSViewRepresentable {
         private var action: DragAction?
         private var start: CGPoint?
         private var last: CGPoint?
-        /// 分隔条拖动的绝对基准：起始鼠标 y（预览区坐标）与起始信息区高度。
-        private var dividerStartY: CGFloat = 0
+        /// 分隔条拖动的绝对基准：起始鼠标坐标（窗口绝对）与起始信息区高度/宽度。
+        /// 上下布局用 y 拖高度；右侧布局用 x 拖宽度。按下时按 axis 记录。
+        private var dividerStartPos: CGFloat = 0
         private var dividerStartH: CGFloat = 0
+        private var dividerIsWidthAxis = false
         /// 双击的第二下按下已处理，紧随其后的 mouseUp 直接吞掉，避免孤儿事件。
         private var swallowNextUp = false
 
@@ -846,27 +860,39 @@ struct LeftMouseBridge: NSViewRepresentable {
                 let p = self.convert(e.locationInWindow, from: nil)
                 guard self.bounds.width > 0 else { return e }
 
-                // 分隔条紧贴在预览区正下方（dividerH=8），给 14pt 命中容差。
-                // 命中判定用 view 本地坐标 p：只在 leftMouseDown 那一刻使用，
-                // 此时布局尚未变化，判定准确。
-                let inDivider = p.x >= 0 && p.x <= self.bounds.width && p.y >= -10 && p.y < 0
+                // 分隔条命中：上下布局在预览区正下方（水平条），右侧布局在预览区正右方
+                // （垂直条）。用 view 本地坐标 p，只在 leftMouseDown 那一刻判定，此时布局未变。
+                // 按下时读取当前方向（拖动过程中不会变），基准用窗口绝对坐标。
+                let vertical = self.coordinator?.dividerIsVertical?() ?? false
+                let inDivider: Bool
+                if vertical {
+                    inDivider = p.y >= 0 && p.y <= self.bounds.height
+                        && p.x >= self.bounds.width && p.x < self.bounds.width + 10
+                } else {
+                    inDivider = p.x >= 0 && p.x <= self.bounds.width && p.y >= -10 && p.y < 0
+                }
                 if inDivider, e.type == .leftMouseDown {
                     self.action = .divider
-                    // 关键：拖动基准必须用窗口绝对坐标 e.locationInWindow.y，
-                    // 不能用 p.y。p 是"桥接 view 的本地坐标"，而这个 view 铺满预览区，
-                    // 其底部会随 infoHeight 变化而移动 —— 用 p.y 会构成反馈闭环：
-                    // 拖动 → 改 infoHeight → view 底部移动 → 同一鼠标位置 p.y 改变 →
-                    // 再改 infoHeight → 来回震荡（信息区与照片一起跳）。
+                    // 关键：拖动基准必须用窗口绝对坐标 e.locationInWindow，
+                    // 不能用 p。p 是"桥接 view 的本地坐标"，而这个 view 铺满预览区，
+                    // 其边缘会随信息区尺寸变化而移动 —— 用 p 会构成反馈闭环：
+                    // 拖动 → 改尺寸 → view 边缘移动 → 同一鼠标位置 p 改变 →
+                    // 再改尺寸 → 来回震荡（信息区与照片一起跳）。
                     // 窗口坐标在布局变化时不移动，是真正的绝对基准。
-                    self.dividerStartY = e.locationInWindow.y
+                    self.dividerIsWidthAxis = vertical
+                    self.dividerStartPos = vertical ? e.locationInWindow.x : e.locationInWindow.y
                     self.dividerStartH = self.coordinator?.dividerBegin?() ?? 0
                     return nil
                 }
                 if self.action == .divider {
                     switch e.type {
                     case .leftMouseDragged:
-                        // AppKit 窗口坐标 y 向上：鼠标上移 → 信息区变高（与旧手势语义一致）。
-                        self.coordinator?.dividerDrag?(self.dividerStartH + (e.locationInWindow.y - self.dividerStartY))
+                        // 上下布局：鼠标上移 → 信息区变高（窗口 y 向上，与旧语义一致）。
+                        // 右侧布局：鼠标左移 → 信息区变宽（窗口 x 向右，左移 x 减小 → 宽度增大）。
+                        let delta = self.dividerIsWidthAxis
+                            ? -(e.locationInWindow.x - self.dividerStartPos)
+                            : (e.locationInWindow.y - self.dividerStartPos)
+                        self.coordinator?.dividerDrag?(self.dividerStartH + delta)
                     case .leftMouseUp:
                         self.action = nil
                         self.coordinator?.dividerEnd?()
@@ -1281,11 +1307,17 @@ struct DetailView: View {
                         isSuppressed: { store.isDividerDragging },
                         dividerBegin: {
                             store.isDividerDragging = true
-                            return store.dividerInfoHeight
+                            return store.dividerValue
                         },
+                        dividerIsVertical: { store.infoOnRight },
                         dividerDrag: { next in
-                            store.infoHeight = min(max(next, store.dividerMinBottom),
-                                                   store.dividerMaxBottom)
+                            if store.infoOnRight {
+                                store.infoWidth = min(max(next, store.dividerMin),
+                                                      store.dividerMax)
+                            } else {
+                                store.infoHeight = min(max(next, store.dividerMin),
+                                                       store.dividerMax)
+                            }
                         },
                         dividerEnd: {
                             store.isDividerDragging = false
@@ -1535,10 +1567,11 @@ struct InfoView: View {
     /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
     var compact = false
 
-    private func cell(_ title: String, _ value: String) -> some View {
+    private func cell(_ title: String, _ value: String, limit: Int = 1) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(compact ? .caption2 : .caption2).foregroundColor(.secondary)
-            Text(value).font(compact ? .caption : .callout).monospacedDigit().lineLimit(1)
+            Text(title).font(.caption2).foregroundColor(.secondary)
+            Text(value).font(compact ? .caption : .callout).monospacedDigit()
+                .lineLimit(limit).fixedSize(horizontal: false, vertical: limit > 1)
         }
         .frame(minWidth: compact ? 96 : 120, alignment: .leading)
     }
@@ -1614,12 +1647,13 @@ struct InfoView: View {
                             Text(exif.coreLine).font(.callout).monospacedDigit()
                         }
                         if compact {
-                            LazyVGrid(columns: [GridItem(.flexible(minimum: 120), spacing: 10),
-                                                GridItem(.flexible(minimum: 120))],
-                                      alignment: .leading, spacing: 8) {
-                                cell("相机", exif.camera ?? "—")
-                                cell("镜头", exif.lens ?? "—")
-                                cell("曝光补偿", exif.exposureBias ?? "—")
+                            // 窄栏规整排版：短值两列一行；镜头名长，整行放、最多两行不截断。
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .top, spacing: 14) {
+                                    cell("相机", exif.camera ?? "—")
+                                    cell("曝光补偿", exif.exposureBias ?? "—")
+                                }
+                                cell("镜头", exif.lens ?? "—", limit: 2)
                                 cell("拍摄时间", exif.dateTime ?? "—")
                             }
                         } else {
@@ -1880,17 +1914,42 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
 
                 // 右侧区域两种布局：
-                // - 默认（infoOnRight=false）：预览在上、信息区在下、可拖分隔条 —— 完全保持原样；
-                // - infoOnRight=true：预览占中间、信息区竖排到最右侧，宽度可拖。
+                // - 默认（infoOnRight=true）：预览占左、信息区竖排在最右，宽度可拖并记住；
+                // - infoOnRight=false：预览在上、信息区在下、可拖分隔条 —— 原布局。
                 Group {
                     if store.infoOnRight {
-                        HSplitView {
-                            previewPane
-                                .frame(minWidth: 420, idealWidth: 760, maxWidth: .infinity)
-                                .frame(maxHeight: .infinity)
-                            infoPane(compact: true)
-                                .frame(minWidth: 300, idealWidth: 380, maxWidth: 560)
-                                .frame(maxHeight: .infinity)
+                        // 宽度完全由 store.infoWidth 驱动（与下方布局的 infoHeight 同模式）：
+                        // 拖动分隔条改变宽度，批内记住；预览区吃剩余宽度。
+                        GeometryReader { region in
+                            let totalW = region.size.width
+                            let dividerW: CGFloat = 8
+                            let minLeft: CGFloat = 420
+                            let minRight: CGFloat = 260
+                            let maxRight = max(minRight, totalW - dividerW - minLeft)
+                            let rightW = min(max(store.infoWidth, minRight), maxRight)
+                            let leftW = max(minLeft, totalW - dividerW - rightW)
+                            // 每帧把分隔条几何交给左键桥接（非 @Published，不触发重算）。
+                            let _ = store.setDividerContext(axis: .width, value: rightW,
+                                                            min: minRight, max: maxRight)
+                            HStack(spacing: 0) {
+                                previewPane
+                                    .frame(width: leftW)
+                                    .frame(maxHeight: .infinity)
+
+                                // 垂直分隔条仅作视觉；拖动由 DetailView 内的左键桥接统一处理。
+                                Rectangle()
+                                    .fill(Color.gray.opacity(0.28))
+                                    .frame(width: dividerW)
+                                    .frame(maxHeight: .infinity)
+                                    .onHover { hovering in
+                                        if hovering { NSCursor.resizeLeftRight.push() }
+                                        else { NSCursor.resizeLeftRight.pop() }
+                                    }
+
+                                infoPane(compact: true)
+                                    .frame(width: rightW)
+                                    .frame(maxHeight: .infinity)
+                            }
                         }
                     } else {
                         // 预览区弹性 + 信息区固定高度 + 可拖动分隔条。
@@ -1906,7 +1965,8 @@ struct ContentView: View {
                             let topH = max(minTop, totalH - dividerH - bottomH)
                             // 每帧把分隔条几何交给左键桥接（非 @Published，不触发重算）。
                             // 分隔条拖动已改由 AppKit 绝对坐标处理，不再用 SwiftUI DragGesture。
-                            let _ = store.setDividerContext(bottomH: bottomH, min: minBottom, max: maxBottom)
+                            let _ = store.setDividerContext(axis: .height, value: bottomH,
+                                                            min: minBottom, max: maxBottom)
                             VStack(spacing: 0) {
                                 previewPane
                                     .frame(height: topH)
