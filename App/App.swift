@@ -122,23 +122,11 @@ final class Store: ObservableObject {
     @Published var dividerStartHeight: CGFloat = 0
     /// 正在拖动分隔条：左键桥接据此放行事件，避免把分隔条拖动误判为平移。
     @Published var isDividerDragging = false
-    /// 拖分隔条期间锁定照片的显示高度与相对预览区顶部的偏移，
-    /// 使照片不随预览区高度伸缩（这是"拖分区时画面跳动"的来源）。
-    @Published var frozenFit: (height: CGFloat, top: CGFloat)?
     /// 分隔条拖动上下文：由外层 GeometryReader 每帧写入，供 AppKit 事件桥接读取。
     /// 非 @Published —— 写值不触发 body 重算，避免布局/事件互相反馈。
     var dividerInfoHeight: CGFloat = Store.defaultInfoHeight
     var dividerMinBottom: CGFloat = 170
     var dividerMaxBottom: CGFloat = 2000
-    /// 预览区每帧记录的自然 fit（非 @Published，避免赋值触发 UI 重算）。
-    /// 分隔条按下时冻结它，即可得到"拖动前一刻"的照片尺寸。
-    var lastNaturalFit: (height: CGFloat, top: CGFloat)?
-    func recordNaturalFit(height: CGFloat, top: CGFloat) {
-        guard frozenFit == nil else { return }
-        lastNaturalFit = (height, top)
-    }
-    func freezeCurrentFit() { frozenFit = lastNaturalFit }
-    func endFitFreeze() { frozenFit = nil }
     /// 外层布局每帧写入分隔条的当前几何，供左键桥接做绝对坐标换算。
     /// 非 @Published：写值本身不触发 UI 重算。
     func setDividerContext(bottomH: CGFloat, min: CGFloat, max: CGFloat) {
@@ -1067,16 +1055,13 @@ struct DetailView: View {
                 let naturalW = min(geo.size.width, geo.size.height * aspect)
                 let naturalH = naturalW / aspect
                 let naturalOy = (geo.size.height - naturalH) / 2
-                // 拖分隔条期间用锁定值，照片不随预览区高度伸缩（消除画面跳动）；
-                // 未锁定时正常 fit，同时记录自然 fit 供分隔条按下时冻结。
-                let fitW: CGFloat = {
-                    if let f = store.frozenFit { return f.height * aspect }
-                    store.recordNaturalFit(height: naturalH, top: naturalOy)
-                    return naturalW
-                }()
-                let fitH = fitW / aspect
+                // ACR 式：照片每一帧都按当前预览区实时 fit，不冻结尺寸。
+                // 拖分隔条时预览区高度平滑变化，照片跟着平滑缩放、始终待在画布内，
+                // 既不溢出到信息区，也不会在松手瞬间突然跳变尺寸。
+                let fitW = naturalW
+                let fitH = naturalH
                 let ox = (geo.size.width - fitW) / 2
-                let oy = store.frozenFit?.top ?? naturalOy
+                let oy = naturalOy
                 let scale = store.zoom
 
                 ZStack {
@@ -1107,13 +1092,7 @@ struct DetailView: View {
                     .frame(width: fitW, height: fitH)
                     .scaleEffect(scale, anchor: .center)
                     .offset(x: (0.5 - store.zoomCenter.x) * fitW * scale + store.panOffset.width,
-                            y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height
-                                // 图片层默认在预览区里居中；但手势换算用的是 (ox, oy)。
-                                // 拖分隔条时预览区高度变化，若靠居中，图片中心会跟着预览区中心
-                                // 上下移动（就是"画面跳动"）。冻结期间 oy 固定，这里补偿掉
-                                // 居中的位置漂移，使渲染位置与 displayedImageRect / oy 完全一致。
-                                // 未冻结时 oy 就等于居中值，补偿为 0，不改变正常行为。
-                                + (oy - (geo.size.height - fitH) / 2))
+                            y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height)
 
                     if let s = store.dragStart, let c = store.dragCurrent {
                         Rectangle().stroke(store.dragIsZoom ? Color.yellow : Color.cyan, lineWidth: 2)
@@ -1164,7 +1143,6 @@ struct DetailView: View {
                         isSuppressed: { store.isDividerDragging },
                         dividerBegin: {
                             store.isDividerDragging = true
-                            store.freezeCurrentFit()
                             return store.dividerInfoHeight
                         },
                         dividerDrag: { next in
@@ -1173,7 +1151,6 @@ struct DetailView: View {
                         },
                         dividerEnd: {
                             store.isDividerDragging = false
-                            store.endFitFreeze()
                         }
                     ) { g in
                         switch g {
