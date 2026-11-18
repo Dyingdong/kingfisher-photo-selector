@@ -18,6 +18,11 @@ enum Verdict: String {
 struct PhotoMetrics {
     let url: URL
     let globalHi: Double
+    /// 全图最锐的单个分块读数（最大值）。判定仍用 globalHi=P99，
+    /// 但界面上"按最清楚的地方算100%"的百分比以它作分母：
+    /// 极小主体（拍鸟）时 P99 会被大面积平坦背景拉到很低，主体块却很锐，
+    /// 用 P99 作分母会算出 2159% 这种违反语义的爆表值。
+    let peakBlock: Double
     let subjectScore: Double
     let ratio: Double
     let centerRatio: Double
@@ -37,6 +42,16 @@ struct PhotoMetrics {
     let preview: CGImage?
     let width: Int
     let height: Int
+
+    /// 界面显示用：主体相对"全图最锐那一块"的比值，恒在 0~1，不会爆表。
+    /// 判定仍用 ratio（对 P99），两者用途不同，不要混用。
+    var displaySubjectRatio: Double {
+        subjectScore / max(peakBlock, 1e-6)
+    }
+    /// 界面显示用：中心区相对最锐块的比值。centerRatio×globalHi 还原出中心块读数。
+    var displayCenterRatio: Double {
+        (centerRatio * globalHi) / max(peakBlock, 1e-6)
+    }
 }
 
 struct PhotoResult: Identifiable {
@@ -184,7 +199,7 @@ enum Analyzer {
         let centerRatio = centerScore / max(hi, 1e-6)
 
         return PhotoMetrics(
-            url: url, globalHi: hi, subjectScore: s,
+            url: url, globalHi: hi, peakBlock: scores.max() ?? hi, subjectScore: s,
             ratio: s / max(hi, 1e-6), centerRatio: centerRatio,
             anisotropy: directionalRatio(d.pixels, d.w, d.h),
             softRatio: softRatio, spread: spread,
@@ -216,6 +231,25 @@ enum Analyzer {
         }
         return picked.isEmpty ? m.centerRatio
             : percentile(picked, 0.5) / max(m.globalHi, 1e-6)
+    }
+
+    /// 界面显示用：圈选区相对全图最锐块的比值，恒在 0~1。
+    /// rectRatio（对 P99）留给判定/报告，避免影响已标定的判定。
+    static func rectDisplayRatio(_ m: PhotoMetrics, rect: CGRect) -> Double {
+        var picked: [Double] = []
+        let topMinY = 1 - rect.maxY
+        let topMaxY = 1 - rect.minY
+        for r in 0..<m.rows {
+            for c in 0..<m.cols {
+                let cx = (Double(c) + 0.5) / Double(m.cols)
+                let cy = (Double(r) + 0.5) / Double(m.rows)
+                if cx >= rect.minX, cx <= rect.maxX, cy >= topMinY, cy <= topMaxY {
+                    picked.append(m.scores[r * m.cols + c])
+                }
+            }
+        }
+        let base = picked.isEmpty ? (m.centerRatio * m.globalHi) : percentile(picked, 0.5)
+        return base / max(m.peakBlock, 1e-6)
     }
 
     /// 只有前景分割/人脸这种可信定位，主体锐度比才算数；

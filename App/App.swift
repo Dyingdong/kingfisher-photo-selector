@@ -108,6 +108,8 @@ final class Store: ObservableObject {
     @Published var zoom: CGFloat = 1
     @Published var zoomCenter = CGPoint(x: 0.5, y: 0.5)
     @Published var selectionRatio: Double?
+    /// 圈选区相对"最锐块"的显示百分比（恒<=1）；selectionRatio 是判定用的（对 P99）。
+    @Published var selectionDisplayRatio: Double?
     @Published var selectionRect: CGRect?
     @Published var wbCache: [URL: WhiteBalanceStats] = [:]
     @Published var afCache: [URL: AFInfo] = [:]
@@ -238,6 +240,7 @@ final class Store: ObservableObject {
         heatCache = [:]
         baseCache = [:]
         selectionRatio = nil
+        selectionDisplayRatio = nil
         status = "正在分析…"
         let faces = preferFaces
         let anchor = anchorHi
@@ -397,6 +400,7 @@ final class Store: ObservableObject {
         panStart = nil
         dragAction = nil
         selectionRatio = nil
+        selectionDisplayRatio = nil
         selectionRect = nil
     }
 
@@ -1001,6 +1005,7 @@ struct DetailView: View {
         store.panStart = nil
         store.selectionRect = rect
         store.selectionRatio = Analyzer.rectRatio(m, rect: rect)
+        store.selectionDisplayRatio = Analyzer.rectDisplayRatio(m, rect: rect)
     }
 
     /// 双击预览：把相机对焦点（合焦点）所在区域放大铺满视窗。
@@ -1038,6 +1043,7 @@ struct DetailView: View {
         let vision = CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
         store.selectionRect = vision
         store.selectionRatio = Analyzer.rectRatio(m, rect: vision)
+        store.selectionDisplayRatio = Analyzer.rectDisplayRatio(m, rect: vision)
     }
 
     var body: some View {
@@ -1377,23 +1383,23 @@ struct InfoView: View {
                     sectionTitle("判断依据（鼠标停上看解释）")
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)],
                               alignment: .leading, spacing: 8) {
-                        metricCell("主体清晰度", String(format: "%.0f%%", m.ratio * 100),
-                                   "主体有多清楚，按最清楚的地方算 100%。越接近 100% 越好。")
-                        metricCell("画面中心清晰度", String(format: "%.0f%%", m.centerRatio * 100),
-                                   "画面正中央有多清楚，同样按最清楚的地方算 100%。")
+                        metricCell("主体清晰度", String(format: "%.0f%%", m.displaySubjectRatio * 100),
+                                   "主体有多清楚，按整张照片最锐利那一块算 100%。越接近 100% 越好。")
+                        metricCell("画面中心清晰度", String(format: "%.0f%%", m.displayCenterRatio * 100),
+                                   "画面正中央有多清楚，同样按最锐利那一块算 100%。")
                         metricCell("合格线", String(format: "%.0f", store.heatFloor),
-                                   "判断清不清楚的门槛。比它高算清晰，比它低算模糊。")
-                        metricCell("最清楚处", String(format: "%.0f", m.globalHi),
-                                   "整张照片里最锐利那一块的读数，上面几项都拿它当 100% 基准。")
+                                   "判断整张照片是否整体失焦用的尺子，看的是画面绝大部分区域，不是最锐的那一小块。拍鸟这类主体很小的片子它偏低属正常，以主体清晰度为准。")
+                        metricCell("最清楚处", String(format: "%.0f", m.peakBlock),
+                                   "整张照片里最锐利那一块的读数，上面几项百分比都拿它当 100% 基准。")
                         metricCell("发虚区域", String(format: "%.0f%%", m.softRatio * 100),
                                    "画面里模糊、没细节的地方占多少。")
                         metricCell("拖影", String(format: "%.2f", m.anisotropy),
                                    "数值越高越像手抖或物体移动留下的拖影，正常约 1 左右。")
                         metricCell("主体虚化", String(format: "%.2f", m.subjectReblur),
                                    "把主体再人为模糊一次，细节掉得越多说明原来越虚。")
-                        if let sr = store.selectionRatio {
+                        if let sr = store.selectionDisplayRatio {
                             metricCell("你圈的地方", String(format: "%.0f%%", sr * 100),
-                                       "手动圈出区域有多清楚，按最清楚的地方算 100%。")
+                                       "手动圈出区域有多清楚，按整张照片最锐利那一块算 100%。")
                         }
                     }
                     Text("主体位置：\(subjectLabel(m.subjectSource))")
