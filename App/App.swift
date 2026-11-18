@@ -784,20 +784,26 @@ struct LeftMouseBridge: NSViewRepresentable {
                 guard self.bounds.width > 0 else { return e }
 
                 // 分隔条紧贴在预览区正下方（dividerH=8），给 14pt 命中容差。
-                // 用 AppKit 绝对坐标处理：SwiftUI DragGesture 的位移基准会随
-                // 承载视图移动而漂移，正是"拖分隔条时信息区与画面来回跳"的根因。
+                // 命中判定用 view 本地坐标 p：只在 leftMouseDown 那一刻使用，
+                // 此时布局尚未变化，判定准确。
                 let inDivider = p.x >= 0 && p.x <= self.bounds.width && p.y >= -10 && p.y < 0
                 if inDivider, e.type == .leftMouseDown {
                     self.action = .divider
-                    self.dividerStartY = p.y
+                    // 关键：拖动基准必须用窗口绝对坐标 e.locationInWindow.y，
+                    // 不能用 p.y。p 是"桥接 view 的本地坐标"，而这个 view 铺满预览区，
+                    // 其底部会随 infoHeight 变化而移动 —— 用 p.y 会构成反馈闭环：
+                    // 拖动 → 改 infoHeight → view 底部移动 → 同一鼠标位置 p.y 改变 →
+                    // 再改 infoHeight → 来回震荡（信息区与照片一起跳）。
+                    // 窗口坐标在布局变化时不移动，是真正的绝对基准。
+                    self.dividerStartY = e.locationInWindow.y
                     self.dividerStartH = self.coordinator?.dividerBegin?() ?? 0
                     return nil
                 }
                 if self.action == .divider {
                     switch e.type {
                     case .leftMouseDragged:
-                        // AppKit 坐标 y 向上：鼠标上移 → 信息区变高（与旧手势语义一致）。
-                        self.coordinator?.dividerDrag?(self.dividerStartH + (p.y - self.dividerStartY))
+                        // AppKit 窗口坐标 y 向上：鼠标上移 → 信息区变高（与旧手势语义一致）。
+                        self.coordinator?.dividerDrag?(self.dividerStartH + (e.locationInWindow.y - self.dividerStartY))
                     case .leftMouseUp:
                         self.action = nil
                         self.coordinator?.dividerEnd?()
