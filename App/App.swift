@@ -135,6 +135,9 @@ final class Store: ObservableObject {
     @Published var infoWidth: CGFloat = 380
     /// 题材人工覆盖：用户改过题材的照片存这里；没有覆盖的自动识别。
     @Published var genreOverride: [URL: PhotoGenre] = [:]
+    /// 题材纠正记忆：用户手动改题材时自动记录特征样本，特征相似的照片
+    /// 以后按用户的判断优先。存本地 JSON（GenreMemory），可一键清空。
+    @Published var memory: [GenreCorrectionSample] = GenreMemory.load()
     /// 分隔条拖动基准：按下时记录当前信息区高度，作为绝对基准。
     @Published var dividerStartHeight: CGFloat = 0
     /// 正在拖动分隔条：左键桥接据此放行事件，避免把分隔条拖动误判为平移。
@@ -421,12 +424,23 @@ final class Store: ObservableObject {
 
     // MARK: - 综合评分
 
-    /// 当前题材：用户改过用覆盖值，否则自动识别。返回 (题材, 是否自动, 识别依据)。
+    /// 当前题材：用户改过用覆盖值，否则自动识别（先查纠正记忆，再走规则）。
+    /// 返回 (题材, 是否自动, 识别依据)。
     func genre(for r: PhotoResult) -> (PhotoGenre, Bool, String) {
         if let g = genreOverride[r.id] { return (g, false, "手动指定") }
         let (g, why) = ScoreEngine.guessGenre(m: r.metrics, af: afCache[r.id],
                                               wb: wbCache[r.id], exif: exifCache[r.id],
                                               focus: focusCache[r.id], human: humanCache[r.id])
+        // 纠正记忆：对焦点特征与你手动纠正过的照片相似 → 按你的判断优先。
+        if let focusLabels = focusCache[r.id]?.labels, !focusLabels.isEmpty {
+            let names = focusLabels.map { GenreMemory.parseLabel($0) }
+            let query = (top: names.first ?? "", labels: names)
+            if let sug = GenreMemory.suggest(query: query, samples: memory),
+               let genre = PhotoGenre(rawValue: sug.genre), genre != g {
+                return (genre, true,
+                        "参考了你以往 \(sug.count) 次同特征纠正（判\(sug.genre)）")
+            }
+        }
         return (g, true, why)
     }
 
@@ -440,8 +454,45 @@ final class Store: ObservableObject {
     }
 
     func setGenre(_ g: PhotoGenre?, for url: URL) {
-        if let g = g { genreOverride[url] = g }
-        else { genreOverride.removeValue(forKey: url) }
+        if let g = g {
+            genreOverride[url] = g
+            recordGenreCorrection(for: url, userGenre: g)
+        } else {
+            genreOverride.removeValue(forKey: url)
+        }
+    }
+
+    /// 记住一次题材纠正：机器判错的瞬间是最宝贵的监督信号。
+    /// 记录对焦点标签签名 + 焦距/镜头/主体来源，特征相似的照片以后按此优先。
+    private func recordGenreCorrection(for url: URL, userGenre: PhotoGenre) {
+        guard let r = results.first(where: { $0.id == url }) else { return }
+        let machine = ScoreEngine.guessGenre(m: r.metrics, af: afCache[url],
+                                             wb: wbCache[url], exif: exifCache[url],
+                                             focus: focusCache[url],
+                                             human: humanCache[url]).0
+        // 与机器一致不算纠正（没有新信息），避免重复记录撑爆记忆。
+        guard machine != userGenre else { return }
+        let exif = exifCache[url]
+        let labels = (focusCache[url]?.labels ?? []).map { GenreMemory.parseLabel($0) }
+        let sample = GenreCorrectionSample(
+            labels: Array(labels.prefix(8)),
+            topLabel: labels.first ?? "",
+            focal: exif.flatMap { $0.focalLength.map { GenreMemory.maxNumber(in: $0) } } ?? 0,
+            lensMax: exif.flatMap { $0.lens.map { GenreMemory.maxNumber(in: $0) } } ?? 0,
+            subjectSource: r.metrics.subjectSource,
+            machineGenre: machine.rawValue,
+            userGenre: userGenre.rawValue,
+            date: Date())
+        GenreMemory.append(sample)
+        memory = GenreMemory.load()
+        status = "已记住这次题材纠正（共 \(memory.count) 条），特征相似的照片会参考你的判断"
+    }
+
+    /// 清空纠正记忆：识别回到纯自动规则。
+    func clearGenreMemory() {
+        GenreMemory.clear()
+        memory = []
+        status = "已清空题材纠正记忆"
     }
 
     func ensureFullPreview(for url: URL) {
@@ -1537,6 +1588,15 @@ private struct ScorePanel: View {
                 .help(score.genreIsGuess
                       ? "软件按「\(score.genreReason)」判为该题材；不准可在上面手动改"
                       : "你已手动指定题材，评分权重按该题材计算")
+            if !store.memory.isEmpty {
+                HStack(spacing: 6) {
+                    Text("纠正记忆 \(store.memory.count) 条")
+                        .font(.caption2).foregroundColor(.secondary)
+                    Button("清空") { store.clearGenreMemory() }
+                        .font(.caption2).buttonStyle(.borderless)
+                        .help("清空所有题材纠正记录，识别回到纯自动规则（清空前可把\n\(GenreMemory.fileURL.path) 备份）")
+                }
+            }
         }
     }
 

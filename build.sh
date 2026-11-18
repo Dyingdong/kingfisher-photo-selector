@@ -25,6 +25,7 @@ SRC=(
     "$ROOT/Sources/ExifInfo.swift"
     "$ROOT/Sources/FocusSemantics.swift"
     "$ROOT/Sources/HumanPresence.swift"
+    "$ROOT/Sources/GenreMemory.swift"
     "$ROOT/Sources/Score.swift"
 )
 FLAGS=(-O -swift-version 5 -target arm64-apple-macosx13.0)
