@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FocusScreener 结果验证工具。
+Kingfisher-PhotoSelector 结果验证工具。
 
 「结果正确」不是看通过率，而是分四层各自拿到证据：
 
@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CLI = ROOT / "focuscli"
+CLI = ROOT / "kingfisher-photoselector"
 
 SUSPECT = {"全片未合焦", "主体未合焦", "景深不足"}
 UNCERTAIN = {"运动模糊/拖影", "无法解码"}
@@ -49,7 +49,7 @@ def run_cli(paths, sensitivity=1.0, out=None, extra=None):
         cmd += ["-o", str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        sys.exit("focuscli 运行失败：" + r.stderr.strip())
+        sys.exit("kingfisher-photoselector 运行失败：" + r.stderr.strip())
     return r.stdout if not out else read_report(out)
 
 
@@ -438,7 +438,7 @@ def cmd_bytes(args):
 # ---------------------------------------------------------------- main
 
 def main():
-    ap = argparse.ArgumentParser(description="FocusScreener 结果验证工具")
+    ap = argparse.ArgumentParser(description="Kingfisher-PhotoSelector 结果验证工具")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("truth", help="用人工真值算混淆矩阵、临界样本、建议灵敏度")

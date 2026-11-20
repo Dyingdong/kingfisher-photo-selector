@@ -81,7 +81,7 @@ enum ScoreEngine {
     ///    （FocusSemanticsEngine 已先拿主体框复核过：主体处认出鸟会直接改判拍鸟，
     ///     针对飞鸟群照焦点落在鸟间水面/天空的情况）
     /// 4) 对焦点识别不出来（unknown）才退回原有规则：
-    ///    前景小主体 / 打鸟镜头 / 超长焦 → 拍鸟；有人脸信号 → 人像；其余 → 风光。
+    ///    前景小主体 / 观鸟长焦镜头 / 超长焦 → 拍鸟；有人脸信号 → 人像；其余 → 风光。
     /// 只是「猜测」，界面明确标注并允许用户手动改。
     static func guessGenre(m: PhotoMetrics, af: AFInfo?, wb: WhiteBalanceStats?,
                            exif: ExifInfo?,
@@ -103,6 +103,18 @@ enum ScoreEngine {
         // isMainSubject=0，不受此规则影响（真值 JD5A8533：4 人 30%、人像）。
         let crowdScene = (human?.count ?? 0) >= 2 && (human?.isMainSubject ?? false)
 
+        // AI 主体明确认出花或非人动物时，背景里被姿态检测抓到的小人不是照片主体。
+        // 实测马场照：姿态检测抓到背景 25% 高的游客，旧规则据此判「人像」，
+        // 而抠图分类给出 horse 67% —— 后者更能说明拍的是什么。
+        // 人是主体（≥35% 高度）或相机在人脸对焦模式时不适用，避免真的人像被误改。
+        let aiNonHumanLandscape: (PhotoGenre, String)? = {
+            guard let ai = ai, !(human?.isMainSubject ?? false) else { return nil }
+            switch ai.kind {
+            case .flower, .animal: return (.landscape, ai.reason)
+            case .face, .bird, .other, .none: return nil
+            }
+        }()
+
         // —— 第一优先级：对焦点处的语义判断（只要识别出来了，就以此为准）——
         if let focus = focus {
             switch focus.kind {
@@ -111,11 +123,13 @@ enum ScoreEngine {
             case .bird:
                 return (.bird, focus.reason)
             case .nonBird:
-                // 焦点落在明确非鸟的东西上：典型是长焦拍风光，哪怕镜头是打鸟头也不算拍鸟。
+                // 背景里的马/花已由 AI 主体认出，不要因为画面里有个 25% 高的游客判人像。
+                if let hit = aiNonHumanLandscape { return hit }
+                // 焦点落在明确非鸟的东西上：典型是长焦拍风光，哪怕用的是观鸟长焦镜头也不算拍鸟。
                 // 两个例外（均来自真值复盘）：
                 // a) 画面主体确认是人 → 人站在天空/山水前也是人像，别被对焦点落空带偏；
                 // b) 超长焦（≥400mm）且分割出明确前景小主体 → 多为站在地面/枝头的鸟，
-                //    分类没认出往往只是因为裁块被草地/泥土淹没。
+                //    分类没认出往往只是因为裁块被草地/泥土淹没。花/马等已由 AI 主体认出，不会走到这里。
                 if let human = human, !crowdScene,
                    human.isMainSubject || (human.hasPerson && human.bodyHeightRatio >= 0.22) {
                     return (.portrait, human.reason)
@@ -143,6 +157,8 @@ enum ScoreEngine {
                 return (.portrait, ai.reason)
             case .bird:
                 return (.bird, ai.reason)
+            case .flower, .animal:
+                if let hit = aiNonHumanLandscape { return hit }
             case .other, .none:
                 break   // 没认出人或鸟，交回下面的规则
             }
@@ -158,7 +174,7 @@ enum ScoreEngine {
 
         // 无脸人像：背影/侧身/低头等没露出脸的题材。用人体姿态检测（不依赖脸），
         // 放在长焦兜底之前——否则 RF100-400 这类长焦拍的人像会被误判成拍鸟。
-        // 只在「对焦点语义没识别出鸟/风景」时才走到这里，不会把打鸟片里偶尔入镜的人误判。
+        // 只在「对焦点语义没识别出鸟/风景」时才走到这里，不会把鸟类照片里偶尔入镜的人误判。
         // crowdScene（≥3 人）排除：景区里一群游客不该当人像主体。
         if let human = human, human.isMainSubject, !crowdScene {
             return (.portrait, human.reason)
@@ -213,7 +229,7 @@ enum ScoreEngine {
     }
 
     /// 从镜头型号（如 "RF200-800mm F6.3-9 IS USM"）取最大焦距端，
-    /// 用来识别打鸟镜头。取所有整数里的最大值：200-800→800，24-105→105。
+    /// 用来识别观鸟用的长焦镜头。取所有整数里的最大值：200-800→800，24-105→105。
     private static func parseLensMaxFocal(_ s: String) -> Double? {
         var best = 0.0
         var cur = ""
@@ -246,7 +262,7 @@ enum ScoreEngine {
                                      focus: FocusSemantics? = nil) -> (Double, String) {
         if let manual = manual {
             let s = clamp(manual / 0.60 * 100)
-            return (s, String(format: "你圈选的主体区域清晰度是最锐处的 %.0f%%（人工指定，覆盖自动识别）",
+            return (s, String(format: "人工圈选的主体区域清晰度是最锐处的 %.0f%%（人工指定，覆盖自动识别）",
                               manual * 100))
         }
         let trusted = m.subjectSource == "前景主体" || m.subjectSource == "人脸检测"

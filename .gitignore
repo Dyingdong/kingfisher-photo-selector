@@ -10,3 +10,6 @@ focuscli
 .DS_Store
 __pycache__/
 *.pyc
+
+# 命令行编译产物
+kingfisher-photoselector

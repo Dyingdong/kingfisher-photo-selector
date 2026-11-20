@@ -2,12 +2,12 @@ import Foundation
 import ImageIO
 
 // 命令行入口：与 App 共用 Analyzer / Subject / Report，保证两条路径的判定完全一致。
-// 用法：focuscli <照片或文件夹...> [-o 报告.csv] [-s 灵敏度] [-a 清晰参考片] [--faces]
+// 用法：kingfisher-photoselector <照片或文件夹...> [-o 报告.csv] [-s 灵敏度] [-a 清晰参考片] [--faces]
 // 默认用独立固定阈值判定，不依赖同批照片的构成。
 
 func usage() -> String {
     """
-    用法: focuscli <照片或文件夹...> [-o 报告.csv] [-s 灵敏度] [-a 清晰参考片] [--faces]
+    用法: kingfisher-photoselector <照片或文件夹...> [-o 报告.csv] [-s 灵敏度] [-a 清晰参考片] [--faces]
 
     每张照片独立判定，默认基准为固定阈值 400（用真值标定，不随同批照片变化）。
       -o       输出 CSV 路径；省略则打印到标准输出

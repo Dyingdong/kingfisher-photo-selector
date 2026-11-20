@@ -357,9 +357,11 @@ enum Analyzer {
 /// 目的是让用户据此排除这类片子；故意虚化主体的照片也会命中，所以只给线索不自动delete。
 struct FocusMissDiagnosis {
     let suspected: Bool      // 是否疑似对焦落点失误
-    let short: String        // 短标签
+    let short: String        // 短标签（界面行首标签在外面，这里不带前缀，避免重复）
     let detail: String       // 白话解释
     let focusMethod: String  // 对焦方式：手动 / 自动 / 未知（用户定义的判定）
+    // 主体发虚原因（手动/自动对焦都给）：只提示、不改判定。nil = 主体不虚或数据不够，不硬猜。
+    let subjectBlurCause: (short: String, detail: String)?
 }
 
 /// 对焦方式判定（用户定义规则）：
@@ -385,6 +387,33 @@ enum FocusMethod {
 }
 
 enum FocusMiss {
+    /// 主体发虚原因推断【只提示、不改判定】：不管是手动还是自动对焦，
+    /// 只要主体确实偏虚（清晰度 < 35%），就尽量给一个可核对的原因——
+    /// 快门太慢（手抖/主体在动）、有拖影（主体移动快）、或对焦位置不对。
+    /// 快门/焦距数据不全时退回拖影判断；连拖影都没有就只说「像是对焦位置不对」。
+    static func subjectBlurCause(_ m: PhotoMetrics,
+                                 shutter: (isSlow: Bool, text: String)?) -> (short: String, detail: String)? {
+        guard m.displaySubjectRatio < 0.35 else { return nil }
+        let pct = Int(m.displaySubjectRatio * 100)
+        let drag = String(format: "%.2f", m.anisotropy)
+        if let s = shutter, s.isSlow {
+            if m.anisotropy > 1.35 {
+                return (short: "疑似快门太慢（手抖或主体在动）",
+                        detail: "主体清晰度只有 \(pct)%；快门明显慢于安全快门（\(s.text)）。"
+                              + "慢门下手抖和主体移动都会把主体拍虚，可放大看主体边缘有没有同向拖影")
+            }
+            return (short: "疑似手抖（快门太慢）",
+                    detail: "主体清晰度只有 \(pct)%；快门明显慢于安全快门，这个速度手持很容易抖虚。\(s.text)")
+        }
+        if m.anisotropy > 1.5 {
+            return (short: "疑似主体移动快",
+                    detail: "主体清晰度只有 \(pct)%；快门不算慢，但画面有拖影（\(drag)），"
+                          + "更像主体移动快或瞬间抖动留下的痕迹")
+        }
+        return (short: "疑似焦点没落在主体上",
+                detail: "主体清晰度只有 \(pct)%；快门正常、无明显拖影，更像对焦位置不对而不是抖")
+    }
+
     /// 判据（真值复盘后收紧）：
     /// 1. 必须有相机合焦点数据（无数据不能猜）；
     /// 2. 画面别处确实很锐（最锐块 ≥ 合格线，说明不是整体发虚）；
@@ -392,9 +421,11 @@ enum FocusMiss {
     /// 4. 最锐块离合焦点有距离（≥ 8% 画幅，避免把对焦点附近的小抖动当失误）；
     /// 5. 主体本身不锐（显示锐度比 < 25%，确认主体确实虚了）。
     static func diagnose(_ m: PhotoMetrics, af: AFInfo?, verdict: Verdict,
-                         lens: String? = nil) -> FocusMissDiagnosis {
+                         lens: String? = nil,
+                         shutter: (isSlow: Bool, text: String)? = nil) -> FocusMissDiagnosis {
         let method = FocusMethod.judge(lens: lens, af: af)
         let manualNote = method.isManual ? "；这张是手动对焦，焦点需人工拧准，失误更常见" : ""
+        let blur = subjectBlurCause(m, shutter: shutter)
 
         guard let af = af, let p = af.points.first, !af.points.isEmpty else {
             // 没有 AF 点：若是手动对焦，用「主体虚 + 别处锐」给一条更实用的提示。
@@ -402,16 +433,16 @@ enum FocusMiss {
             if method.isManual, verdict.isSuspect, m.peakBlock >= Analyzer.independentFloor,
                m.displaySubjectRatio < 0.25 {
                 return FocusMissDiagnosis(
-                    suspected: true, short: "手动对焦：主体偏虚",
+                    suspected: true, short: "主体偏虚",
                     detail: "\(method.text)。相机没有合焦点记录，无法判断焦点落在哪里；"
                           + "但主体清晰度只有最锐处的 \(Int(m.displaySubjectRatio * 100))%，"
                           + "而画面别处有清晰区域（最锐处 \(Int(m.peakBlock))）。"
                           + "像是手动对焦没拧到位。故意虚化主体的照片也会这样，请自行确认",
-                                      focusMethod: method.text)
+                                      focusMethod: method.text, subjectBlurCause: blur)
             }
-            return FocusMissDiagnosis(suspected: false, short: method.isManual ? "手动对焦·无焦点数据" : "无对焦数据",
+            return FocusMissDiagnosis(suspected: false, short: method.isManual ? "无焦点数据" : "无对焦数据",
                                       detail: "\(method.text)。相机没有合焦点记录，无法判断对焦是否拧到位",
-                                      focusMethod: method.text)
+                                      focusMethod: method.text, subjectBlurCause: blur)
         }
         let xPct = Int(p.cx * 100), yPct = Int(p.cy * 100)
         let pos = "横向\(xPct)%／纵向\(yPct)%"
@@ -419,7 +450,7 @@ enum FocusMiss {
         guard peak >= Analyzer.independentFloor, m.scores.count == m.cols * m.rows else {
             return FocusMissDiagnosis(suspected: false, short: "全片偏软",
                                       detail: "整张照片都不够锐（最锐处 \(Int(peak))），不像是对焦点拧偏，更像整体没对上\(manualNote)",
-                                      focusMethod: method.text)
+                                      focusMethod: method.text, subjectBlurCause: blur)
         }
         let fc = min(m.cols - 1, max(0, Int(p.cx * Double(m.cols))))
         let fr = min(m.rows - 1, max(0, Int(p.cy * Double(m.rows))))
@@ -435,17 +466,24 @@ enum FocusMiss {
 
         let miss = verdict.isSuspect && focusRatio < 0.35 && dist >= 0.08 && subject < 0.25
         if miss {
+            // 手动对焦叫「拧偏」，自动对焦叫「跑焦」，同一套判据、两种说法
+            let short = method.isManual ? "疑似对焦拧偏" : "疑似跑焦"
+            let cause = method.isManual ? "像是手动对焦没拧到位（焦点落在主体前后）"
+                                        : "像是相机把焦点对到了主体前后（跑焦）"
             return FocusMissDiagnosis(
-                suspected: true, short: "疑似对焦拧偏",
+                suspected: true, short: short,
                 detail: "合焦点在\(pos)，但那一点只有全图最锐处的 \(Int(focusRatio * 100))%；"
                       + "最锐的地方离合焦点约 \(Int(dist * 100))% 画幅，主体也只有 \(Int(subject * 100))%。"
-                      + "像是手动对焦没拧到位（焦点落在主体前后）。注意：故意虚化主体的照片也会这样，请自行确认\(manualNote)",
-                focusMethod: method.text)
+                      + "\(cause)。注意：故意虚化主体的照片也会这样，请自行确认\(manualNote)",
+                focusMethod: method.text, subjectBlurCause: blur)
         }
+        // 没有失误迹象：手动对焦给「未见明显拧偏」；自动对焦这项不适用，
+        // 返回空字符串（界面整行隐藏），不再出现「手动对焦：无」这种多余行。
+        let noMissShort = method.isManual ? "未见明显拧偏" : ""
         return FocusMissDiagnosis(
-            suspected: false, short: "未见明显拧偏",
+            suspected: false, short: noMissShort,
             detail: "合焦点在\(pos)，焦点处锐度是最锐处的 \(Int(focusRatio * 100))%，"
                   + "离最锐处约 \(Int(dist * 100))% 画幅。没有明显的对焦点落空迹象\(manualNote)",
-            focusMethod: method.text)
+            focusMethod: method.text, subjectBlurCause: blur)
     }
 }

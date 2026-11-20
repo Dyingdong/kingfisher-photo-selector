@@ -72,7 +72,7 @@ enum MetadataWriter {
         let n = xmlEscape(note)
         return """
         \(packetBegin)
-        <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="FocusScreener">
+        <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Kingfisher-PhotoSelector">
           <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
             <rdf:Description rdf:about=""
               xmlns:dc="http://purl.org/dc/elements/1.1/"
@@ -299,7 +299,7 @@ enum MetadataWriter {
               let desc = firstDescription(root) else {
             return """
             \(packetBegin)
-            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="FocusScreener">
+            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Kingfisher-PhotoSelector">
               <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
                 <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
                   <xmp:Rating>\(rating)</xmp:Rating>
@@ -318,6 +318,99 @@ enum MetadataWriter {
             desc.addChild(r)
         }
         return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
+    }
+
+    // MARK: - 只写「说明」（dc:description），其余元数据一律不动
+
+    /// 本软件写入说明时的段落标记，刷新时只替换这一段，用户自己的说明原样保留。
+    /// 更名历史：FocusScreener → PhotoSelector → Kingfisher-PhotoSelector。
+    /// legacyInfoTags 里的旧段落也会被识别并清理，已写入过的照片说明不会残留多段。
+    static let infoTag = "[Kingfisher-PhotoSelector]"
+    private static let legacyInfoTags = ["[PhotoSelector]", "[FocusScreener]"]
+
+    /// 拼新的说明：保留用户原有说明（剔除本软件新旧段落），末尾追加本软件新内容。
+    static func composeDescription(old: String, info: String) -> String {
+        let kept = old.components(separatedBy: "\n")
+            .filter { line in
+                !line.contains(infoTag) && !legacyInfoTags.contains { line.contains($0) }
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return kept.isEmpty ? "\(infoTag) \(info)" : kept + "\n\(infoTag) \(info)"
+    }
+
+    /// 在已有 XMP 上只设置 dc:description（Bridge 的「说明」）；
+    /// 没有现成 XMP 时生成一个只含说明的最小合法包；已有但解析不了时抛错保护，绝不覆盖。
+    private static func descriptionOnlyXMP(existing: String?, note: String) throws -> String {
+        guard let existing, !existing.isEmpty else {
+            let n = xmlEscape(composeDescription(old: "", info: note))
+            return """
+            \(packetBegin)
+            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Kingfisher-PhotoSelector">
+              <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+                <rdf:Description rdf:about=""
+                  xmlns:dc="http://purl.org/dc/elements/1.1/">
+                  <dc:description><rdf:Alt><rdf:li xml:lang="x-default">\(n)</rdf:li></rdf:Alt></dc:description>
+                </rdf:Description>
+              </rdf:RDF>
+            </x:xmpmeta>
+            \(packetEnd)
+            """
+        }
+        guard let data = existing.data(using: .utf8),
+              let doc = try? XMLDocument(data: data, options: []),
+              let root = doc.rootElement(),
+              let desc = firstDescription(root) else { throw MetaError.xmpUnreadable }
+        ensureNS(desc, "dc", "http://purl.org/dc/elements/1.1/")
+        if let d = child(desc, "description"), let alt = child(d, "Alt"),
+           let li = (alt.children ?? []).compactMap({ $0 as? XMLElement }).first {
+            li.stringValue = composeDescription(old: li.stringValue ?? "", info: note)
+        } else {
+            let d = XMLElement(name: "dc:description")
+            let alt = XMLElement(name: "rdf:Alt")
+            let li = XMLElement(name: "rdf:li")
+            li.addAttribute(attributeNode("xml:lang", "x-default"))
+            li.stringValue = composeDescription(old: "", info: note)
+            alt.addChild(li)
+            d.addChild(alt)
+            desc.addChild(d)
+        }
+        return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
+    }
+
+    /// 只写「说明」字段：关键词、星级、颜色标签、Instructions 等全部不动。
+    /// RAW 走同名 .xmp 侧车（Bridge 标准方式，不改原片）；JPG 内嵌 XMP。
+    static func setDescription(to u: URL, note: String, backupDir: URL) throws -> WriteOutcome {
+        let fm = FileManager.default
+        try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
+        let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before-desc.xmp")
+        let sc = sidecar(u)
+
+        if isJPEG(u) {
+            let data = try Data(contentsOf: u)
+            let embedded = embeddedXMP(data)
+            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
+            var originals: [String] = []
+            if let e = embedded { originals.append("EMBEDDED\n" + e) }
+            if let s = side { originals.append("SIDECAR\n" + s) }
+            try originals.joined(separator: "\n---\n").write(to: backup, atomically: true, encoding: .utf8)
+
+            let xmp = try descriptionOnlyXMP(existing: embedded ?? side, note: note)
+            let newData = try injectXMP(into: data, xmp: xmp)
+            try newData.write(to: u, options: .atomic)
+            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
+            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: "说明")
+        }
+
+        if isRAW(u) {
+            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
+            if let s = side { try s.write(to: backup, atomically: true, encoding: .utf8) }
+            let xmp = try descriptionOnlyXMP(existing: side, note: note)
+            try xmp.write(to: sc, atomically: true, encoding: .utf8)
+            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: "说明")
+        }
+
+        throw MetaError.unsupportedFormat(u.pathExtension)
     }
 
     // MARK: - JPEG 字节级写入（不重新编码图像数据）

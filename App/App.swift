@@ -50,14 +50,26 @@ struct ShortcutSettings: Codable, Equatable {
     var zoom: ModifierKey = .command       // 框选放大，默认 ⌘
     var subject: ModifierKey = .control    // 圈选主体，默认 ⌃(Control)
 
-    private static let storeKey = "FocusScreener.shortcuts.v1"
+    private static let storeKey = "Kingfisher-PhotoSelector.shortcuts.v1"
+    /// 更名前的旧存储 key（FocusScreener / PhotoSelector 时代），只用于一次性迁移读取。
+    private static let legacyStoreKeys = ["PhotoSelector.shortcuts.v1",
+                                          "FocusScreener.shortcuts.v1"]
 
     static func load() -> ShortcutSettings {
-        guard let data = UserDefaults.standard.data(forKey: storeKey),
-              let s = try? JSONDecoder().decode(ShortcutSettings.self, from: data) else {
-            return ShortcutSettings()
+        if let data = UserDefaults.standard.data(forKey: storeKey),
+           let s = try? JSONDecoder().decode(ShortcutSettings.self, from: data) {
+            return s
         }
-        return s
+        // 旧版本迁移：读到旧 key 的设置就搬到新 key，用户自定义过的手势不丢。
+        for key in legacyStoreKeys {
+            if let data = UserDefaults.standard.data(forKey: key),
+               let s = try? JSONDecoder().decode(ShortcutSettings.self, from: data) {
+                UserDefaults.standard.set(data, forKey: storeKey)
+                UserDefaults.standard.removeObject(forKey: key)
+                return s
+            }
+        }
+        return ShortcutSettings()
     }
     func save() {
         if let data = try? JSONEncoder().encode(self) {
@@ -86,7 +98,17 @@ final class Store: ObservableObject {
     @Published var done = 0
     @Published var total = 0
     @Published var status = "把照片文件夹拖进窗口，或点「选择文件夹」开始"
-    @Published var selected: URL?
+    @Published var selected: URL? {
+        didSet {
+            // 切换照片时做两件事：
+            // 1) 把上一张的评星依据、合焦信息（含鸟类识别）写进该照片元数据的「说明」
+            //    ——用户 2026-11-19 要求，且只动说明字段，其他元数据一律不碰；
+            // 2) 缩放/平移复位；人工圈选记录按照片持久保留，切走再切回来仍在。
+            guard oldValue != selected else { return }
+            if let old = oldValue { writeDescription(for: old) }
+            resetZoom()
+        }
+    }
     @Published var onlySuspect = true
     @Published var sensitivity: Double = 1.0
     @Published var preferFaces = false
@@ -107,10 +129,28 @@ final class Store: ObservableObject {
     @Published var anchorHi: Double?
     @Published var zoom: CGFloat = 1
     @Published var zoomCenter = CGPoint(x: 0.5, y: 0.5)
-    @Published var selectionRatio: Double?
-    /// 圈选区相对"最锐块"的显示百分比（恒<=1）；selectionRatio 是判定用的（对 P99）。
-    @Published var selectionDisplayRatio: Double?
-    @Published var selectionRect: CGRect?
+    /// 人工圈选记录：按照片 URL 索引，切照片/复位缩放都不清。
+    /// 与 overrideRect（单张重判结果）并存，互不覆盖——青框 AI 主体照常显示。
+    @Published var selectionRects: [URL: CGRect] = [:]
+    /// 以下三项按「当前选中照片」从 selectionRects 实时派生：
+    /// 黄框、评分用的 manualSubjectRatio、信息区指标格始终同一来源，
+    /// 切走再切回来不会出现「框还在、参数却回退到自动识别」。
+    var selectionRect: CGRect? {
+        guard let url = selected else { return nil }
+        return selectionRects[url]
+    }
+    /// 判定用的历史字段（对 P99），当前无读者；保留派生语义避免状态分叉。
+    var selectionRatio: Double? {
+        guard let url = selected, let rect = selectionRects[url],
+              let m = metrics.first(where: { $0.url == url }) else { return nil }
+        return Analyzer.rectRatio(m, rect: rect)
+    }
+    /// 圈选区相对"最锐块"的显示百分比（恒<=1），传给评分当 manualSubjectRatio。
+    var selectionDisplayRatio: Double? {
+        guard let url = selected, let rect = selectionRects[url],
+              let m = metrics.first(where: { $0.url == url }) else { return nil }
+        return Analyzer.rectDisplayRatio(m, rect: rect)
+    }
     @Published var wbCache: [URL: WhiteBalanceStats] = [:]
     @Published var afCache: [URL: AFInfo] = [:]
     /// 对焦点读取状态：loading 驱动"读取中"提示；attempted 避免 nil 结果反复跑 exiftool。
@@ -126,9 +166,10 @@ final class Store: ObservableObject {
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
     @Published var showAFPoints = true
-    /// 构图辅助线：九宫格与对角线，各自独立、默认关闭，可同时开启叠加。
-    @Published var showThirds = false
-    @Published var showDiagonals = false
+    /// 构图辅助线：九宫格与对角线。默认开启（2026-11-19 用户要求），
+    /// 线条画得很淡（见 CompositionGuides），不影响看图。
+    @Published var showThirds = true
+    @Published var showDiagonals = true
     /// 信息区位置：true=画面最右侧竖排（默认）；false=预览下方（原布局，可切回）。
     /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
     /// 默认改为右侧布局（2026-11-18 用户要求），可在顶部按钮切回下方。
@@ -267,8 +308,6 @@ final class Store: ObservableObject {
         genreOverride = [:]
         heatCache = [:]
         baseCache = [:]
-        selectionRatio = nil
-        selectionDisplayRatio = nil
         status = "正在分析…"
         let faces = preferFaces
         let anchor = anchorHi
@@ -321,6 +360,8 @@ final class Store: ObservableObject {
         results[idx].verdict = v
         results[idx].reason = why + "（人工圈选）"
         results[idx].overrideRect = rect
+        // 同时持久记录显示用圈选框：切照片/复位缩放后仍按这张照片恢复。
+        selectionRects[id] = rect
         status = "已按圈选区域重判 \(id.deletingPathExtension().lastPathComponent)：\(v.rawValue)"
     }
 
@@ -420,7 +461,7 @@ final class Store: ObservableObject {
         let previous = ratingCache[url]
         let stamp = Int(Date().timeIntervalSince1970)
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("FocusScreener/backups/\(stamp)")
+            .appendingPathComponent("Kingfisher-PhotoSelector/backups/\(stamp)")
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try MetadataWriter.setRating(to: url, rating: rating, backupDir: dir)
@@ -542,9 +583,7 @@ final class Store: ObservableObject {
         panOffset = .zero
         panStart = nil
         dragAction = nil
-        selectionRatio = nil
-        selectionDisplayRatio = nil
-        selectionRect = nil
+        // 复位只针对放大/平移：人工圈选记录（黄框 + 评分参数）按照片保留。
     }
 
     func zoomIn() { zoom = min(8, zoom * 1.5) }
@@ -555,7 +594,7 @@ final class Store: ObservableObject {
         guard !targets.isEmpty else { return }
         let stamp = Int(Date().timeIntervalSince1970)
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("FocusScreener/backups/\(stamp)")
+            .appendingPathComponent("Kingfisher-PhotoSelector/backups/\(stamp)")
         var ok = 0
         var failed: [String] = []
         for r in targets {
@@ -590,16 +629,22 @@ final class Store: ObservableObject {
         var moved: [String] = []
         var failed: String?
         var removedURLs: Set<URL> = []
+        var trashPairs: [(trash: URL, original: URL)] = []
         for t in targets {
             do {
                 var resulting: NSURL?
                 try FileManager.default.trashItem(at: t, resultingItemURL: &resulting)
                 moved.append(t.lastPathComponent)
                 removedURLs.insert(t)
+                // 记录「废纸篓里的位置 ← 原位置」，⌘Z 撤销时原样搬回去
+                if let r = resulting {
+                    trashPairs.append((trash: r as URL, original: t))
+                }
             } catch {
                 failed = "\(t.lastPathComponent)：\(error.localizedDescription)"
             }
         }
+        if !trashPairs.isEmpty { lastDeleted = trashPairs }
         // 从内存列表与缓存移除（只移除确实删掉的）
         results.removeAll { removedURLs.contains($0.id) }
         metrics.removeAll { removedURLs.contains($0.url) }
@@ -615,6 +660,106 @@ final class Store: ObservableObject {
             selected = shown.first?.id
         }
         return (moved, failed)
+    }
+
+    /// 最近一次删除的记录（废纸篓位置 ↔ 原位置），⌘Z 撤销用。
+    var lastDeleted: [(trash: URL, original: URL)] = []
+    /// 撤销最近一次删除：从废纸篓原样搬回原位置，并重新分析恢复到列表里。
+    func undoDelete() {
+        let pairs = lastDeleted
+        guard !pairs.isEmpty else {
+            status = "没有可撤销的删除"
+            return
+        }
+        lastDeleted = []
+        DispatchQueue.global(qos: .userInitiated).async {
+            var restored: [URL] = []
+            var failed: String?
+            for p in pairs {
+                let dir = p.original.deletingLastPathComponent()
+                if !FileManager.default.fileExists(atPath: dir.path) {
+                    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                }
+                do {
+                    try FileManager.default.removeItem(at: p.original)   // 原位置若已有同名文件先让位
+                    try FileManager.default.moveItem(at: p.trash, to: p.original)
+                    restored.append(p.original)
+                } catch {
+                    failed = "\(p.original.lastPathComponent)：\(error.localizedDescription)"
+                }
+            }
+            DispatchQueue.main.async {
+                if restored.isEmpty {
+                    self.status = "撤销删除失败\(failed.map { "：\($0)" } ?? "")"
+                    return
+                }
+                // 重新分析并插回列表（按文件名排序位置不重要，放最前即可）
+                var newResults: [PhotoResult] = []
+                for u in restored where MetadataWriter.isRAW(u) {
+                    if let m = Analyzer.analyze(u, preferFaces: self.preferFaces) {
+                        let (v, why) = Analyzer.classify(m, hiMin: self.hiMin)
+                        newResults.append(PhotoResult(id: m.url, metrics: m, verdict: v, reason: why))
+                    }
+                }
+                self.metrics.append(contentsOf: newResults.map { $0.metrics })
+                self.results.append(contentsOf: newResults)
+                self.status = "已撤销删除：\(restored.map { $0.lastPathComponent }.joined(separator: "、"))" +
+                    (failed.map { "；失败：\($0)" } ?? "")
+                if let first = newResults.first { self.selected = first.id }
+            }
+        }
+    }
+
+    // MARK: - 「说明」元数据写入（切照片时自动执行）
+
+    /// 组一张照片的「说明」内容：鸟类类别（首位）→ 评星依据 → 合焦信息。
+    /// 什么数据都没有（还没分析完）返回 nil，不写。
+    private func describeNote(for url: URL) -> String? {
+        guard let r = results.first(where: { $0.id == url }) else { return nil }
+        let s = score(for: r)
+        var seg: [String] = []
+        if let bird = birdCategory(for: url) { seg.append("鸟类：\(bird)") }
+        var scoreDesc = "建议 \(s.stars) 星（总分 \(Int(s.total))）"
+        if let w = s.weakest, w.weight > 0 { scoreDesc += "，短板：\(w.name) \(Int(w.score)) 分" }
+        seg.append("评星依据：\(scoreDesc)")
+        seg.append("合焦：\(r.verdict.rawValue)——\(r.reason)")
+        return seg.joined(separator: "；")
+    }
+
+    /// 鸟类类别：优先 AI 主体识别（分割+分类，更准），其次对焦点语义。
+    /// 能认出鸟种给中文名；只认出「鸟」认不出种也如实说。
+    /// 注意：雄雌差别（繁殖羽/羽色）系统分类器分不出来，不硬猜。
+    private func birdCategory(for url: URL) -> String? {
+        if let ai = aiCache[url], ai?.kind == .bird, let ai = ai {
+            return FocusSemanticsEngine.speciesName(fromLabels: ai.labels)
+                ?? "识别到鸟（具体鸟种认不出）"
+        }
+        if let f = focusCache[url], f.kind == .bird {
+            return FocusSemanticsEngine.speciesName(fromLabels: f.labels)
+                ?? "识别到鸟（具体鸟种认不出）"
+        }
+        return nil
+    }
+
+    /// 把「说明」写进照片元数据（异步、只动 dc:description 一个字段）。
+    /// 文件已不存在（刚被删除）时跳过，避免往废纸篓里的文件写侧车。
+    func writeDescription(for url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let note = describeNote(for: url) else { return }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Kingfisher-PhotoSelector/backups/descriptions")
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                _ = try MetadataWriter.setDescription(to: url, note: note, backupDir: dir)
+                DispatchQueue.main.async {
+                    self.status = "已写入说明：\(url.lastPathComponent)"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.status = "写入说明失败 \(url.lastPathComponent)：\(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func exportCSV() {
@@ -637,7 +782,8 @@ final class Store: ObservableObject {
                                               manualGenre: genreOverride[r.id]?.rawValue,
                                               stars: s.stars, total: Int(s.total.rounded()))
             focusMiss[r.id] = FocusMiss.diagnose(r.metrics, af: afCache[r.id], verdict: r.verdict,
-                                                  lens: exifCache[r.id]?.lens)
+                                                  lens: exifCache[r.id]?.lens,
+                                                  shutter: exifCache[r.id]?.shutterSafety)
         }
         let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity,
                              anchor: anchorHi, genres: genres, focusMiss: focusMiss)
@@ -649,9 +795,9 @@ final class Store: ObservableObject {
 
     // MARK: 开发模式调试导出
 
-    /// 开发模式：设置环境变量 FOCUSSCREENER_DEV=1 启动才显示「导出调试 CSV」。
+    /// 开发模式：设置环境变量 KINGFISHER_DEV=1 启动才显示「导出调试 CSV」。
     /// 发布版没有这个按钮，也不写任何调试文件。
-    let devMode = ProcessInfo.processInfo.environment["FOCUSSCREENER_DEV"] == "1"
+    let devMode = ProcessInfo.processInfo.environment["KINGFISHER_DEV"] == "1"
 
     /// 调试 CSV：每张照片的全部中间参数（合焦判定依据、各维度分数与依据、
     /// 对焦点语义标签、人体检测、题材判定链），用于对照真值调阈值。
@@ -714,9 +860,11 @@ final class Store: ObservableObject {
                 Report.q(ai?.labels.prefix(5).joined(separator: " | ") ?? ""),
                 String(memory.count),
                 Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict,
-                                            lens: exifCache[r.id]?.lens).short),
+                                            lens: exifCache[r.id]?.lens,
+                                            shutter: exifCache[r.id]?.shutterSafety).short),
                 Report.q(FocusMiss.diagnose(m, af: af, verdict: r.verdict,
-                                            lens: exifCache[r.id]?.lens).detail),
+                                            lens: exifCache[r.id]?.lens,
+                                            shutter: exifCache[r.id]?.shutterSafety).detail),
                 Report.q(r.id.path),
             ]
             lines.append(row.joined(separator: ","))
@@ -1170,7 +1318,7 @@ private struct FrameLegend: View {
         HStack(spacing: 14) {
             legend(Color.cyan, "青框＝AI 主体")
             legend(Color.red, "红框＝相机对焦点")
-            legend(Color.yellow, "黄框＝你圈选/放大区")
+            legend(Color.yellow, "黄框＝人工圈选的主体")
         }
         .font(.caption2)
         .foregroundColor(.secondary)
@@ -1182,6 +1330,19 @@ private struct FrameLegend: View {
         HStack(spacing: 4) {
             Rectangle().stroke(c, lineWidth: 1.5).frame(width: 11, height: 9)
             Text(text)
+        }
+    }
+}
+
+/// 工具栏开关文字 + 小号灰色快捷键字母。快捷键本身仍由 .keyboardShortcut 绑定，
+/// 这里只把字母显示出来，避免用户看不见 H/F/G/D。
+private struct ShortcutToggleLabel: View {
+    let title: String
+    let key: String
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(title)
+            Text(key).font(.caption2).foregroundColor(.secondary)
         }
     }
 }
@@ -1215,8 +1376,8 @@ private struct CompositionGuides: View {
                     path.addLine(to: CGPoint(x: 0, y: fitH))
                 }
             }
-            .stroke(Color.white.opacity(0.75), lineWidth: 1 / scale)
-            .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
+            .stroke(Color.white.opacity(0.28), lineWidth: 1 / scale)
+            .shadow(color: .black.opacity(0.18), radius: 0.6, x: 0, y: 0)
             .allowsHitTesting(false)
         }
         .frame(width: fitW, height: fitH)
@@ -1309,16 +1470,13 @@ struct DetailView: View {
     /// ACR 式放大：把选区中心移到视窗中心，选区较长边尽量铺满视窗。
     /// 倍数在当前 zoom 上累乘，所以可以在已放大的画面上继续框选放大；
     /// 中心与选区都按当前显示矩形反算，避免第二次起画面跑偏。
-    private func zoomToSelection(_ s: CGPoint, _ e: CGPoint, metrics m: PhotoMetrics,
+    private func zoomToSelection(_ s: CGPoint, _ e: CGPoint,
                                  fitW: CGFloat, fitH: CGFloat,
                                  ox: CGFloat, oy: CGFloat) {
         let w = abs(e.x - s.x), h = abs(e.y - s.y)
         guard w > 8, h > 8, fitW > 0, fitH > 0 else { return }
         let d = displayedImageRect(fitW: fitW, fitH: fitH, ox: ox, oy: oy)
         guard d.width > 0, d.height > 0 else { return }
-        // 先用「放大前」的显示矩形算好选区，再改 zoom/zoomCenter，
-        // 否则选区会被按放大后的变换解释，位置整体偏移。
-        let rect = imageRect(s, e, fitW: fitW, fitH: fitH, ox: ox, oy: oy)
         let nx = min(max(((s.x + e.x) / 2 - d.minX) / d.width, 0), 1)
         let nyTop = min(max(((s.y + e.y) / 2 - d.minY) / d.height, 0), 1)
         let rw = min(w / d.width, 1), rh = min(h / d.height, 1)
@@ -1327,9 +1485,7 @@ struct DetailView: View {
         store.zoomCenter = CGPoint(x: nx, y: 1 - nyTop)
         store.panOffset = .zero
         store.panStart = nil
-        store.selectionRect = rect
-        store.selectionRatio = Analyzer.rectRatio(m, rect: rect)
-        store.selectionDisplayRatio = Analyzer.rectDisplayRatio(m, rect: rect)
+        // 放大是「看」的操作：不写判定参数、也不再画黄框（黄框只标注用户圈选的主体）。
     }
 
     /// 双击预览：把相机对焦点（合焦点）所在区域放大铺满视窗。
@@ -1363,11 +1519,7 @@ struct DetailView: View {
         store.zoomCenter = CGPoint(x: b.midX, y: 1 - b.midY)
         store.panOffset = .zero
         store.panStart = nil
-        // 黄色选区框用 Vision 坐标（y 向上）显示。
-        let vision = CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
-        store.selectionRect = vision
-        store.selectionRatio = Analyzer.rectRatio(m, rect: vision)
-        store.selectionDisplayRatio = Analyzer.rectDisplayRatio(m, rect: vision)
+        // 双击放大是「看」的操作：不写判定参数、不画黄框（黄框只标注圈选主体）。
     }
 
     var body: some View {
@@ -1376,10 +1528,18 @@ struct DetailView: View {
             if compact {
                 // 右侧窄栏：开关一行、缩放一行，保证最窄时也不超出预览区宽度。
                 HStack(spacing: 12) {
-                    Toggle("锐度热力图", isOn: $store.showHeatmap)
-                    Toggle("对焦点", isOn: $store.showAFPoints)
-                    Toggle("九宫格", isOn: $store.showThirds)
-                    Toggle("对角线", isOn: $store.showDiagonals)
+                    Toggle(isOn: $store.showHeatmap) { ShortcutToggleLabel(title: "锐度热力图", key: "H") }
+                        .keyboardShortcut("h", modifiers: [])
+                        .help("""
+                        把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
+                        （快捷键 H）
+                        """)
+                    Toggle(isOn: $store.showAFPoints) { ShortcutToggleLabel(title: "对焦点", key: "F") }
+                        .keyboardShortcut("f", modifiers: [])
+                    Toggle(isOn: $store.showThirds) { ShortcutToggleLabel(title: "九宫格", key: "G") }
+                        .keyboardShortcut("g", modifiers: [])
+                    Toggle(isOn: $store.showDiagonals) { ShortcutToggleLabel(title: "对角线", key: "D") }
+                        .keyboardShortcut("d", modifiers: [])
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.vertical, 4)
@@ -1391,19 +1551,27 @@ struct DetailView: View {
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.bottom, 4)
-                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原")
+                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · 快捷键：H 热力图 / F 对焦点 / G 九宫格 / D 对角线 / ⌘1-5 评星 / ⌘0 清除星级 / ⌘⌫ 删除（⌘Z 撤销）")
             } else {
                 HStack(spacing: 12) {
-                    Toggle("锐度热力图", isOn: $store.showHeatmap)
-                    Toggle("对焦点", isOn: $store.showAFPoints)
-                    Toggle("九宫格", isOn: $store.showThirds)
-                    Toggle("对角线", isOn: $store.showDiagonals)
+                    Toggle(isOn: $store.showHeatmap) { ShortcutToggleLabel(title: "锐度热力图", key: "H") }
+                        .keyboardShortcut("h", modifiers: [])
+                        .help("""
+                        把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
+                        （快捷键 H）
+                        """)
+                    Toggle(isOn: $store.showAFPoints) { ShortcutToggleLabel(title: "对焦点", key: "F") }
+                        .keyboardShortcut("f", modifiers: [])
+                    Toggle(isOn: $store.showThirds) { ShortcutToggleLabel(title: "九宫格", key: "G") }
+                        .keyboardShortcut("g", modifiers: [])
+                    Toggle(isOn: $store.showDiagonals) { ShortcutToggleLabel(title: "对角线", key: "D") }
+                        .keyboardShortcut("d", modifiers: [])
                     Button("－") { store.zoomOut() }.frame(width: 26)
                     Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
                     Button("＋") { store.zoomIn() }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
                     Spacer()
-                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原")
+                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · H/F/G/D 切换热力图/对焦点/九宫格/对角线 · ⌘1-5 评星 · ⌘0 清除 · ⌘⌫ 删除（⌘Z 撤销）")
                         .font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -1447,7 +1615,8 @@ struct DetailView: View {
                                           thirds: store.showThirds,
                                           diagonals: store.showDiagonals,
                                           scale: scale)
-                        if let sel = store.selectionRect, store.zoom > 1 {
+                        // 黄框＝人工圈选主体：按照片持久保留；青框 AI 主体在上方独立绘制，不受影响
+                        if let sel = store.selectionRect {
                             Rectangle().stroke(Color.yellow, lineWidth: 1.5 / scale)
                                 .frame(width: sel.width * fitW, height: sel.height * fitH)
                                 .position(x: (sel.minX + sel.width / 2) * fitW,
@@ -1460,8 +1629,9 @@ struct DetailView: View {
                             y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height)
 
                     if let s = store.dragStart, let c = store.dragCurrent {
-                        Rectangle().stroke(store.dragIsZoom ? Color.yellow : Color.cyan, lineWidth: 2)
-                            .background((store.dragIsZoom ? Color.yellow : Color.cyan).opacity(0.12))
+                        // 拖框预览：圈选主体画黄框（松手后保留）；框选放大画白框（纯看图）
+                        Rectangle().stroke(store.dragIsZoom ? Color.white : Color.yellow, lineWidth: 2)
+                            .background((store.dragIsZoom ? Color.white : Color.yellow).opacity(0.12))
                             .frame(width: abs(c.x - s.x), height: abs(c.y - s.y))
                             .position(x: (s.x + c.x) / 2, y: (s.y + c.y) / 2)
                     }
@@ -1488,7 +1658,7 @@ struct DetailView: View {
                         onMove: { p in store.dragCurrent = p },
                         onEnd: { p in
                             if let s = store.dragStart {
-                                zoomToSelection(s, p, metrics: m,
+                                zoomToSelection(s, p,
                                                 fitW: fitW, fitH: fitH, ox: ox, oy: oy)
                             }
                             store.dragStart = nil
@@ -1557,9 +1727,13 @@ struct DetailView: View {
                                     let rect = imageRect(s, p, fitW: fitW, fitH: fitH, ox: ox, oy: oy)
                                     if abs(p.x - s.x) > 8, abs(p.y - s.y) > 8 {
                                         if action == .zoom {
-                                            zoomToSelection(s, p, metrics: m,
+                                            zoomToSelection(s, p,
                                                             fitW: fitW, fitH: fitH, ox: ox, oy: oy)
                                         } else {
+                                            // 圈选主体：重判这一张 + 让评分参数跟着圈选区走
+                                            //（主体清晰度按圈选算、「人工圈选」指标格出格、黄框显示）。
+                                            // recheck 内部同时写入 overrideRect（判定）与
+                                            // selectionRects（显示/评分），切照片后按 id 恢复。
                                             store.recheck(id: r.id, rect: rect)
                                         }
                                     }
@@ -1690,7 +1864,7 @@ private struct ScorePanel: View {
                 Label("采用建议：打 \(score.stars) 星", systemImage: "checkmark.circle")
             }
             .buttonStyle(.borderedProminent).controlSize(.small)
-            .help("把建议星级写入现有 Bridge 评分（xmp:Rating），随时可在最上面的评分条手动改")
+            .help("把建议星级写入 Adobe Bridge 星级评分（xmp:Rating）")
             if store.ratingCache[r.id] != nil {
                 Text("当前 \(store.ratingCache[r.id]! == -1 ? "拒绝" : "\(store.ratingCache[r.id]!) 星")")
                     .font(.caption2).foregroundColor(.secondary)
@@ -1798,9 +1972,10 @@ struct InfoView: View {
         .frame(minWidth: compact ? 96 : 120, alignment: .leading)
     }
 
-    /// 通俗命名的指标格：鼠标悬停即时显示大白话解释（解释 + 实际值一起给出）。
+    /// 通俗命名的指标格：鼠标悬停即时显示大白话解释，标题用指标名（用户要求，
+    /// 如悬停「7%」时提示框标题显示「主体清晰度」而不是数值）。
     private func metricCell(_ title: String, _ value: String, _ tip: String) -> some View {
-        cell(title, value, help: nil).instantHelp("\(value)\n\n\(tip)")
+        cell(title, value, help: nil).instantHelp(tip, title: title)
     }
 
     private func sectionTitle(_ s: String) -> some View {
@@ -1832,6 +2007,7 @@ struct InfoView: View {
                             .foregroundColor((!rejected && current >= n) ? .orange : .secondary)
                     }
                     .buttonStyle(.plain).help("\(n) 星")
+                    .keyboardShortcut(KeyEquivalent(n.description.first ?? "1"), modifiers: .command)
                 }
                 Button {
                     store.setRating(r.id, rating: rejected ? 0 : -1)
@@ -1843,6 +2019,9 @@ struct InfoView: View {
                         .cornerRadius(4)
                 }
                 .buttonStyle(.plain).help("标记/取消拒绝（Bridge Reject）")
+                // ⌘0：清除星级（隐藏按钮只承载快捷键）
+                Button { store.setRating(r.id, rating: 0) } label: { EmptyView() }
+                    .keyboardShortcut("0", modifiers: .command)
             }
             if let rt = store.ratingCache[r.id] {
                 Text(rt == -1 ? "已拒绝" : "\(rt) 星").font(.caption2).foregroundColor(.secondary)
@@ -1898,7 +2077,7 @@ struct InfoView: View {
 
                 Divider()
 
-                // 3b) 合焦结论：保留供复核，降级为一行（判定仍独立于评分）
+                // 3b) 合焦结论 + 判断依据：同一个区域、中间不分割（用户 2026-11-19 要求）
                 HStack(spacing: 6) {
                     Image(systemName: r.verdict.isSuspect ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
                         .font(.caption)
@@ -1908,8 +2087,6 @@ struct InfoView: View {
                     Text("· \(r.reason)").font(.caption2).foregroundColor(.secondary)
                         .lineLimit(1).help(r.reason)
                 }
-
-                Divider()
 
                 // 4) 判断依据：全部常显，名字说人话，悬停看解释
                 VStack(alignment: .leading, spacing: 6) {
@@ -1931,47 +2108,65 @@ struct InfoView: View {
                         metricCell("主体虚化", String(format: "%.2f", m.subjectReblur),
                                    "把主体再人为模糊一次，细节掉得越多说明原来越虚。")
                         if let sr = store.selectionDisplayRatio {
-                            metricCell("你圈的地方", String(format: "%.0f%%", sr * 100),
-                                       "手动圈出区域有多清楚，按整张照片最锐利那一块算 100%。")
+                            metricCell("人工圈选", String(format: "%.0f%%", sr * 100),
+                                       "人工圈出区域有多清楚，按整张照片最锐利那一块算 100%。")
                         }
                     }
                     Text("主体位置：\(subjectLabel(m.subjectSource))")
                         .font(.caption2).foregroundColor(.secondary)
                     if let af = store.afCache[r.id] {
                         let rel = Analyzer.afSubjectRelation(m, af: af)
+                        // 悬停热区放整行而不是 ⓘ 小图标：图标只有 12pt，很难停准（用户实测不灵敏）
                         HStack(spacing: 5) {
                             Text("对焦点与主体：\(rel.0)")
                                 .font(.caption2).foregroundColor(.secondary)
                             Image(systemName: "info.circle")
                                 .font(.caption2).foregroundColor(.secondary)
-                                .instantHelp(rel.1)
                         }
+                        .instantHelp(rel.1)
                     }
                     let miss = FocusMiss.diagnose(m, af: store.afCache[r.id], verdict: r.verdict,
-                                                  lens: store.exifCache[r.id]?.lens)
-                    if let exif = store.exifCache[r.id],
-                       let shutter = exif.shutterSafety, shutter.isSlow {
+                                                  lens: store.exifCache[r.id]?.lens,
+                                                  shutter: store.exifCache[r.id]?.shutterSafety)
+                    // 对焦提示区（用户 2026-11-18 规划）：对焦方式 → 主体发虚 → 疑似跑焦等提示。
+                    // 「快门偏慢」与「主体发虚」两条黄提示合并成一条：有发虚原因时只显示发虚
+                    // （原因里已含快门信息）；主体清楚但快门确实偏慢才单独提示。
+                    HStack(spacing: 5) {
+                        Text("对焦方式：\(miss.focusMethod)")
+                            .font(.caption2).foregroundColor(.secondary)
+                            .lineLimit(1)
+                        Image(systemName: "info.circle")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    .instantHelp(miss.focusMethod)
+                    if let blur = miss.subjectBlurCause {
+                        HStack(spacing: 5) {
+                            Text("主体发虚：\(blur.short)").font(.caption2).foregroundColor(.orange)
+                            Image(systemName: "info.circle")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        .instantHelp(blur.detail)
+                    } else if let exif = store.exifCache[r.id],
+                              let shutter = exif.shutterSafety, shutter.isSlow {
                         HStack(spacing: 5) {
                             Image(systemName: "clock.badge.exclamationmark")
                                 .font(.caption2).foregroundColor(.orange)
                             Text("快门偏慢，可能手抖发虚").font(.caption2).foregroundColor(.orange)
                             Image(systemName: "info.circle")
                                 .font(.caption2).foregroundColor(.secondary)
-                                .instantHelp(shutter.text)
                         }
+                        .instantHelp(shutter.text)
                     }
-                    HStack(spacing: 5) {
-                        Text("对焦方式：\(miss.focusMethod)")
-                            .font(.caption2).foregroundColor(.secondary)
-                            .lineLimit(1).help(miss.focusMethod)
-                    }
-                    HStack(spacing: 5) {
-                        Text("手动对焦：\(miss.short)")
-                            .font(.caption2)
-                            .foregroundColor(miss.suspected ? .orange : .secondary)
-                        Image(systemName: "info.circle")
-                            .font(.caption2).foregroundColor(.secondary)
-                            .instantHelp(miss.detail)
+                    // 对焦失误提示：只在实际有话说时显示（自动对焦无失误就不出这行）
+                    if !miss.short.isEmpty {
+                        HStack(spacing: 5) {
+                            Text(miss.short)
+                                .font(.caption2)
+                                .foregroundColor(miss.suspected ? .orange : .secondary)
+                            Image(systemName: "info.circle")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        .instantHelp(miss.detail)
                     }
                 }
 
@@ -2159,7 +2354,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("摄影照片筛选工具").font(.title3).fontWeight(.medium)
+                    Text("Kingfisher-PhotoSelector").font(.title3).fontWeight(.medium)
                     Text("RAW · 锐度热力图 · 合焦辅助 · 白平衡参考 · Bridge 元数据")
                         .font(.caption).foregroundColor(.secondary)
                 }
@@ -2173,8 +2368,8 @@ struct ContentView: View {
                 Button("选择文件夹") { pickFolder() }
                 .onAppear {
                     // UILOAD 调试入口：启动后自动载入指定目录（仅开发期，trigger 文件触发）。
-                    if let dir = FocusScreenerApp.pendingLoad {
-                        FocusScreenerApp.pendingLoad = nil
+                    if let dir = KingfisherPhotoSelectorApp.pendingLoad {
+                        KingfisherPhotoSelectorApp.pendingLoad = nil
                         store.onlySuspect = false   // 调试复现用：显示全部，不被过滤清空
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                             store.scan(folder: URL(fileURLWithPath: dir))
@@ -2186,7 +2381,7 @@ struct ContentView: View {
                 if store.devMode {
                     Button("导出调试 CSV") { store.exportDebugCSV() }
                         .disabled(store.results.isEmpty)
-                        .help("开发模式：导出全部中间参数（合焦依据、各维度分数、对焦点语义标签、题材判定链），用于对照真值调阈值。设置环境变量 FOCUSSCREENER_DEV=1 才显示。")
+                        .help("开发模式：导出全部中间参数（合焦依据、各维度分数、对焦点语义标签、题材判定链），用于对照真值调阈值。设置环境变量 KINGFISHER_DEV=1 才显示。")
                 }
             }.padding(12)
 
@@ -2310,6 +2505,10 @@ struct ContentView: View {
                 }
 
                 Toggle("附红色标签", isOn: $store.addColorLabel)
+                    .help("""
+                    开启后，「写入 Bridge 元数据」会给每张未合焦照片加上红色颜色标签（xmp:Label=Red），
+                    在 Bridge 里一眼就能把废片筛出来；关闭则只写关键词和说明，不动颜色标签。
+                    """)
                 Spacer()
                 if store.processing {
                     ProgressView(value: Double(store.done), total: Double(max(store.total, 1)))
@@ -2322,11 +2521,15 @@ struct ContentView: View {
                 }
                 .disabled(store.selected == nil || store.processing)
                 .foregroundColor(.red)
+                .keyboardShortcut(.delete, modifiers: .command)
             }.padding(10)
 
             HStack {
                 Text(store.status).font(.caption).foregroundColor(.secondary).lineLimit(2)
                 Spacer()
+                // ⌘Z：撤销最近一次删除（隐藏按钮只承载快捷键，从废纸篓原样搬回）
+                Button { store.undoDelete() } label: { EmptyView() }
+                    .keyboardShortcut("z", modifiers: .command)
                 if !store.backupPath.isEmpty {
                     Button("打开写入前备份") {
                         NSWorkspace.shared.open(URL(fileURLWithPath: store.backupPath))
@@ -2351,7 +2554,7 @@ struct ContentView: View {
             Text("""
             将对 \(store.writableSuspects.count) 张未合焦照片追加关键词「未合焦」，并把判定原因写入 IPTC Core 的说明与 Instructions 字段。
 
-            已有的关键词、说明、颜色标签、星级都会被保留。RAW 只生成同名 .xmp 侧车，不改动原片。写入前的元数据会备份到「应用程序支持/FocusScreener/backups」。
+            已有的关键词、说明、颜色标签、星级都会被保留。RAW 只生成同名 .xmp 侧车，不改动原片。写入前的元数据会备份到「应用程序支持/Kingfisher-PhotoSelector/backups」。
             """)
         }
         .alert("删除照片", isPresented: $store.confirmDelete) {
@@ -2360,7 +2563,7 @@ struct ContentView: View {
                 if let u = store.deleteURL {
                     let out = store.deletePhoto(u)
                     let names = out.moved.joined(separator: "、")
-                    store.status = "已移到废纸篓：\(names)" +
+                    store.status = "已移到废纸篓：\(names)（⌘Z 可撤销）" +
                         (out.failed.map { "；失败：\($0)" } ?? "")
                 }
                 store.deleteURL = nil
@@ -2371,7 +2574,7 @@ struct ContentView: View {
                 Text("""
                 将把 \(u.lastPathComponent) 移到废纸篓\(jpg == nil ? "" : "，以及同名的 \(jpg!.lastPathComponent)")。
 
-                文件会进入废纸篓，仍可从废纸篓恢复。确认继续？
+                文件会进入废纸篓，确认后可用 ⌘Z 撤销（自动从废纸篓搬回并恢复到列表）。确认继续？
                 """)
             }
         }
@@ -2424,7 +2627,7 @@ struct ContentView: View {
 }
 
 @main
-struct FocusScreenerApp: App {
+struct KingfisherPhotoSelectorApp: App {
     @StateObject private var store = Store()
 
     init() {
@@ -2454,6 +2657,32 @@ struct FocusScreenerApp: App {
         if let dir = probeDir, !dir.isEmpty {
             Self.runGenreProbe(dir: dir)
             exit(0)
+        }
+
+        // 软件更名数据迁移：FocusScreener → PhotoSelector → Kingfisher-PhotoSelector。
+        // 一次性把旧数据目录整体搬过来（题材纠正记忆、元数据备份），
+        // 老用户的纠正记忆不丢。新目录已存在则不动（可能已有新数据）。
+        Self.migrateLegacySupportDir()
+    }
+
+    /// 旧 App Support 目录迁移（按从新到旧的顺序找）：
+    /// ~/Library/Application Support/{PhotoSelector|FocusScreener}
+    /// → ~/Library/Application Support/Kingfisher-PhotoSelector
+    private static func migrateLegacySupportDir() {
+        let fm = FileManager.default
+        let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let newDir = support.appendingPathComponent("Kingfisher-PhotoSelector", isDirectory: true)
+        guard !fm.fileExists(atPath: newDir.path) else { return }
+        for name in ["PhotoSelector", "FocusScreener"] {
+            let oldDir = support.appendingPathComponent(name, isDirectory: true)
+            guard fm.fileExists(atPath: oldDir.path) else { continue }
+            try? fm.createDirectory(at: support, withIntermediateDirectories: true)
+            do {
+                try fm.moveItem(at: oldDir, to: newDir)
+            } catch {
+                // 搬不动就留着旧目录，不阻塞启动；纠正记忆读不到时按空处理。
+            }
+            return
         }
     }
 
@@ -2684,7 +2913,7 @@ struct FocusScreenerApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("摄影照片筛选工具") {
+        WindowGroup("Kingfisher-PhotoSelector") {
             ContentView().environmentObject(store)
         }
         .defaultSize(width: 1060, height: 700)
@@ -2703,42 +2932,53 @@ func colorBiasText(r: Double, b: Double) -> String {
     return "接近中性"
 }
 
-/// 即时悬停提示：系统 .help() 要等约 1 秒才弹、鼠标一动就消失，用户觉得「不灵敏」。
-/// 这个修饰器用 onHover 在鼠标进入的那一刻就显示气泡，离开立刻消失，可停留阅读。
-/// 气泡锚定在视图上方、宽度受限自动换行；只用于信息区的解释文字。
+/// 即时悬停提示：鼠标停留满 1 秒后弹出（用户要求，滑过不乱弹），离开立刻消失。
+/// 用系统 popover 而不是自绘 overlay——之前自绘气泡有两个问题：宽度被锚定格子
+/// （约 130pt）限住变成竖条；网格里后面的格子会盖在气泡上，看起来像透明底、
+/// 和底下文字叠在一起。popover 是独立窗口：不透明、跟随系统深浅色、
+/// 始终完整显示在屏幕内、宽度可到 460 横向排版。
+/// title：可选的第一行标题（指标格显示指标名，如「主体清晰度」，而不是数值）。
 struct InstantHelp: ViewModifier {
     let text: String
+    var title: String? = nil
     @State private var showing = false
+    @State private var showTask: Task<Void, Never>?
     func body(content: Content) -> some View {
         content
-            .onHover { showing = $0 }
-            .overlay(alignment: .top) {
-                if showing {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(text)
-                            .font(.caption)
-                            .foregroundColor(.primary)
-                            .fixedSize(horizontal: false, vertical: true)
+            .onHover { hover in
+                showTask?.cancel()
+                showTask = nil
+                if hover {
+                    showTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        showing = true
                     }
-                    .padding(8)
-                    .frame(maxWidth: 280, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color(nsColor: .controlBackgroundColor))
-                            .shadow(radius: 4)
-                    )
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.35)))
-                    .zIndex(100)
-                    .allowsHitTesting(false)
-                    .offset(y: -10)
+                } else {
+                    showing = false
                 }
+            }
+            .popover(isPresented: $showing, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let title {
+                        Text(title).font(.caption).fontWeight(.semibold)
+                    }
+                    Text(text)
+                        .font(.caption)
+                        .foregroundColor(.primary)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .frame(maxWidth: 460, alignment: .leading)
+                .background(Color(nsColor: .windowBackgroundColor))
             }
     }
 }
 
 extension View {
     /// 即时悬停提示（替代判断依据区的 .help）。
-    func instantHelp(_ text: String) -> some View {
-        modifier(InstantHelp(text: text))
+    func instantHelp(_ text: String, title: String? = nil) -> some View {
+        modifier(InstantHelp(text: text, title: title))
     }
 }
