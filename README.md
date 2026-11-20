@@ -207,7 +207,7 @@ Kingfisher（翠鸟）停在水边，能透过水面的波纹与反光，从杂�
 
 ### 方法一：下载编译好的 App（推荐）
 
-从本仓库 [Releases](https://github.com/Dyingdong/photography_photo_selection_assistance_software/releases) 下载最新版，解压双击即可。当前发布包仅支持 **Apple Silicon（arm64）**。
+从本仓库 [Releases](https://github.com/Dyingdong/kingfisher-photoselector/releases) 下载最新版，解压双击即可。当前发布包仅支持 **Apple Silicon（arm64）**。
 
 若提示「来自身份不明的开发者」，右键 → 打开 → 弹窗里点打开；或执行：
 
@@ -220,8 +220,8 @@ xattr -cr "/path/to/Kingfisher-PhotoSelector.app"
 需要 Apple Silicon Mac，以及 Xcode 命令行工具（`xcode-select --install`）：
 
 ```bash
-git clone git@github.com:Dyingdong/photography_photo_selection_assistance_software.git
-cd photography_photo_selection_assistance_software
+git clone git@github.com:Dyingdong/kingfisher-photo-selector.git
+cd kingfisher-photo-selector
 ./build.sh
 ```
 

@@ -9,7 +9,7 @@ macOS 原生 SwiftUI 照片筛选软件：批量扫描 RAW 照片，用拉普拉
 
 - 技术栈：Swift 5 + SwiftUI + Vision + ImageIO，无第三方依赖（exiftool Perl 已内置打包）
 - 构建：`./build.sh` → 产出 `Kingfisher-PhotoSelector.app` + 命令行工具 `kingfisher-photoselector`
-- 仓库：`Dyingdong/photography_photo_selection_assistance_software`（main 分支，仓库名不改）
+- 仓库：`Dyingdong/kingfisher-photo-selector`（main 分支，2026-11-20 由 photography_photo_selection_assistance_software 更名）
 
 ## 铁律（违反即事故）
 
