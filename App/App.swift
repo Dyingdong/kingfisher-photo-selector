@@ -263,6 +263,21 @@ final class Store: ObservableObject {
         return same > 1 ? u.lastPathComponent : stem
     }
 
+    /// 导入素材根文件夹名（取扫描目录最后一段），用于导出 CSV 的默认文件名。
+    /// 扫描成功（找到照片）时记录；非 @Published：不进 UI，不触发重算。
+    private(set) var importFolderName = "未命名"
+
+    /// 从扫描根目录提取可用于文件名的文件夹名：取最后一段路径，
+    /// 清理文件系统非法字符（/ \ : 等），根目录（"/"）或空名兜底为「未命名」。
+    private static func folderName(from url: URL) -> String {
+        var name = url.lastPathComponent
+        if url.path == "/" || name.isEmpty { name = "未命名" }
+        let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>")
+        name = name.components(separatedBy: invalid).joined(separator: "_")
+            .trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? "未命名" : name
+    }
+
     func toggleExclude(_ u: URL) {
         if excluded.contains(u) { excluded.remove(u) } else { excluded.insert(u) }
     }
@@ -277,13 +292,17 @@ final class Store: ObservableObject {
                 files.append(u)
             }
         }
+        // 扫描到照片才记录根目录名，避免空目录覆盖上一次的有效记录。
+        if !files.isEmpty { importFolderName = Self.folderName(from: folder) }
         process(files.sorted { $0.lastPathComponent < $1.lastPathComponent })
     }
 
     func scan(files: [URL]) {
         let allowed = MetadataWriter.rawExts
-        process(files.filter { allowed.contains($0.pathExtension.lowercased()) }
-                     .sorted { $0.lastPathComponent < $1.lastPathComponent })
+        let kept = files.filter { allowed.contains($0.pathExtension.lowercased()) }
+        // 散拖多张文件时没有扫描目录，用第一张所在文件夹名兜底。
+        if let first = kept.first { importFolderName = Self.folderName(from: first.deletingLastPathComponent()) }
+        process(kept.sorted { $0.lastPathComponent < $1.lastPathComponent })
     }
 
     private func process(_ files: [URL]) {
@@ -762,9 +781,23 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 导出 CSV 默认文件名：前缀-导入文件夹名-日期（到日）。
+    /// 例：导入 ~/Downloads/test2 → 「摄影筛选报告-test2-2026-11-20.csv」。
+    private func csvDefaultFileName(prefix: String) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return "\(prefix)-\(importFolderName)-\(formatter.string(from: Date())).csv"
+    }
+
+    /// NSSavePanel 默认目录：系统「下载」文件夹。
+    static var defaultExportDirectory: URL? {
+        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+    }
+
     func exportCSV() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "摄影筛选报告.csv"
+        panel.nameFieldStringValue = csvDefaultFileName(prefix: "摄影筛选报告")
+        panel.directoryURL = Store.defaultExportDirectory
         panel.allowedContentTypes = [UTType.commaSeparatedText]
         guard panel.runModal() == .OK, let u = panel.url else { return }
         // 题材记录：纯规则识别 + 最终生效题材 + 是否人工改过，供复核与调规则。
@@ -803,7 +836,8 @@ final class Store: ObservableObject {
     /// 对焦点语义标签、人体检测、题材判定链），用于对照真值调阈值。
     func exportDebugCSV() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "调试记录.csv"
+        panel.nameFieldStringValue = csvDefaultFileName(prefix: "调试记录")
+        panel.directoryURL = Store.defaultExportDirectory
         panel.allowedContentTypes = [UTType.commaSeparatedText]
         guard panel.runModal() == .OK, let u = panel.url else { return }
         let header = ["文件名", "判定", "判定原因", "建议星级", "综合分",

@@ -65,6 +65,39 @@ enum FocusSemanticsEngine {
         return specificAnimalWords.contains { s == $0 || s.hasSuffix("_\($0)") }
     }
 
+    /// 长焦裁块标签复核（30% 与 15% 两级裁块共用同一套规则，保证门槛一致）：
+    /// (a) 具体动物标签置信度 ≥ 最高鸟标签 × animalVsBirdRatio 时，判「动物局部
+    ///     被误认成鸟」，返回 nonBird 交回 AI 主体复核（实测 JD5A9143：兔 16% vs 鸟 22%）；
+    /// (b) ≥2 个鸟种标签、最高 ≥ multiBirdMinConfidence、无具体动物标签时，
+    ///     采纳为鸟（实测 JD5A9173：鸟 18% + sparrow/raptor/owl）。
+    /// 返回 nil 表示两条规则都不适用，调用方维持原判。
+    private static func telephotoLabelReview(_ result: FocusSemantics) -> FocusSemantics? {
+        let parsed = Self.parsedLabels(result.labels)
+        let birdHits = parsed.filter { Self.isBirdLabel($0.id) }
+        let topBird = birdHits.max { $0.conf < $1.conf }
+        let animalHits = parsed.filter { Self.isSpecificAnimalLabel($0.id) }
+        let topAnimal = animalHits.max { $0.conf < $1.conf }
+
+        // (a) 兔子等具体动物局部被误判为鸟
+        if result.kind == .bird, let bird = topBird, let animal = topAnimal,
+           animal.conf >= bird.conf * Self.animalVsBirdRatio {
+            return FocusSemantics(
+                kind: .nonBird,
+                reason: "焦点裁块把动物局部认成鸟，交回 AI 主体复核（\(Self.cnName(animal.id)) \(Int((animal.conf * 100).rounded()))% vs 鸟 \(Int((bird.conf * 100).rounded()))%）",
+                labels: result.labels)
+        }
+        // (b) 多个鸟种标签互证但被大场景标签压过
+        if result.kind == .nonBird, topAnimal == nil,
+           birdHits.count >= 2, let bird = topBird,
+           bird.conf >= Self.multiBirdMinConfidence {
+            return FocusSemantics(
+                kind: .bird,
+                reason: "长焦下焦点裁块多个鸟种标签互证，采纳为鸟（\(Self.cnName(bird.id)) \(Int((bird.conf * 100).rounded()))%）",
+                labels: result.labels)
+        }
+        return nil
+    }
+
     /// 检测对焦点处的语义。af 为相机对焦点（归一化左上原点）；image 为缩略图。
     /// subjectBoxes 为主体检测框（归一化、左下原点，同 PhotoMetrics.bboxes）；
     /// telephoto 表示当前是长焦镜头（允许动物检测兜底）。
@@ -88,7 +121,7 @@ enum FocusSemanticsEngine {
             result = FocusSemantics(kind: .unknown, reason: "对焦点区域无法裁剪", labels: [])
         }
 
-        // 长焦镜头下的裁块标签复核（不改 classify 签名）：
+        // 长焦镜头下的裁块标签复核（30% 与 15% 两级裁块共用同一套规则）：
         // classify 只看「top 鸟标签≥0.20」与「风景标签≥0.25」两个孤立信号，
         // 实测在两种情况下会错判，这里用完整标签分布修正：
         // (a) 动物局部（如兔耳）被认成鸟：具体动物标签置信度接近最高鸟标签时，
@@ -96,30 +129,8 @@ enum FocusSemanticsEngine {
         // (b) 多个弱鸟标签被大场景标签压过：≥2 个鸟种标签、最高≥0.15、且无具体
         //     动物标签时，采纳为鸟。
         // 两处都直接 return，避免后续动物检测兜底把 (a) 又判回鸟。
-        if telephoto {
-            let parsed = Self.parsedLabels(result.labels)
-            let birdHits = parsed.filter { Self.isBirdLabel($0.id) }
-            let topBird = birdHits.max { $0.conf < $1.conf }
-            let animalHits = parsed.filter { Self.isSpecificAnimalLabel($0.id) }
-            let topAnimal = animalHits.max { $0.conf < $1.conf }
-
-            // (a) 兔子等具体动物局部被误判为鸟（实测 JD5A9143：兔 16% vs 鸟 22%）
-            if result.kind == .bird, let bird = topBird, let animal = topAnimal,
-               animal.conf >= bird.conf * Self.animalVsBirdRatio {
-                return FocusSemantics(
-                    kind: .nonBird,
-                    reason: "焦点裁块把动物局部认成鸟，交回 AI 主体复核（\(Self.cnName(animal.id)) \(Int((animal.conf * 100).rounded()))% vs 鸟 \(Int((bird.conf * 100).rounded()))%）",
-                    labels: result.labels)
-            }
-            // (b) 多个鸟种标签互证但被大场景标签压过（实测 JD5A9173：鸟 18% + sparrow/raptor/owl）
-            if result.kind == .nonBird, topAnimal == nil,
-               birdHits.count >= 2, let bird = topBird,
-               bird.conf >= Self.multiBirdMinConfidence {
-                return FocusSemantics(
-                    kind: .bird,
-                    reason: "长焦下焦点裁块多个鸟种标签互证，采纳为鸟（\(Self.cnName(bird.id)) \(Int((bird.conf * 100).rounded()))%）",
-                    labels: result.labels)
-            }
+        if telephoto, let reviewed = telephotoLabelReview(result) {
+            return reviewed
         }
 
         // 对焦点处已明确认出鸟或人脸 → 直接采用。
@@ -135,6 +146,48 @@ enum FocusSemanticsEngine {
                 result = FocusSemantics(kind: .unknown,
                                         reason: "对焦点处是天空/云，长焦镜头下不排除拍鸟",
                                         labels: result.labels)
+            }
+        }
+
+        // 兜底〇·五：长焦小裁块二次复核。
+        // 30% 裁块被天空/枝叶淹没认不出鸟（unknown）时，以对焦点为中心收紧到 15% span
+        // 再 classify 一次，鸟在裁块里的相对占比变大，标签置信度随之上升
+        // （实测 test2 极小飞鸟片：3875 从 8% 升到 29%，3891/3950 也在此被正式识别）。
+        // 门槛与 30% 裁块完全一致（单鸟标签 ≥0.20，或多鸟互证 ≥0.15 且 ≥2 标签，
+        // 且无具体动物标签），识别不出就继续走原流程，绝不硬猜。
+        // 边界（回归实测踩过的坑）：
+        // - 只在 30% 裁块 unknown 时复核：30% 已认出水面/陆地等明确风景（nonBird）
+        //   就不再复核——那些是比小裁块更强的风光证据（8330/8331 水面由此保持风光）；
+        // - 30% 裁块已认出具体动物（兔/马等 ≥0.20）时禁止复核：实测兔片 9141/9142
+        //   的 15% 小裁块会把兔子头部认成 bird/owl 55~66%，且动物检测在小裁块上
+        //   不报（拦不住），只能靠 30% 裁块的具体动物标签挡在门外；
+        // - 刻意不做 10% 档：实验显示 10% 裁块上动物检测会出 Cat/Dog 0.6+ 假检出。
+        if telephoto, result.kind == .unknown,
+           !Self.parsedLabels(result.labels).contains(where: {
+               Self.isSpecificAnimalLabel($0.id) && $0.conf >= 0.20 }),
+           let smallCrop = cropAround(image: image, cx: p.cx, cy: p.cy, span: 0.15) {
+            let small = classify(crop: smallCrop, fallbackReason: "对焦点区域识别不出明确内容")
+            let parsed = Self.parsedLabels(small.labels)
+            let birdHits = parsed.filter { Self.isBirdLabel($0.id) }
+            let topBird = birdHits.max { $0.conf < $1.conf }
+            let animalHits = parsed.filter { Self.isSpecificAnimalLabel($0.id) }
+            let topAnimal = animalHits.max { $0.conf < $1.conf }
+            // (a) 动物局部被误认成鸟：不采信小裁块，继续原流程（兜底一/二）。
+            if let bird = topBird, let animal = topAnimal,
+               animal.conf >= bird.conf * Self.animalVsBirdRatio {
+                // fall through
+            } else if small.kind == .bird, topAnimal == nil, let bird = topBird {
+                return FocusSemantics(
+                    kind: .bird,
+                    reason: "小裁块复核识别到：\(Self.cnName(bird.id)) (\(Int((bird.conf * 100).rounded()))%)",
+                    labels: small.labels)
+            } else if small.kind == .nonBird, topAnimal == nil,
+                      birdHits.count >= 2, let bird = topBird,
+                      bird.conf >= Self.multiBirdMinConfidence {
+                return FocusSemantics(
+                    kind: .bird,
+                    reason: "长焦下小裁块多个鸟种标签互证，采纳为鸟（\(Self.cnName(bird.id)) \(Int((bird.conf * 100).rounded()))%）",
+                    labels: small.labels)
             }
         }
 
@@ -254,11 +307,13 @@ enum FocusSemanticsEngine {
         return nil
     }
 
-    /// 以对焦点为中心裁一块正方形，边长取画面短边的 focusSpan 比例，并保证最小像素数。
+    /// 以对焦点为中心裁一块正方形，边长取画面短边的 span 比例，并保证最小像素数。
+    /// span 默认 0.30（主裁块）；15% 小裁块二次复核传 0.15。
     private static let focusSpan = 0.30
-    private static func cropAround(image: CGImage, cx: Double, cy: Double) -> CGImage? {
+    private static func cropAround(image: CGImage, cx: Double, cy: Double,
+                                   span: Double = focusSpan) -> CGImage? {
         let w = image.width, h = image.height
-        let side = max(160, Int(Double(min(w, h)) * focusSpan))
+        let side = max(160, Int(Double(min(w, h)) * span))
         let halfW = side / 2, halfH = side / 2
         var x = Int(cx * Double(w)) - halfW
         var y = Int(cy * Double(h)) - halfH

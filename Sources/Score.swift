@@ -140,7 +140,9 @@ enum ScoreEngine {
                     var area = 0.0
                     for b in m.bboxes { area += Double(b.width * b.height) }
                     if area > 0 && area < 0.08 {
-                        return (.bird, "\(focus.reason)，但超长焦下分割出极小主体（\(Int(area * 100))%），更可能是鸟")
+                        // 面积保留一位小数：极小主体常在 0.1%~0.8%，Int 截断会显示成 0%，
+                        // 让用户误以为分割失败（实测 test2 的 9 张飞鸟片）。
+                        return (.bird, "\(focus.reason)，但超长焦下分割出极小主体（\(String(format: "%.1f", area * 100))%），更可能是鸟")
                     }
                 }
                 return (.landscape, focus.reason)
@@ -198,7 +200,8 @@ enum ScoreEngine {
         if teleLens && tinyForeground {
             let bits = [focal > 0 ? "焦距 \(Int(focal))mm" : nil,
                         exif?.lens].compactMap { $0 }
-            return (.bird, bits.joined(separator: " · ") + "，且有极小前景主体（\(Int(subjectArea * 100))%），像远处的鸟")
+            // 面积保留一位小数，同上：0.1%~0.8% 的极小主体不该显示成 0%。
+            return (.bird, bits.joined(separator: " · ") + "，且有极小前景主体（\(String(format: "%.1f", subjectArea * 100))%），像远处的鸟")
         }
         if teleLens || (focal >= 200 && hasForeground) {
             let why = teleLens
