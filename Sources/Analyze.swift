@@ -2,16 +2,45 @@ import Foundation
 import CoreGraphics
 import ImageIO
 
-enum Verdict: String {
-    case pass = "合焦"
-    case globalBlur = "全片未合焦"
-    case subjectBlur = "主体未合焦"
+/// 主判定轴：主体清晰度（选片视角，六档 + 无法解码）。
+/// 「合焦/未合焦」是相机视角；用户选片时真正关心的是「主体清不清楚」，
+/// 因此判定文案统一改用主体轴：主体清晰 / 焦点正常 / 主体偏软 / 整片偏软 / 主体拖影 / 景深不足。
+/// - pass / passUnverified 都是「没判出问题」的放行档，区别只在主体定位可信度；
+/// - passUnverified（焦点正常）= 定位不可靠（显著性区域/中心权重兜底）时的放行，
+///   主体清晰度证据弱，文案里注明仅供参考。
+enum Verdict: String, CaseIterable {
+    case pass = "主体清晰"
+    case passUnverified = "焦点正常"
+    case globalBlur = "整片偏软"
+    case subjectBlur = "主体偏软"
     case depthIssue = "景深不足"
-    case motionBlur = "运动模糊/拖影"
+    case motionBlur = "主体拖影"
     case unreadable = "无法解码"
 
     var isSuspect: Bool {
         self == .globalBlur || self == .subjectBlur || self == .depthIssue
+    }
+
+    /// Bridge 颜色标签文本（2026-11-20 用户拍板：直接写判定词，不写英文颜色值）。
+    /// Bridge 的标签机制是文本匹配：文件里存字符串，与「偏好设置 → 标签」里的标签名
+    /// 比对后显示对应颜色（共 5 个槽位，正好对应五档）；对不上的显示白标。
+    /// 用户把 5 个标签名改成这五个词后即可按词显示颜色并筛选。无法解码不打标。
+    var bridgeLabel: String? {
+        switch self {
+        case .pass: return "主体清晰"
+        case .passUnverified: return "焦点正常"
+        case .globalBlur: return "整片偏软"
+        case .subjectBlur: return "主体偏软"
+        case .depthIssue: return "景深不足"
+        case .motionBlur: return "主体拖影"
+        case .unreadable: return nil
+        }
+    }
+
+    /// 主体定位是否可信（前景分割 / 人脸这两种可直接框中主体的方式）。
+    /// 显著性区域 / 中心权重只是兜底推测，框到的往往不是真主体。
+    static func subjectTrusted(source: String) -> Bool {
+        source == "前景主体" || source == "人脸检测"
     }
 }
 
@@ -253,7 +282,7 @@ enum Analyzer {
     }
 
     /// 只有前景分割/人脸这种可信定位，主体锐度比才算数；
-    /// 显著性兜底时它往往框到背景，退回中心区比，避免把「主体未合焦/背景清晰」误放行。
+    /// 显著性兜底时它往往框到背景，退回中心区比，避免把「主体偏软/背景清晰」误放行。
     static func effectiveSubjectRatio(_ m: PhotoMetrics) -> Double {
         (m.subjectSource == "前景主体" || m.subjectSource == "人脸检测")
             ? m.ratio : m.centerRatio
@@ -311,10 +340,24 @@ enum Analyzer {
         // 判定说明一律用大白话：让不懂「锐度比/重模糊比」的人也能一眼明白问题在哪。
         // 具体数值仍可在信息区的「判断依据」里查看，这里只给结论和原因。
         if m.anisotropy > 2.2 && (m.softRatio > 0.85 || m.globalHi < hiMin) {
-            return (.motionBlur, "画面有明显的拖影或抖动痕迹，整张偏软")
+            return (.motionBlur, "主体有明显的拖影或抖动痕迹，整张偏软")
         }
         if m.globalHi < hiMin {
-            return (.globalBlur, "整张照片都不够清晰，像是整体没对上焦")
+            // 整片偏软：主体证据细分（test3 实测 36 张整片偏软里 19 张主体是全图最锐区域的
+            // 天空小主体记录照，用户会保留）。判定用锐度比在 [0.8, 3.0] 才算可信——
+            // 极小主体时这个比值可能远大于 1 甚至上百，属噪声不可信。
+            let trusted = Verdict.subjectTrusted(source: m.subjectSource)
+            let f = subjectOverride ?? Self.effectiveSubjectRatio(m)
+            if trusted && f >= 0.8 && f <= 3.0 {
+                return (.globalBlur, "整张照片都不够清晰，像是整体没对上焦；"
+                        + "主体已是全图最锐区域，常见于天空小主体记录照，是否保留请自行判断")
+            } else if !trusted {
+                return (.globalBlur, "整张照片都不够清晰，像是整体没对上焦；"
+                        + "主体清晰度证据不足（主体定位不可靠）")
+            } else {
+                return (.globalBlur, "整张照片都不够清晰，像是整体没对上焦；"
+                        + "主体不是全图最锐区域")
+            }
         }
         // 以下规则用 50 张真实 RAW + 人工真值标定（召回 13/13，误杀 1/37）。
         // 注意：这是经验规则，换机型/题材后必须重新标注标定，不要当成通用阈值。
@@ -330,14 +373,19 @@ enum Analyzer {
                 return (.subjectBlur, "主体本身发虚，看不清细节")
             }
         } else if m.subjectSource == "显著性区域" {
-            // 显著性兜底时主体比反而偏高、且中心区偏软，真值中对应未合焦片
+            // 显著性兜底时主体比反而偏高、且中心区偏软，真值中对应主体偏软片
             if h > 0.105 && f < 0.25 {
                 return (.subjectBlur, "主体不够清楚，焦点可能落在了别处")
             }
         } else if f < 0.35 {
             return (.subjectBlur, "主体明显偏软，焦点可能没落在主体上")
         }
-        return (.pass, "主体清晰，对焦正常")
+        // 放行档按主体定位可信度分两级：定位可信才能下「主体清晰」的结论；
+        // 显著性/中心兜底只说明没发现明显问题，主体清不清楚仅供参考。
+        if Verdict.subjectTrusted(source: m.subjectSource) {
+            return (.pass, "主体清晰，对焦正常")
+        }
+        return (.passUnverified, "未发现明显失焦；主体清晰度仅供参考（主体定位不可靠）")
     }
 
     static func decide(_ all: [PhotoMetrics], sensitivity: Double = 1.0,
@@ -448,7 +496,7 @@ enum FocusMiss {
         let pos = "横向\(xPct)%／纵向\(yPct)%"
         let peak = m.peakBlock
         guard peak >= Analyzer.independentFloor, m.scores.count == m.cols * m.rows else {
-            return FocusMissDiagnosis(suspected: false, short: "全片偏软",
+            return FocusMissDiagnosis(suspected: false, short: "整片偏软",
                                       detail: "整张照片都不够锐（最锐处 \(Int(peak))），不像是对焦点拧偏，更像整体没对上\(manualNote)",
                                       focusMethod: method.text, subjectBlurCause: blur)
         }

@@ -46,14 +46,14 @@ struct RatingTest {
         print("rating:", sr.rating as Any, "rejected:", sr.isRejected)
         assert(sr.isRejected, "拒绝标记失败")
 
-        print("--- 保留其它字段：先写入质检说明 + 关键词，再评分 ---")
-        _ = try MetadataWriter.apply(to: jpg, reason: "主体未合焦", addLabel: true, backupDir: backup)
+        print("--- 保留其它字段：先写入质检说明 + 判定标签，再评分 ---")
+        _ = try MetadataWriter.apply(to: jpg, reason: "主体偏软", labelColor: "主体偏软", backupDir: backup)
         _ = try MetadataWriter.setRating(to: jpg, rating: 5, backupDir: backup)
         let sm = MetadataWriter.snapshot(jpg)
         print("rating:", sm.rating as Any, "keywords:", sm.keywords, "label:", sm.label)
         assert(sm.rating == 5, "说明后评分丢失")
-        assert(sm.keywords.contains("未合焦"), "评分覆盖掉了关键词")
-        assert(sm.label == "Red", "评分覆盖掉了颜色标签")
+        assert(!sm.keywords.contains("未合焦"), "仍在写入已停用的关键词")
+        assert(sm.label == "主体偏软", "评分覆盖掉了判定标签")
 
         print("ALL OK")
     }

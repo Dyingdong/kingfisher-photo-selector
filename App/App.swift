@@ -4,6 +4,39 @@ import UniformTypeIdentifiers
 import Foundation
 import CoreGraphics
 
+// MARK: - 导入后题材选择
+
+/// 导入文件夹后让用户整批指定题材；auto = 保持逐张自动识别。
+enum FolderGenreChoice: String, CaseIterable, Identifiable {
+    case auto, bird, landscape, portrait
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto:      return "自动识别题材"
+        case .bird:      return "鸟类摄影"
+        case .landscape: return "风光摄影"
+        case .portrait:  return "人像摄影"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .auto:      return "每张照片单独判断"
+        case .bird:      return "看重主体清晰、锐度高"
+        case .landscape: return "先看主体清晰，再看整体锐度"
+        case .portrait:  return "看对焦点、人脸清晰与白平衡"
+        }
+    }
+    var genre: PhotoGenre? {
+        switch self {
+        case .auto:      return nil
+        case .bird:      return .bird
+        case .landscape: return .landscape
+        case .portrait:  return .portrait
+        }
+    }
+}
+
 // MARK: - 快捷键配置
 
 /// 可用于框选手势的修饰键。
@@ -89,34 +122,75 @@ struct ShortcutSettings: Codable, Equatable {
 
 final class Store: ObservableObject {
     @Published var results: [PhotoResult] = []
-    /// 信息区高度（像素）。默认 = 刚好显示到合焦结论；用户拖分隔条调整。
+    /// 信息区高度（像素）。默认 = 刚好显示到清晰度判定结论；用户拖分隔条调整。
     /// 同一序列内切照片/重算都不改它，导入新素材时重置为默认值。
     @Published var infoHeight: CGFloat = Store.defaultInfoHeight
-    /// 默认信息区高度：让「评分 / 拍摄参数 / 合焦结论」可见，白平衡需滚动。
+    /// 默认信息区高度：让「评分 / 拍摄参数 / 清晰度判定」可见，白平衡需滚动。
     static let defaultInfoHeight: CGFloat = 300
     @Published var processing = false
     @Published var done = 0
     @Published var total = 0
+    /// 进度条旁的阶段标注：区分「读取历史数据」与「新素材分析」，避免误以为每次都在重算。
+    @Published var sessionPhase = ""
     @Published var status = "把照片文件夹拖进窗口，或点「选择文件夹」开始"
     @Published var selected: URL? {
         didSet {
             // 切换照片时做两件事：
-            // 1) 把上一张的评星依据、合焦信息（含鸟类识别）写进该照片元数据的「说明」
+            // 1) 把上一张的评星依据、清晰度判定信息（含鸟类识别）写进该照片元数据的「说明」
             //    ——用户 2026-11-19 要求，且只动说明字段，其他元数据一律不碰；
+            //    可用「切换时自动写说明」开关关闭（配合一键清除标记使用）；
             // 2) 缩放/平移复位；人工圈选记录按照片持久保留，切走再切回来仍在。
             guard oldValue != selected else { return }
-            if let old = oldValue { writeDescription(for: old) }
+            if let old = oldValue, autoWriteDescription { writeDescription(for: old) }
             resetZoom()
         }
+    }
+    /// 左侧列表多选（⌘/⇧ 与访达一致）：预览仍跟随单选 selected。
+    /// 单张点击 = selections 只有一个元素并同步 selected；
+    /// 多选时 selected 不变（保持最后单击的那张），批量操作针对整个 selections。
+    @Published var selections: Set<URL> = [] {
+        didSet {
+            guard selections != oldValue else { return }
+            if selections.count == 1, let only = selections.first {
+                selected = only
+            } else if let cur = selected, !selections.contains(cur) {
+                // 从多选缩小到不含当前预览图时，预览切到所选里的第一张
+                selected = selections.first
+            }
+        }
+    }
+    /// 批量删除/操作的目标：有多选就整组，否则当前预览那张。
+    var deleteTargets: [URL] {
+        let live = Set(results.map { $0.id })
+        let picked = selections.isEmpty ? (selected.map { [$0] } ?? []) : Array(selections)
+        return picked.filter { live.contains($0) }
     }
     @Published var onlySuspect = true
     @Published var sensitivity: Double = 1.0
     @Published var preferFaces = false
     @Published var addColorLabel = true
+    /// 切换照片时自动把上一张的判定信息写进其说明字段（用户 2026-11-19 要求；可关）。
+    @Published var autoWriteDescription = true
     @Published var confirmWrite = false
+    @Published var confirmCleanup = false
     @Published var confirmDelete = false
-    @Published var deleteURL: URL?
-    @Published var backupPath = ""
+    @Published var deleteURLs: [URL] = []
+    /// 导入文件夹后的一次性题材选择（每个文件夹每次启动只问一次）。
+    @Published var showGenrePrompt = false
+    @Published var genrePromptFolder: URL?
+    private var genrePromptAsked: Set<URL> = []
+    /// 题材弹窗先于读取/分析出现：用户答完后才真正开始扫描，
+    /// 选择先暂存，等新一批 results 填好再整批应用（避免改到上一批照片）。
+    private var pendingScan: (folder: URL, files: [URL], forceReload: Bool)?
+    private var pendingGenreChoice: FolderGenreChoice?
+    private var pendingGenreResolved = false
+    /// 当前批次导入时选的整批题材，写进会话缓存（含 auto）。
+    /// 下次导入同一文件夹时若 log 里已有它，就不再弹题材选择框。
+    private var folderGenreChoice: FolderGenreChoice?
+    /// 缓存被判定与本批照片无关时的说明，拼到完成状态里，方便判断是否真的读了历史。
+    private var scanNote = ""
+    /// 写入前备份所在的照片目录（备份已随照片放到各自文件夹，可能多个目录）。
+    @Published var backupDirs: [String] = []
     @Published var dropTarget = false
     @Published var showHeatmap = true
     @Published var dragStart: CGPoint?
@@ -165,6 +239,28 @@ final class Store: ObservableObject {
     @Published var aiCache: [URL: AISubject?] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
+
+    // MARK: - 鸟种识别（BioCLIP 2 本地，纯离线）
+    /// 当前采用的鸟种（BioCLIP 2 本地识别 / 人工确认；人工确认优先）。
+    @Published var birdCache: [URL: BirdSpeciesGuess] = [:]
+    @Published var birdTop3: [URL: String] = [:]
+    @Published var birdSource: [URL: String] = [:]
+    @Published var birdReason: [URL: String] = [:]
+    /// 人工确认输入框内容，按照片保存。
+    @Published var birdConfirm: [URL: String] = [:]
+    /// 用户主动清除标签后，本次会话不再自动重认这张。
+    @Published var birdDismissed: Set<URL> = []
+    /// 本地模型把握不足（或历史日志只有低置信误认）：不再反复重跑，也不显示候选鸟名。
+    @Published var birdUnreliable: Set<URL> = []
+    @Published var birdLoading: Set<URL> = []
+    @Published var birdMessage: [URL: String] = [:]
+    /// 首启预热状态：580MB 本地模型首次载入要 5～6 秒，放进后台做，避免点开照片才等。
+    @Published var birdModelWarming = false
+    /// 每次重新启动识别自增；旧任务完成时 token 对不上就丢弃，避免圈选后旧结果覆盖新结果。
+    @Published var birdTaskToken: [URL: Int] = [:]
+    /// 鸟种日志按根目录缓存在内存里，靠文件修改时间失效；切照片不再反复读盘。
+    private var birdLogMemory: [URL: (stamp: Date?, rows: [BirdRecord])] = [:]
+
     @Published var showAFPoints = true
     /// 构图辅助线：九宫格与对角线。默认开启（2026-11-19 用户要求），
     /// 线条画得很淡（见 CompositionGuides），不影响看图。
@@ -217,6 +313,10 @@ final class Store: ObservableObject {
     /// 非 @Published：生成结果不需要触发 UI 刷新；选中图/基准变化时按 key 自动失效。
     private var heatCache: [URL: (floor: Double, img: NSImage)] = [:]
     private var baseCache: [URL: (full: Bool, img: NSImage)] = [:]
+    /// 左侧列表缩略图缓存。历史加载时不逐张解 RAW（太慢），这里按需解小图。
+    /// 非 @Published：ResultRow 在 onAppear 触发解码，解好后写回并局部刷新。
+    private var thumbnailCache: [URL: CGImage] = [:]
+    private var thumbLoading: Set<URL> = []
 
     func heatmapImage(for r: PhotoResult) -> NSImage {
         let floor = heatFloor
@@ -226,10 +326,32 @@ final class Store: ObservableObject {
         return img
     }
 
+    /// 列表缩略图：历史恢复时 preview=nil，这里按需解码 160px 小图并缓存。
+    /// 单张 CR3 解到 160px 约 260ms，但只在行出现时解一次，不阻塞进入页面。
+    func ensureThumbnail(for url: URL) {
+        guard thumbnailCache[url] == nil, !thumbLoading.contains(url) else { return }
+        thumbLoading.insert(url)
+        DispatchQueue.global(qos: .utility).async {
+            let img = Analyzer.decode(url, maxSide: 160)?.image
+            DispatchQueue.main.async {
+                self.thumbLoading.remove(url)
+                if let img {
+                    self.thumbnailCache[url] = img
+                    self.baseCache[url] = nil   // 让主图/列表重取带缩略图的新状态
+                }
+            }
+        }
+    }
+
+    func thumbnail(for url: URL, fallback: CGImage?) -> CGImage? {
+        thumbnailCache[url] ?? fallback
+    }
+
     func baseImage(for r: PhotoResult) -> NSImage {
         let useFull = fullPreviewURL == r.id && fullPreview != nil
         if let c = baseCache[r.id], c.full == useFull { return c.img }
-        let cg = useFull ? (fullPreview ?? r.metrics.preview) : r.metrics.preview
+        let cg = useFull ? (fullPreview ?? thumbnail(for: r.id, fallback: r.metrics.preview))
+                         : thumbnail(for: r.id, fallback: r.metrics.preview)
         let img: NSImage
         if let cg {
             img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
@@ -244,9 +366,32 @@ final class Store: ObservableObject {
     private var hiMin: Double = 0
     private var cancelled = false
 
+    /// 需留意的照片（列表默认筛选、状态栏计数口径）：主体偏软 / 整片偏软 / 景深不足。
+    /// 主体拖影是橙色独立档，不算「需留意」，但要打红色标签（见 Verdict.bridgeLabelColor）。
     var suspects: [PhotoResult] { results.filter { $0.verdict.isSuspect } }
-    var writableSuspects: [PhotoResult] { suspects.filter { !excluded.contains($0.id) } }
+    /// 批量写元数据的目标（2026-11-20 起为全部照片）：每张照片把判定词写入 xmp:Label
+    /// （主体清晰/焦点正常/整片偏软/景深不足/主体偏软/主体拖影），原因写说明字段。
+    var writableTargets: [PhotoResult] {
+        results.filter { !excluded.contains($0.id) && $0.verdict != .unreadable }
+    }
     var shown: [PhotoResult] { onlySuspect ? suspects : results }
+
+    /// ↑/↓ 在当前列表（含"只看需留意"过滤）内切换照片，与列表顺序一致。
+    func moveSelection(by delta: Int) {
+        let items = shown
+        guard !items.isEmpty else { return }
+        let base: Int
+        if let cur = selected, let i = items.firstIndex(where: { $0.id == cur }) {
+            base = i
+        } else {
+            // 当前照片不在过滤列表里：向下从头开始，向上从尾开始。
+            base = delta >= 0 ? -1 : items.count
+        }
+        let target = max(0, min(items.count - 1, base + delta))
+        let next = items[target].id
+        selected = next
+        selections = [next]
+    }
 
     /// 热力图的固定标尺：有锚点用锚点，否则用本批 P75。
     /// 与判定共用同一个基准，避免「全糊的图按自己 P99 归一化后满屏绿」。
@@ -283,6 +428,85 @@ final class Store: ObservableObject {
     }
 
     func scan(folder: URL) {
+        scan(folder: folder, forceReload: false)
+    }
+
+    /// 会话缓存优先当前文件夹，找不到就逐级向上找（最多 4 层）。
+    /// 用户可能导入 .../拍鸟/好片 这样的子文件夹，而缓存写在 .../拍鸟 根目录。
+    /// 2026-11-23 修正两个误判：
+    /// ① 日志就在导入文件夹里时以日志为准——文件夹被移动/拷贝后快照里的绝对路径会过期，
+    ///    不能因此拒绝使用随文件夹一起走的历史数据；
+    /// ② 上级日志只有在本批照片确实有文件名重合时才借用，否则新文件夹会被错标成
+    ///    「读取历史数据」却实际逐张重新分析。
+    private func cachedSession(for folder: URL, files: [URL]) -> SessionSnapshot? {
+        let fileNames = Set(files.map { $0.lastPathComponent })
+        // 先找导入目录自己 + 逐级向上（最多 4 层）。
+        var cur = folder.standardizedFileURL
+        for _ in 0..<4 {
+            if let snap = SessionCache.load(folder: cur) {
+                let snapRoot = URL(fileURLWithPath: snap.folderPath).standardizedFileURL
+                let cachedNames = Set(snap.photos.map { $0.file })
+                let overlap = fileNames.filter { cachedNames.contains($0) }.count
+                if cur.path == folder.path {
+                    // 日志就在导入目录：随文件夹移动也认（只看文件名是否对得上）。
+                    if overlap > 0 { return snap }
+                } else if snapRoot.path == cur.path, overlap > 0 {
+                    // 上级目录自己的日志，且确实覆盖了本批部分照片。
+                    return snap
+                }
+            }
+            if cur.pathComponents.count <= 2 { break }
+            cur = cur.deletingLastPathComponent().standardizedFileURL
+        }
+        // 再向下汇总：用户可能把「拍鸟 / 风光 / 人像」放在一个大文件夹里分别处理过，
+        // 每批的 log 写在各自子目录。导入大文件夹时应按文件名合并这些快照，
+        // 已判定的直接恢复，只有真正新增的才分析（智慧识鸟式的"直接进入处理结果"）。
+        return mergedChildSession(for: folder, fileNames: fileNames)
+    }
+
+    /// 轻量 peek：log 里是否已经记过这批的题材选择（含"自动识别题材"）。
+    /// 只解码 JSON 的 folderGenreChoice 字段，不做任何缩略图解码/重建，几十毫秒。
+    /// 有记录就跳过题材弹窗，直接进入处理好的页面。
+    private func loggedGenreChoice(for folder: URL, files: [URL]) -> FolderGenreChoice? {
+        guard let snap = cachedSession(for: folder, files: files),
+              let raw = snap.folderGenreChoice else { return nil }
+        return FolderGenreChoice(rawValue: raw)
+    }
+
+    /// 向下扫描导入目录里的所有会话日志，按文件名合并成一份虚拟快照。
+    /// 只取与本批照片有交集的日志，避免把无关子目录的历史混进来。
+    private func mergedChildSession(for folder: URL, fileNames: Set<String>) -> SessionSnapshot? {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: folder, includingPropertiesForKeys: nil,
+                                    options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
+        var candidates: [SessionSnapshot] = []
+        for case let f as URL in e where f.lastPathComponent == SessionCache.fileName {
+            guard let data = try? Data(contentsOf: f),
+                  let snap = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
+                  snap.version == SessionCache.version else { continue }
+            let names = Set(snap.photos.map { $0.file })
+            guard !fileNames.filter({ names.contains($0) }).isEmpty else { continue }
+            candidates.append(snap)
+        }
+        guard !candidates.isEmpty else { return nil }
+        // 从旧到新覆盖，同一文件以最新保存的记录为准。
+        candidates.sort { $0.savedAt < $1.savedAt }
+        var merged: [String: CachedPhoto] = [:]
+        for snap in candidates {
+            for p in snap.photos where fileNames.contains(p.file) { merged[p.file] = p }
+        }
+        guard var snap = candidates.last, !merged.isEmpty else { return nil }
+        snap.folderPath = folder.standardizedFileURL.path
+        snap.photos = merged.values.sorted { $0.file < $1.file }
+        return snap
+    }
+
+    /// 当前素材根文件夹（scan(folder:) 记录）；「重新分析」按钮和会话缓存都靠它定位。
+    private(set) var currentFolder: URL?
+
+    /// 扫描文件夹。forceReload=false 时先查会话缓存：命中就直接加载历史判定，
+    /// 只有缓存里没有的照片（新增）才真正分析（用户 2026-11-22 要求）。
+    func scan(folder: URL, forceReload: Bool) {
         let fm = FileManager.default
         var files: [URL] = []
         let allowed = MetadataWriter.rawExts
@@ -292,12 +516,60 @@ final class Store: ObservableObject {
                 files.append(u)
             }
         }
-        // 扫描到照片才记录根目录名，避免空目录覆盖上一次的有效记录。
-        if !files.isEmpty { importFolderName = Self.folderName(from: folder) }
-        process(files.sorted { $0.lastPathComponent < $1.lastPathComponent })
+        guard !files.isEmpty else {
+            currentFolder = folder
+            resetBirdState()
+            process([])
+            return
+        }
+        importFolderName = Self.folderName(from: folder)
+        let sorted = files.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        pendingScan = (folder, sorted, forceReload)
+        pendingGenreChoice = nil
+        pendingGenreResolved = false
+        // 2026-11-23：题材选择提前到"读取历史数据/分析"之前，用户答完才真正开扫。
+        // 但如果 log 里已经记着这批的题材选择（说明之前导入过），就不再打扰用户。
+        if !forceReload, !genrePromptAsked.contains(folder) {
+            genrePromptAsked.insert(folder)
+            if loggedGenreChoice(for: folder, files: sorted) != nil {
+                pendingGenreResolved = true
+                startPendingScan()
+                return
+            }
+            genrePromptFolder = folder
+            showGenrePrompt = true
+            return
+        }
+        pendingGenreResolved = true
+        startPendingScan()
+    }
+
+    /// 用户答完题材弹窗（或无需提问）后才真正开始读缓存/分析。
+    private func startPendingScan() {
+        guard let job = pendingScan, pendingGenreResolved else { return }
+        showGenrePrompt = false
+        genrePromptFolder = nil
+        currentFolder = job.folder
+        resetBirdState()
+        scanNote = ""
+        if !job.forceReload, let snap = cachedSession(for: job.folder, files: job.files) {
+            let cachedNames = Set(snap.photos.map { $0.file })
+            let hits = job.files.filter { cachedNames.contains($0.lastPathComponent) }.count
+            if hits > 0 {
+                apply(snapshot: snap, files: job.files)
+                return
+            }
+            // 有日志但文件名完全对不上：明确按新素材处理，别再显示"读取历史数据"。
+            scanNote = "根目录日志与本批照片不匹配，按新素材处理；"
+        }
+        process(job.files)
     }
 
     func scan(files: [URL]) {
+        // 散拖文件没有明确的扫描根目录：清掉 currentFolder，
+        // 避免这批结果的会话缓存覆盖到上一个文件夹的缓存上。
+        currentFolder = nil
+        resetBirdState()
         let allowed = MetadataWriter.rawExts
         let kept = files.filter { allowed.contains($0.pathExtension.lowercased()) }
         // 散拖多张文件时没有扫描目录，用第一张所在文件夹名兜底。
@@ -327,7 +599,10 @@ final class Store: ObservableObject {
         genreOverride = [:]
         heatCache = [:]
         baseCache = [:]
-        status = "正在分析…"
+        thumbnailCache = [:]
+        thumbLoading = []
+        sessionPhase = "新素材分析"
+        status = "新文件夹：正在分析…"
         let faces = preferFaces
         let anchor = anchorHi
         DispatchQueue.global(qos: .userInitiated).async {
@@ -345,14 +620,122 @@ final class Store: ObservableObject {
             DispatchQueue.main.async {
                 self.metrics = found
                 self.hiMin = min
-                // 新素材序列：信息区高度重置为默认（显示到合焦）；同一序列内切照片不动它。
+                // 新素材序列：信息区高度重置为默认（显示到清晰度判定）；同一序列内切照片不动它。
                 self.infoHeight = Store.defaultInfoHeight
                 self.results = list
                 self.processing = false
-                self.status = "已分析 \(found.count) 张，未合焦 \(self.suspects.count) 张"
-                if let f = self.shown.first { self.selected = f.id }
+                self.status = self.scanNote + "新素材分析完成：\(found.count) 张，需留意 \(self.suspects.count) 张"
+                if let f = self.shown.first {
+                    self.selected = f.id
+                    self.selections = [f.id]
+                }
+                self.applyPendingGenre()
+                self.saveSession()
+                self.scanNote = ""
             }
         }
+    }
+
+    /// 加载历史会话缓存（scan(folder:) 的快速路径）：
+    /// 缓存里有的照片直接重建判定结果与指标（预览图重新解码，很快），
+    /// 缓存里没有的（新增照片）照常分析；缓存里有但文件夹里没有的（已删除）丢弃。
+    private func apply(snapshot: SessionSnapshot, files: [URL]) {
+        cancelled = false
+        processing = true
+        done = 0
+        total = files.count
+        results = []
+        wbCache = [:]
+        afCache = [:]
+        afLoading = []
+        afAttempted = []
+        exifCache = [:]
+        focusCache = [:]
+        humanCache = [:]
+        aiCache = [:]
+        ratingCache = [:]
+        genreOverride = [:]
+        heatCache = [:]
+        baseCache = [:]
+        thumbnailCache = [:]
+        thumbLoading = []
+        selectionRects = [:]
+        excluded = []
+        sessionPhase = "读取历史数据"
+        status = "正在读取历史数据…"
+        let byName = Dictionary(uniqueKeysWithValues: snapshot.photos.map { ($0.file, $0) })
+        // 2026-11-23 瞬时化：判定数值全在 log 里，恢复不需要解码 RAW。
+        // 原实现对每张都调 Analyzer.decode（单张 CR3 260~500ms），
+        // 45 张要爬十几秒进度条，看起来像在重新分析。现在同步重建，
+        // preview 留 nil，缩略图交给 ResultRow.onAppear 按需解 160px 小图。
+        var found: [PhotoMetrics] = []
+        var list: [PhotoResult] = []
+        var cachedSelections: [URL: CGRect] = [:]
+        var cachedGenres: [URL: PhotoGenre] = [:]
+        var newFiles: [URL] = []
+        for u in files {
+            if let c = byName[u.lastPathComponent],
+               let m = SessionCache.metrics(from: c, url: u, decodePreview: false) {
+                let v = Verdict(rawValue: c.verdict) ?? .unreadable
+                var r = PhotoResult(id: u, metrics: m, verdict: v, reason: c.reason)
+                r.overrideRect = c.overrideRect
+                found.append(m)
+                list.append(r)
+                if let rect = c.selectionRect { cachedSelections[u] = rect }
+                if let g = c.genreOverride, let genre = PhotoGenre(rawValue: g) {
+                    cachedGenres[u] = genre
+                }
+            } else {
+                newFiles.append(u)
+            }
+        }
+        // 新增照片（缓存里没有）照常完整分析；通常为空，所以主流程瞬时完成。
+        if !newFiles.isEmpty {
+            for u in newFiles {
+                if let m = Analyzer.analyze(u) {
+                    let (v, why) = Analyzer.classify(m, hiMin: snapshot.hiMin)
+                    found.append(m)
+                    list.append(PhotoResult(id: u, metrics: m, verdict: v, reason: why))
+                }
+            }
+        }
+        self.metrics = found
+        self.hiMin = snapshot.hiMin
+        self.sensitivity = snapshot.sensitivity
+        self.anchorHi = snapshot.anchorHi
+        self.folderGenreChoice = snapshot.folderGenreChoice.flatMap { FolderGenreChoice(rawValue: $0) }
+        self.infoHeight = Store.defaultInfoHeight
+        self.results = list
+        self.selectionRects = cachedSelections
+        self.genreOverride = cachedGenres
+        self.excluded = Set(snapshot.excludedFiles.compactMap { name in
+            list.first(where: { $0.id.lastPathComponent == name })?.id
+        })
+        self.done = files.count
+        self.processing = false
+        let df = DateFormatter()
+        df.dateFormat = "M-d HH:mm"
+        self.status = self.scanNote + "已读取历史数据（\(list.count - newFiles.count) 张，保存于 \(df.string(from: snapshot.savedAt))）"
+            + (newFiles.isEmpty ? "" : "；新素材 \(newFiles.count) 张已分析")
+            + "。点「重新分析」可全量重算"
+        if let f = self.shown.first {
+            self.selected = f.id
+            self.selections = [f.id]
+        }
+        self.applyPendingGenre()
+        self.saveSession()
+        self.scanNote = ""
+    }
+
+    /// 把当前文件夹的判定状态落盘（会话缓存）。照片全部删除后清掉缓存文件。
+    func saveSession() {
+        guard let folder = currentFolder, !processing, !results.isEmpty else { return }
+        SessionCache.save(folder: folder, sensitivity: sensitivity, anchorHi: anchorHi,
+                          hiMin: hiMin, excluded: excluded, results: results,
+                          metrics: metrics, selectionRects: selectionRects,
+                          genreOverride: genreOverride,
+                          folderGenreChoice: folderGenreChoice?.rawValue)
+        if results.isEmpty { SessionCache.remove(folder: folder) }
     }
 
     func recompute() {
@@ -367,7 +750,8 @@ final class Store: ObservableObject {
             r.overrideRect = old[m.url] ?? nil
             return r
         }
-        status = "已按新灵敏度重算，未合焦 \(suspects.count) 张"
+        status = "已按新灵敏度重算，需留意 \(suspects.count) 张"
+        saveSession()
     }
 
     func recheck(id: URL, rect: CGRect) {
@@ -382,6 +766,26 @@ final class Store: ObservableObject {
         // 同时持久记录显示用圈选框：切照片/复位缩放后仍按这张照片恢复。
         selectionRects[id] = rect
         status = "已按圈选区域重判 \(id.deletingPathExtension().lastPathComponent)：\(v.rawValue)"
+        // 拍鸟题材：用新圈选的主体框重新识别鸟种（人工确认结果不覆盖）。
+        refreshBirdAfterSubjectSelection(for: id)
+        saveSession()
+    }
+
+    /// 取消这张照片的人工圈选：清掉黄框和单张重判结果，恢复按自动识别主体判定/评分。
+    /// 只影响当前照片；其他照片的圈选记录不动，鸟种结果与人工确认也不动。
+    func clearManualSubject(for id: URL) {
+        guard let idx = results.firstIndex(where: { $0.id == id }),
+              let m = metrics.first(where: { $0.url == id }),
+              selectionRects[id] != nil || results[idx].overrideRect != nil else { return }
+        let (v, why) = Analyzer.classify(m, hiMin: hiMin, subjectOverride: nil)
+        objectWillChange.send()
+        results[idx].verdict = v
+        results[idx].reason = why
+        results[idx].overrideRect = nil
+        selectionRects.removeValue(forKey: id)
+        resetZoom()
+        status = "已取消 \(id.deletingPathExtension().lastPathComponent) 的自选主体，恢复自动判定"
+        saveSession()
     }
 
     func setAnchor(_ url: URL) {
@@ -478,15 +882,13 @@ final class Store: ObservableObject {
     /// 设置星级：0~5 星，-1 为 Bridge 的「拒绝」。即时写入元数据，失败则回滚 UI。
     func setRating(_ url: URL, rating: Int) {
         let previous = ratingCache[url]
-        let stamp = Int(Date().timeIntervalSince1970)
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Kingfisher-PhotoSelector/backups/\(stamp)")
+        let dir = url.deletingLastPathComponent()
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try MetadataWriter.setRating(to: url, rating: rating, backupDir: dir)
                 DispatchQueue.main.async {
                     self.ratingCache[url] = rating
-                    self.backupPath = dir.path
+                    if !self.backupDirs.contains(dir.path) { self.backupDirs.append(dir.path) }
                     let label = rating == -1 ? "拒绝" : "\(rating) 星"
                     self.status = "已设 \(url.deletingPathExtension().lastPathComponent) 为\(label)，并写入元数据"
                 }
@@ -546,6 +948,43 @@ final class Store: ObservableObject {
         } else {
             genreOverride.removeValue(forKey: url)
         }
+        saveSession()   // 手动改题材也要落盘，下次恢复会话时保留
+    }
+
+    /// 题目在扫描前就问；这里只暂存答案，真正应用等新一批 results 填好后做。
+    func applyFolderGenre(_ choice: FolderGenreChoice) {
+        pendingGenreChoice = choice
+        pendingGenreResolved = true
+        startPendingScan()
+    }
+
+    /// 用户点「暂不设置」：不改题材，但照常开始扫描。
+    func closeGenrePrompt() {
+        pendingGenreChoice = nil
+        pendingGenreResolved = true
+        startPendingScan()
+    }
+
+    /// 新一批结果落地后套用导入前选的题材，再统一落盘。
+    /// 这样弹窗在读取历史数据之前出现，也不会把选择错应用到上一批照片。
+    private func applyPendingGenre() {
+        guard let job = pendingScan else { return }
+        if let choice = pendingGenreChoice {
+            folderGenreChoice = choice   // 记下来，写进 log，下次导入同文件夹不再弹窗
+            let prefix = job.folder.standardizedFileURL.path + "/"
+            let inFolder = results.filter { $0.id.standardizedFileURL.path.hasPrefix(prefix) }
+            let name = Self.folderName(from: job.folder)
+            if let g = choice.genre {
+                for r in inFolder { genreOverride[r.id] = g }
+                status += "；已把「\(name)」的 \(inFolder.count) 张设为\(g.display)"
+            } else {
+                for r in inFolder { genreOverride[r.id] = nil }
+                status += "；「\(name)」已恢复逐张识别题材"
+            }
+        }
+        pendingScan = nil
+        pendingGenreChoice = nil
+        pendingGenreResolved = false
     }
 
     /// 记住一次题材纠正：机器判错的瞬间是最宝贵的监督信号。
@@ -609,25 +1048,49 @@ final class Store: ObservableObject {
     func zoomOut() { zoom = max(1, zoom / 1.5) }
 
     func writeMetadata() {
-        let targets = writableSuspects
+        let targets = writableTargets
         guard !targets.isEmpty else { return }
-        let stamp = Int(Date().timeIntervalSince1970)
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Kingfisher-PhotoSelector/backups/\(stamp)")
         var ok = 0
         var failed: [String] = []
+        var dirs = Set<String>()
         for r in targets {
             do {
+                // 备份随照片放同目录（用户 2026-11-20 要求，不再写进软件目录）。
+                let dir = r.id.deletingLastPathComponent()
+                dirs.insert(dir.path)
+                // 直接把判定词写入 xmp:Label（2026-11-20 用户拍板，不写英文颜色值）。
+                // 照片已有颜色标签时不覆盖（mergedXMP 里保护）。
                 _ = try MetadataWriter.apply(to: r.id, reason: r.reason,
-                                             addLabel: addColorLabel, backupDir: dir)
+                                             labelColor: addColorLabel ? r.verdict.bridgeLabel : nil,
+                                             backupDir: dir)
                 ok += 1
             } catch {
                 failed.append("\(r.id.lastPathComponent)：\(error.localizedDescription)")
             }
         }
-        backupPath = dir.path
+        backupDirs = Array(dirs).sorted()
         status = "已写入 \(ok) 张照片的 Bridge 元数据" +
                  (failed.isEmpty ? "" : "，\(failed.count) 张失败：\(failed.joined(separator: "；"))")
+    }
+
+    /// 一键清除本软件写入的标记（判定说明段、判定词标签）；用户原有元数据一律不动。
+    func cleanupMetadata() {
+        let targets = writableTargets
+        guard !targets.isEmpty else { return }
+        var ok = 0
+        var clean = 0
+        var failed: [String] = []
+        for r in targets {
+            do {
+                let res = try MetadataWriter.cleanup(to: r.id, backupDir: r.id.deletingLastPathComponent())
+                if res.removed { ok += 1 } else { clean += 1 }
+            } catch {
+                failed.append("\(r.id.lastPathComponent)：\(error.localizedDescription)")
+            }
+        }
+        status = "已清除 \(ok) 张照片的本软件标记（\(clean) 张原本就没有）；"
+                 + "用户原有说明/星级/关键词均未动。注意：开着「切换时自动写说明」的话，切照片会重新写入说明。"
+                 + (failed.isEmpty ? "" : " \(failed.count) 张失败：\(failed.joined(separator: "；"))")
     }
 
     /// 与 RAW 同目录、同文件名（不同扩展名）的 JPG；存在才返回。
@@ -642,7 +1105,16 @@ final class Store: ObservableObject {
     }
 
     /// 删除选中的照片；RAW 会连同同名 JPG 一起移到废纸篓。返回实际处理的文件名。
+    /// 删除当前预览那张时，自动选中列表里的**下一张**（没有下一张才选上一张），
+    /// 不再跳回第一张（用户 2026-11-22 要求）。
     func deletePhoto(_ url: URL) -> (moved: [String], failed: String?) {
+        // 先在删除前记住相邻关系：shown 的顺序就是列表顺序
+        let oldShown = shown
+        var nextID: URL?
+        if let idx = oldShown.firstIndex(where: { $0.id == url }) {
+            if idx + 1 < oldShown.count { nextID = oldShown[idx + 1].id }
+            else if idx > 0 { nextID = oldShown[idx - 1].id }
+        }
         var targets = [url]
         if let jpg = siblingJPG(for: url) { targets.append(jpg) }
         var moved: [String] = []
@@ -675,10 +1147,49 @@ final class Store: ObservableObject {
             heatCache[key] = nil; baseCache[key] = nil
         }
         excluded = excluded.subtracting(removedURLs)
+        selections.subtract(removedURLs)
         if let s = selected, removedURLs.contains(s) {
-            selected = shown.first?.id
+            selected = (nextID != nil && results.contains(where: { $0.id == nextID! }))
+                ? nextID : shown.first?.id
         }
+        saveSession()
         return (moved, failed)
+    }
+
+    /// 批量删除：多选后整组移到废纸篓（连同同名 JPG）。逐张走 deletePhoto 的
+    /// 废纸篓/撤销记录逻辑。删完后选「删除块后面的第一张」（没有则前面的），
+    /// 与单删行为一致（用户 2026-11-22 要求，不再跳回第一张）。
+    func deletePhotos(_ urls: [URL]) -> (moved: [String], failed: String?) {
+        // 删除前按 shown 顺序定位接替者：取删除集合中列表序最后一张的下一张
+        let oldShown = shown
+        let ordered = oldShown.filter { urls.contains($0.id) }
+        var nextID: URL?
+        if let last = ordered.last, let idx = oldShown.firstIndex(where: { $0.id == last.id }) {
+            if idx + 1 < oldShown.count, !urls.contains(oldShown[idx + 1].id) {
+                nextID = oldShown[idx + 1].id
+            } else if let first = ordered.first,
+                      let fidx = oldShown.firstIndex(where: { $0.id == first.id }), fidx > 0 {
+                nextID = oldShown[fidx - 1].id
+            }
+        }
+        var allMoved: [String] = []
+        var firstFailed: String?
+        for u in urls {
+            let out = deletePhoto(u)
+            allMoved += out.moved
+            if firstFailed == nil, let f = out.failed { firstFailed = f }
+        }
+        if let n = nextID, results.contains(where: { $0.id == n }) {
+            selected = n
+            selections = [n]
+        } else if let f = shown.first {
+            selected = f.id
+            selections = [f.id]
+        } else {
+            selected = nil
+            selections = []
+        }
+        return (allMoved, firstFailed)
     }
 
     /// 最近一次删除的记录（废纸篓位置 ↔ 原位置），⌘Z 撤销用。
@@ -724,24 +1235,30 @@ final class Store: ObservableObject {
                 self.results.append(contentsOf: newResults)
                 self.status = "已撤销删除：\(restored.map { $0.lastPathComponent }.joined(separator: "、"))" +
                     (failed.map { "；失败：\($0)" } ?? "")
-                if let first = newResults.first { self.selected = first.id }
+                if let first = newResults.first {
+                    self.selected = first.id
+                    self.selections = [first.id]
+                }
+                self.saveSession()
             }
         }
     }
 
     // MARK: - 「说明」元数据写入（切照片时自动执行）
 
-    /// 组一张照片的「说明」内容：鸟类类别（首位）→ 评星依据 → 合焦信息。
+    /// 组一张照片的「说明」内容：鸟类类别（首位）→ 评星依据 → 清晰度判定。
     /// 什么数据都没有（还没分析完）返回 nil，不写。
     private func describeNote(for url: URL) -> String? {
         guard let r = results.first(where: { $0.id == url }) else { return nil }
         let s = score(for: r)
         var seg: [String] = []
-        if let bird = birdCategory(for: url) { seg.append("鸟类：\(bird)") }
+        if let g = birdCache[url] {
+            seg.append("鸟种：\(g.chinese)（\(birdSource[url] ?? "未标注来源")）")
+        } else if let bird = birdCategory(for: url) { seg.append("鸟类：\(bird)") }
         var scoreDesc = "建议 \(s.stars) 星（总分 \(Int(s.total))）"
         if let w = s.weakest, w.weight > 0 { scoreDesc += "，短板：\(w.name) \(Int(w.score)) 分" }
         seg.append("评星依据：\(scoreDesc)")
-        seg.append("合焦：\(r.verdict.rawValue)——\(r.reason)")
+        seg.append("清晰判定：\(r.verdict.rawValue)——\(r.reason)")
         return seg.joined(separator: "；")
     }
 
@@ -765,8 +1282,8 @@ final class Store: ObservableObject {
     func writeDescription(for url: URL) {
         guard FileManager.default.fileExists(atPath: url.path),
               let note = describeNote(for: url) else { return }
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Kingfisher-PhotoSelector/backups/descriptions")
+        // 备份随照片放同目录（2026-11-20 用户要求）。
+        let dir = url.deletingLastPathComponent()
         DispatchQueue.global(qos: .utility).async {
             do {
                 _ = try MetadataWriter.setDescription(to: url, note: note, backupDir: dir)
@@ -779,6 +1296,284 @@ final class Store: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - 鸟种识别：BioCLIP 2 本地 → 人工确认（纯离线）
+
+    private func resetBirdState() {
+        // 2026-11-23：模型不再随文件夹切换卸载。首次载入 580MB 要 5～6 秒，
+        // 每次换文件夹都丢掉会让每张新素材又卡一次；改为常驻到 App 退出。
+        birdCache = [:]
+        birdTop3 = [:]
+        birdSource = [:]
+        birdReason = [:]
+        birdConfirm = [:]
+        birdDismissed = []
+        birdUnreliable = []
+        birdMessage = [:]
+        birdLoading = []
+        birdTaskToken = [:]
+    }
+
+    /// 日志与 XMP 标签都随照片走。若用户导入的是子文件夹（如 .../拍鸟/好片），
+    /// 日志实际在上级根目录 .../拍鸟，这里向上找几层，避免"明明有 log 却没读到"。
+    private func birdRoot(for url: URL) -> URL {
+        let base = (currentFolder ?? url.deletingLastPathComponent()).standardizedFileURL
+        var cur = base
+        for _ in 0..<4 {
+            if FileManager.default.fileExists(atPath: BirdLog.url(in: cur).path) { return cur }
+            if cur.pathComponents.count <= 2 { break }
+            cur = cur.deletingLastPathComponent().standardizedFileURL
+        }
+        return base
+    }
+
+    /// 读取（并按修改时间缓存）某个根目录的鸟种日志行。
+    private func birdRows(in root: URL) -> [BirdRecord] {
+        let stamp = BirdLog.stamp(in: root)
+        if let hit = birdLogMemory[root], hit.stamp == stamp { return hit.rows }
+        let rows = BirdLog.load(in: root)
+        birdLogMemory[root] = (stamp, rows)
+        return rows
+    }
+
+    /// 自动兜底的星级口径：Bridge 人工星级与建议星级取高者。
+    private func birdStars(for url: URL) -> Int {
+        var n = ratingCache[url] ?? 0
+        if let r = results.first(where: { $0.id == url }) { n = max(n, score(for: r).stars) }
+        return n
+    }
+
+    private func birdImage(for url: URL) -> CGImage? {
+        guard let r = results.first(where: { $0.id == url }) else { return nil }
+        return baseImage(for: r).cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+
+    /// 识别裁剪框：用户手动圈选优先（左下原点归一化），否则退回最大自动主体框。
+    /// 2026-11-23 用户要求：圈选主体后自动识别也要跟着刷新，用他画的框去认。
+    private func birdCrop(for url: URL) -> CGRect? {
+        if let manual = selectionRects[url], manual.width > 0, manual.height > 0 {
+            return BirdSpeciesEngine.paddedCrop(manual)
+        }
+        guard let r = results.first(where: { $0.id == url }),
+              let box = r.metrics.bboxes.max(by: { $0.width * $0.height < $1.width * $1.height })
+        else { return nil }
+        return BirdSpeciesEngine.paddedCrop(box)
+    }
+
+    private func birdTop3Text(_ list: [BirdSpeciesGuess]) -> String {
+        list.map { "\($0.chinese) \(Int($0.confidence * 100))%" }.joined(separator: " > ")
+    }
+
+    /// 后台预热本地模型：软件启动后立即低优先级加载，用户点照片时通常已经就绪。
+    /// 放在后台队列，不阻塞界面和照片分析；与按需加载由模型内部锁串行化。
+    func prewarmBirdModel() {
+        guard BirdSpeciesEngine.available, !BirdSpeciesEngine.isLoaded, !birdModelWarming else { return }
+        birdModelWarming = true
+        DispatchQueue.global(qos: .utility).async {
+            let ok = BirdSpeciesEngine.loadIfNeeded()
+            DispatchQueue.main.async {
+                self.birdModelWarming = false
+                if !ok { self.status = "本地鸟种模型加载失败，请检查安装包内的模型文件" }
+            }
+        }
+    }
+
+    /// 拍鸟题材照片被点开时自动显示识别结果；风光 / 人像不识别、不显示。
+    /// 先读可见日志（人工确认优先），否则跑本地 BioCLIP 2。
+    /// forceLocal=true 用于圈选主体后刷新：跳过日志旧结果，强制按新裁剪框重认。
+    func ensureBird(for url: URL, forceLocal: Bool = false) {
+        guard !birdDismissed.contains(url), !birdUnreliable.contains(url) else { return }
+        guard let r = results.first(where: { $0.id == url }), genre(for: r).0 == .bird else { return }
+        guard BirdSpeciesEngine.available else {
+            birdMessage[url] = "鸟种模型未随软件分发"
+            return
+        }
+        guard birdCache[url] == nil, !birdLoading.contains(url) else { return }
+
+        if !forceLocal {
+            let rows = birdRows(in: birdRoot(for: url))
+            if let rec = BirdLog.latest(in: rows, for: url.lastPathComponent,
+                                        minLocalConfidence: BirdSpeciesEngine.localAcceptThreshold,
+                                        agreementConfidence: BirdSpeciesEngine.localAgreementThreshold,
+                                        agreementReason: BirdSpeciesEngine.agreementReasonToken) {
+                applyBirdRecord(rec, to: url, writeLabel: false)
+                return
+            }
+            // 历史日志里只有低置信本地猜测：不读回来、不显示、不重跑；
+            // 顺手清掉旧版写进 xmp:Label 的鸟名（写入前仍有 .before-bird.xmp 备份）。
+            if rows.contains(where: { $0.file == url.lastPathComponent && $0.source != "人工确认" }) {
+                birdUnreliable.insert(url)
+                birdMessage[url] = "历史本地识别把握不足，已忽略结果；请放大原图后人工确认"
+                let dir = url.deletingLastPathComponent()
+                DispatchQueue.global(qos: .utility).async {
+                    _ = try? MetadataWriter.setBirdLabel(to: url, bird: nil, backupDir: dir)
+                }
+                return
+            }
+        }
+
+        // 先触发预热；主线程只靠 birdModelWarming 判断阶段，避免去抢模型加载锁
+        // （预热中的 5 秒如果把主线程卡住，界面反而更卡）。
+        prewarmBirdModel()
+        let needsFirstLoad = birdModelWarming || !BirdSpeciesEngine.isLoaded
+        let token = (birdTaskToken[url] ?? 0) + 1
+        birdTaskToken[url] = token
+        birdLoading.insert(url)
+        birdMessage[url] = needsFirstLoad
+            ? "首次加载本地模型…（约 5 秒，之后秒出）" : "读取原图…"
+        let crop = birdCrop(for: url)
+        // 用原尺寸预览而非分析小图：小图里面临小主体信息不足，会和验证口径不一致。
+        let preferred = fullPreviewURL == url ? fullPreview : nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let cg = preferred ?? Analyzer.loadFullPreview(url) else {
+                DispatchQueue.main.async {
+                    guard self.birdTaskToken[url] == token else { return }
+                    self.birdLoading.remove(url)
+                    self.birdMessage[url] = "原图读取失败"
+                }
+                return
+            }
+            let loaded = BirdSpeciesEngine.loadIfNeeded()
+            DispatchQueue.main.async {
+                guard self.birdTaskToken[url] == token, self.birdLoading.contains(url) else { return }
+                self.birdMessage[url] = "识别中…"
+            }
+            // 整图与主体框各跑一次，取置信更高的；两者 Top1 一致也算互相印证。
+            let whole = loaded ? BirdSpeciesEngine.guess(image: cg, crop: nil) : nil
+            let cropped = loaded ? crop.flatMap { BirdSpeciesEngine.guess(image: cg, crop: $0) } : nil
+            let top = [whole, cropped].compactMap { $0 }.max {
+                ($0.first?.confidence ?? 0) < ($1.first?.confidence ?? 0)
+            }
+            let agree: Bool
+            if let a = whole?.first, let b = cropped?.first {
+                agree = a.chinese == b.chinese
+            } else { agree = false }
+            let topText = top.map { self.birdTop3Text($0) } ?? ""
+            DispatchQueue.main.async {
+                // 圈选后可能已经启动新一轮识别：旧任务的结果全部丢弃。
+                guard self.birdTaskToken[url] == token else { return }
+                self.birdLoading.remove(url)
+                guard let top, let first = top.first else {
+                    self.birdMessage[url] = "本地没认出来"
+                    return
+                }
+                // 窄口径放宽：常规门槛 0.50 直接采纳；只有整图与主体框 Top1 一致时，
+                // 才允许低到 0.45（恢复大山雀 49.3%）。旧口径 0.25 太松，暗光/空画面
+                // 两路会稳定给出同一个错误鸟名（实测黑胸鸫 26.8%、普通翠鸟 26.2%），
+                // 那两张仍低于 0.45，继续拒识。
+                let usable = first.confidence >= BirdSpeciesEngine.localAcceptThreshold
+                    || (agree && first.confidence >= BirdSpeciesEngine.localAgreementThreshold)
+                if usable {
+                    self.birdMessage[url] = ""
+                    let how = agree ? "BioCLIP 2 本地识别（整图与主体框互相印证）"
+                                    : "BioCLIP 2 本地识别"
+                    self.commitBird(name: first.chinese, latin: first.latin,
+                                    confidence: first.confidence, source: "本地识别",
+                                    reason: how, top3: topText, for: url)
+                } else {
+                    // 把握不足：鸟名、置信度、Top3 一概不显示，也不写标签/日志。
+                    self.birdUnreliable.insert(url)
+                    self.birdCache[url] = nil
+                    self.birdSource[url] = nil
+                    self.birdTop3[url] = nil
+                    self.birdReason[url] = nil
+                    self.birdMessage[url] = "本地模型没有可靠结果，未添加鸟种；请放大原图后人工确认"
+                }
+            }
+        }
+    }
+
+    /// 手动圈选主体后重认鸟种：清掉旧候选/旧任务，按新框强制跑一次本地识别。
+    /// 人工确认的结果不动，避免把用户核实过的鸟名覆盖掉。
+    func refreshBirdAfterSubjectSelection(for url: URL) {
+        guard birdSource[url] != "人工确认" else { return }
+        guard let r = results.first(where: { $0.id == url }), genre(for: r).0 == .bird else { return }
+        birdCache[url] = nil
+        birdTop3[url] = nil
+        birdSource[url] = nil
+        birdReason[url] = nil
+        birdMessage[url] = ""
+        birdUnreliable.remove(url)     // 换了裁剪框，允许重新判断一次
+        birdDismissed.remove(url)      // 用户重新框了主体，允许再次自动识别
+        birdLoading.remove(url)        // 旧任务靠 token 失效，不让它占着"识别中"
+        ensureBird(for: url, forceLocal: true)
+    }
+
+    /// 采用一个鸟种结果：更新界面 + 追加可见日志 + 写 XMP 标签（追加在判定词之后）。
+    func commitBird(name: String, latin: String, confidence: Double, source: String,
+                    reason: String, top3: String, for url: URL) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        birdCache[url] = BirdSpeciesGuess(chinese: clean, latin: latin, confidence: confidence)
+        birdSource[url] = source
+        birdReason[url] = reason
+        birdTop3[url] = top3
+        birdMessage[url] = ""
+        let root = birdRoot(for: url)
+        let rec = BirdRecord(time: ISO8601DateFormatter().string(from: Date()),
+                             file: url.lastPathComponent, name: clean, latin: latin,
+                             confidence: confidence, source: source, reason: reason,
+                             root: root.path, stars: birdStars(for: url), top3: top3)
+        BirdLog.append(rec, in: root)
+        let dir = url.deletingLastPathComponent()
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                _ = try MetadataWriter.setBirdLabel(to: url, bird: clean, backupDir: dir)
+            } catch {
+                DispatchQueue.main.async { self.status = "鸟种标签写入失败：\(error.localizedDescription)" }
+            }
+        }
+    }
+
+    private func applyBirdRecord(_ rec: BirdRecord, to url: URL, writeLabel: Bool) {
+        birdCache[url] = BirdSpeciesGuess(chinese: rec.name, latin: rec.latin, confidence: rec.confidence)
+        birdSource[url] = rec.source
+        birdReason[url] = rec.reason
+        birdTop3[url] = rec.top3
+        birdMessage[url] = ""
+        guard writeLabel else { return }
+        DispatchQueue.global(qos: .utility).async {
+            _ = try? MetadataWriter.setBirdLabel(to: url, bird: rec.name,
+                                                  backupDir: url.deletingLastPathComponent())
+        }
+    }
+
+    func confirmBird(for url: URL) {
+        let name = (birdConfirm[url] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        commitBird(name: name, latin: "", confidence: 1, source: "人工确认",
+                   reason: "用户放大原图后确认", top3: birdTop3[url] ?? "", for: url)
+    }
+
+    func clearBirdLabel(for url: URL) {
+        birdCache[url] = nil
+        birdSource[url] = nil
+        birdReason[url] = nil
+        birdTop3[url] = nil
+        birdMessage[url] = ""
+        birdConfirm[url] = ""
+        birdDismissed.insert(url)   // 本次会话不再自动重认，避免清掉又被写回
+        DispatchQueue.global(qos: .utility).async {
+            _ = try? MetadataWriter.setBirdLabel(to: url, bird: nil,
+                                                  backupDir: url.deletingLastPathComponent())
+        }
+    }
+
+    /// 鸟种日志导出：CSV 带照片根目录绝对路径，供后续统计与换模型复用。
+    func exportBirdLog() {
+        let root = currentFolder ?? results.first?.id.deletingLastPathComponent()
+        let records = root.map { BirdLog.load(in: $0) } ?? []
+        guard !records.isEmpty else { status = "当前文件夹还没有鸟种识别记录"; return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = csvDefaultFileName(prefix: "鸟种识别记录")
+        panel.directoryURL = Store.defaultExportDirectory
+        panel.allowedContentTypes = [UTType.commaSeparatedText]
+        guard panel.runModal() == .OK, let u = panel.url else { return }
+        do {
+            try BirdLog.csv(records).write(to: u, atomically: true, encoding: .utf8)
+            status = "鸟种记录已导出：\(u.path)（共 \(records.count) 条）"
+        } catch { status = "导出失败：\(error.localizedDescription)" }
     }
 
     /// 导出 CSV 默认文件名：前缀-导入文件夹名-日期（到日）。
@@ -818,8 +1613,17 @@ final class Store: ObservableObject {
                                                   lens: exifCache[r.id]?.lens,
                                                   shutter: exifCache[r.id]?.shutterSafety)
         }
+        var birds: [URL: Report.BirdInfo] = [:]
+        for r in results {
+            if let g = birdCache[r.id] {
+                birds[r.id] = Report.BirdInfo(name: g.chinese, confidence: g.confidence,
+                                              source: birdSource[r.id] ?? "",
+                                              reason: birdReason[r.id] ?? "",
+                                              top3: birdTop3[r.id] ?? "")
+            }
+        }
         let csv = Report.csv(results, hiMin: hiMin, sensitivity: sensitivity,
-                             anchor: anchorHi, genres: genres, focusMiss: focusMiss)
+                             anchor: anchorHi, genres: genres, focusMiss: focusMiss, birds: birds)
         do {
             try csv.write(to: u, atomically: true, encoding: .utf8)
             status = "报告已导出：\(u.path)（可填「人工真值」列后用 verify.py 复核）"
@@ -832,7 +1636,7 @@ final class Store: ObservableObject {
     /// 发布版没有这个按钮，也不写任何调试文件。
     let devMode = ProcessInfo.processInfo.environment["KINGFISHER_DEV"] == "1"
 
-    /// 调试 CSV：每张照片的全部中间参数（合焦判定依据、各维度分数与依据、
+    /// 调试 CSV：每张照片的全部中间参数（清晰度判定依据、各维度分数与依据、
     /// 对焦点语义标签、人体检测、题材判定链），用于对照真值调阈值。
     func exportDebugCSV() {
         let panel = NSSavePanel()
@@ -915,7 +1719,7 @@ final class Store: ObservableObject {
 
 func verdictColor(_ v: Verdict) -> Color {
     switch v {
-    case .pass: return .secondary
+    case .pass, .passUnverified: return .secondary
     case .globalBlur, .subjectBlur, .depthIssue: return .red
     case .motionBlur: return .orange
     case .unreadable: return .gray
@@ -1028,10 +1832,15 @@ struct ResultRow: View {
     let r: PhotoResult
     var body: some View {
         HStack(spacing: 8) {
-            if let cg = r.metrics.preview {
+            if let cg = store.thumbnail(for: r.id, fallback: r.metrics.preview) {
                 Image(nsImage: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
                     .resizable().aspectRatio(contentMode: .fill)
                     .frame(width: 46, height: 34).clipped().cornerRadius(3)
+            } else {
+                Rectangle().fill(Color.gray.opacity(0.15))
+                    .frame(width: 46, height: 34).cornerRadius(3)
+                // 历史恢复时 preview=nil：行出现才解小图，且不阻塞进入页面。
+                .task { store.ensureThumbnail(for: r.id) }
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.displayName(r.id)).lineLimit(1).font(.body)
@@ -1352,7 +2161,7 @@ private struct FrameLegend: View {
         HStack(spacing: 14) {
             legend(Color.cyan, "青框＝AI 主体")
             legend(Color.red, "红框＝相机对焦点")
-            legend(Color.yellow, "黄框＝人工圈选的主体")
+            legend(Color.yellow, "黄框＝自选主体（信息区可取消）")
         }
         .font(.caption2)
         .foregroundColor(.secondary)
@@ -1585,7 +2394,7 @@ struct DetailView: View {
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.bottom, 4)
-                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · 快捷键：H 热力图 / F 对焦点 / G 九宫格 / D 对角线 / ⌘1-5 评星 / ⌘0 清除星级 / ⌘⌫ 删除（⌘Z 撤销）")
+                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · 快捷键：↑/↓ 切换照片 / H 热力图 / F 对焦点 / G 九宫格 / D 对角线 / ⌘1-5 评星 / ⌘0 清除星级 / ⌘⌫ 删除（⌘Z 撤销）")
             } else {
                 HStack(spacing: 12) {
                     Toggle(isOn: $store.showHeatmap) { ShortcutToggleLabel(title: "锐度热力图", key: "H") }
@@ -1605,7 +2414,7 @@ struct DetailView: View {
                     Button("＋") { store.zoomIn() }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
                     Spacer()
-                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · H/F/G/D 切换热力图/对焦点/九宫格/对角线 · ⌘1-5 评星 · ⌘0 清除 · ⌘⌫ 删除（⌘Z 撤销）")
+                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · ↑/↓ 切换照片 · H/F/G/D 切换热力图/对焦点/九宫格/对角线 · ⌘1-5 评星 · ⌘0 清除 · ⌘⌫ 删除（⌘Z 撤销）")
                         .font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -1823,7 +2632,7 @@ struct DetailView: View {
     }
 }
 
-// MARK: - 综合评分区（替换原合焦块）
+// MARK: - 综合评分区（替换原合焦结论块，主轴已改为主体清晰度）
 
 /// 综合评分面板：建议星级 + 题材（自动/手动）+ 各维度得分条 + 采用建议写入 Bridge 星级。
 /// 抽成独立 View 以减小 InfoView.body 的类型检查复杂度。
@@ -1915,18 +2724,18 @@ private var genreBlock: some View {
             HStack(spacing: 6) {
                 Text("题材").font(.caption2).foregroundColor(.secondary)
                 Picker("", selection: genreBinding) {
-                    Text("自动识别（\(score.genre.rawValue)）").tag("auto")
-                    ForEach(PhotoGenre.allCases) { g in Text(g.rawValue).tag(g.rawValue) }
+                    Text("自动识别（\(score.genre.display)）").tag("auto")
+                    ForEach(PhotoGenre.allCases) { g in Text(g.display).tag(g.rawValue) }
                 }
                 .pickerStyle(.menu).frame(width: compact ? 200 : 168, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Text(score.genreIsGuess ? "自动识别依据：\(score.genreReason)"
+            Text(score.genreIsGuess ? "自动识别依据：\(genreDisplayText(score.genreReason))"
                                     : "题材已手动指定")
                 .font(.caption2).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .help(score.genreIsGuess
-                      ? "软件按「\(score.genreReason)」判为该题材；不准可在上面手动改"
+                      ? "软件按「\(genreDisplayText(score.genreReason))」判为该题材；不准可在上面手动改"
                       : "你已手动指定题材，评分权重按该题材计算")
             if !store.memory.isEmpty {
                 HStack(spacing: 6) {
@@ -2106,17 +2915,17 @@ struct InfoView: View {
 
                 Divider()
 
-                // 3) 综合评分：建议星级 + 题材 + 各维度，替换原合焦结论块
+                // 3) 综合评分：建议星级 + 题材 + 各维度
                 ScorePanel(r: r, score: store.score(for: r), compact: compact)
 
                 Divider()
 
-                // 3b) 合焦结论 + 判断依据：同一个区域、中间不分割（用户 2026-11-19 要求）
+                // 3b) 清晰度判定结论 + 判断依据：同一个区域、中间不分割（用户 2026-11-19 要求）
                 HStack(spacing: 6) {
                     Image(systemName: r.verdict.isSuspect ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
                         .font(.caption)
                         .foregroundColor(verdictColor(r.verdict))
-                    Text("合焦判定：\(r.verdict.rawValue)").font(.caption)
+                    Text("清晰判定：\(r.verdict.rawValue)").font(.caption)
                         .foregroundColor(verdictColor(r.verdict))
                     Text("· \(r.reason)").font(.caption2).foregroundColor(.secondary)
                         .lineLimit(1).help(r.reason)
@@ -2148,6 +2957,16 @@ struct InfoView: View {
                     }
                     Text("主体位置：\(subjectLabel(m.subjectSource))")
                         .font(.caption2).foregroundColor(.secondary)
+                    if store.selectionRects[r.id] != nil || r.overrideRect != nil {
+                        HStack(spacing: 8) {
+                            Text("当前按自选主体判定与评分")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Spacer(minLength: 4)
+                            Button("取消自选主体") { store.clearManualSubject(for: r.id) }
+                                .font(.caption2)
+                                .help("清除这张照片的黄框，恢复按自动识别主体判定与评分；其他照片不受影响")
+                        }
+                    }
                     if let af = store.afCache[r.id] {
                         let rel = Analyzer.afSubjectRelation(m, af: af)
                         // 悬停热区放整行而不是 ⓘ 小图标：图标只有 12pt，很难停准（用户实测不灵敏）
@@ -2256,6 +3075,12 @@ struct InfoView: View {
                 }
                 }
 
+                // 6) 鸟种识别：只给拍鸟题材显示，风光 / 人像不识别也不占位。
+                if store.genre(for: r).0 == .bird {
+                    Divider()
+                    BirdSpeciesPanel(r: r, compact: compact)
+                }
+
                 Text("灰块 = 该处纹理太少、无法判断。热力图只是相对参考，不是相机的 K 值或测光表。")
                     .font(.caption2).foregroundColor(.secondary)
                 Text(r.id.path).font(.caption2).foregroundColor(.secondary)
@@ -2266,6 +3091,8 @@ struct InfoView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            // 模型预热改在 ContentView 启动时统一做：这里不必因为看一张风光图
+            // 就把 580MB 鸟种模型拉进内存；真正需要时 ensureBird 会自己触发。
             store.ensureWB(for: r.id)
             store.ensureAF(for: r.id)
             store.ensureExif(for: r.id)
@@ -2273,6 +3100,7 @@ struct InfoView: View {
             store.ensureHuman(for: r.id)
             store.ensureAI(for: r.id)
             store.ensureRating(for: r.id)
+            store.ensureBird(for: r.id)
         }
         .onChange(of: r.id) { u in
             store.ensureWB(for: u)
@@ -2286,7 +3114,115 @@ struct InfoView: View {
             store.ensureHuman(for: u)
             store.ensureAI(for: u)
             store.ensureRating(for: u)
+            store.ensureBird(for: u)
         }
+    }
+}
+
+// MARK: - 鸟种识别面板
+
+private struct BirdSpeciesPanel: View {
+    @EnvironmentObject var store: Store
+    let r: PhotoResult
+    var compact: Bool = false
+
+    private var url: URL { r.id }
+    private var guess: BirdSpeciesGuess? { store.birdCache[url] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("鸟种识别").font(.caption).fontWeight(.medium).foregroundColor(.secondary)
+                if store.birdLoading.contains(url) { ProgressView().scaleEffect(0.6) }
+                Spacer()
+            }
+            if let g = guess {
+                HStack(spacing: 6) {
+                    Text(g.chinese).font(.callout).fontWeight(.medium)
+                    Text(String(format: "%.0f%%", g.confidence * 100))
+                        .font(.caption2).foregroundColor(.secondary)
+                    if let src = store.birdSource[url] {
+                        Text(src).font(.caption2).foregroundColor(.secondary)
+                    }
+                    Button {
+                        store.clearBirdLabel(for: url)
+                    } label: {
+                        Image(systemName: "xmark.circle").font(.caption2)
+                    }
+                    .buttonStyle(.plain).help("清除这张照片的鸟种标签")
+                }
+                if !g.latin.isEmpty {
+                    Text(g.latin).font(.caption2).italic().foregroundColor(.secondary)
+                }
+                if let t3 = store.birdTop3[url], !t3.isEmpty {
+                    Text("候选：\(t3)").font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                }
+                if let why = store.birdReason[url], !why.isEmpty {
+                    Text(why).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                }
+            } else if let msg = store.birdMessage[url], !msg.isEmpty {
+                Text(msg).font(.caption2).foregroundColor(
+                    store.birdLoading.contains(url) ? .secondary : .orange)
+            } else if store.birdLoading.contains(url) {
+                Text("识别中…").font(.caption2).foregroundColor(.secondary)
+            } else if store.birdDismissed.contains(url) {
+                Text("已清除鸟种标签，本次打开不再自动识别").font(.caption2).foregroundColor(.secondary)
+            } else {
+                Text("尚未识别").font(.caption2).foregroundColor(.secondary)
+            }
+
+            HStack(spacing: 6) {
+                TextField("人工确认鸟种", text: Binding(
+                    get: { store.birdConfirm[url] ?? "" },
+                    set: { store.birdConfirm[url] = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                Button("确认") { store.confirmBird(for: url) }
+                    .disabled((store.birdConfirm[url] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            Text("BioCLIP 2 本地识别，完全离线、不上传照片；结果只作参考，以你放大原图的人工确认为准。确认结果写入 xmp:Label 和根目录的 kingfisher-birds.log。")
+                .font(.caption2).foregroundColor(.secondary)
+        }
+        // 题材判定依赖异步读取的对焦点/EXIF/AI 缓存：InfoView 的 onAppear 可能
+        // 跑在缓存填充之前，那时还不是「拍鸟」，ensureBird 会直接返回。
+        // 面板只在拍鸟题材出现，所以它一出现就等于题材已确定，在这里补触发最可靠。
+        .onAppear { store.ensureBird(for: url) }
+        .onChange(of: url) { u in store.ensureBird(for: u) }
+    }
+}
+
+// MARK: - 导入后题材选择面板
+
+private struct FolderGenrePromptView: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("这个文件夹主要拍什么？").font(.headline)
+            Text("选定后再读取历史数据或开始分析；整批按该题材评分，之后仍可在信息区逐张修改。选「自动识别题材」则保持逐张判断。")
+                .font(.caption).foregroundColor(.secondary)
+            ForEach(FolderGenreChoice.allCases) { c in
+                Button {
+                    store.applyFolderGenre(c)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(c.title).font(.callout)
+                        Spacer()
+                        Text(c.detail).font(.caption2).foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 5).padding(.horizontal, 8)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.10)))
+                }
+                .buttonStyle(.plain)
+            }
+            HStack {
+                Spacer()
+                Button("暂不设置") { store.closeGenrePrompt() }
+                    .buttonStyle(.borderless).font(.caption)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 
@@ -2299,7 +3235,7 @@ struct ShortcutsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("快捷键设置").font(.headline)
-            Text("选择各操作使用的修饰键。修改后立即生效并保存在本机；按住左键拖动始终用于平移，单击始终用于复位。")
+            Text("选择各操作使用的修饰键。修改后立即生效并保存在本机；按住左键拖动始终用于平移，单击始终用于复位。↑/↓ 可在当前列表中切换照片。")
                 .font(.caption).foregroundColor(.secondary)
 
             HStack(spacing: 12) {
@@ -2353,6 +3289,7 @@ struct ShortcutsView: View {
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
+    @State private var arrowKeyMonitor: Any?
 
     /// 预览窗格：选中照片时是 DetailView，否则是空态提示。两种布局共用。
     @ViewBuilder
@@ -2389,7 +3326,7 @@ struct ContentView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Kingfisher-PhotoSelector").font(.title3).fontWeight(.medium)
-                    Text("RAW · 锐度热力图 · 合焦辅助 · 白平衡参考 · Bridge 元数据")
+                    Text("RAW · 锐度热力图 · 主体清晰度辅助 · 白平衡参考 · Bridge 元数据")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
@@ -2400,6 +3337,11 @@ struct ContentView: View {
                 .help("切换信息区位置：默认在预览下方；点一下竖排到画面最右侧")
                 Button("快捷键") { store.showShortcuts = true }.font(.caption)
                 Button("选择文件夹") { pickFolder() }
+                Button("重新分析") {
+                    if let f = store.currentFolder { store.scan(folder: f, forceReload: true) }
+                }
+                .disabled(store.currentFolder == nil || store.processing)
+                .help("忽略历史判定，把这个文件夹的全部照片重新分析一遍（会话缓存会被覆盖）")
                 .onAppear {
                     // UILOAD 调试入口：启动后自动载入指定目录（仅开发期，trigger 文件触发）。
                     if let dir = KingfisherPhotoSelectorApp.pendingLoad {
@@ -2412,10 +3354,13 @@ struct ContentView: View {
                 }
                 Button("导出 CSV 报告") { store.exportCSV() }
                     .disabled(store.results.isEmpty)
+                Button("鸟种记录") { store.exportBirdLog() }
+                    .font(.caption)
+                    .help("导出照片根目录的 kingfisher-birds.log 为 CSV，含根目录绝对路径与来源")
                 if store.devMode {
                     Button("导出调试 CSV") { store.exportDebugCSV() }
                         .disabled(store.results.isEmpty)
-                        .help("开发模式：导出全部中间参数（合焦依据、各维度分数、对焦点语义标签、题材判定链），用于对照真值调阈值。设置环境变量 KINGFISHER_DEV=1 才显示。")
+                        .help("开发模式：导出全部中间参数（清晰度判定依据、各维度分数、对焦点语义标签、题材判定链），用于对照真值调阈值。设置环境变量 KINGFISHER_DEV=1 才显示。")
                 }
             }.padding(12)
 
@@ -2424,13 +3369,25 @@ struct ContentView: View {
             HSplitView {
                 VStack(spacing: 0) {
                     HStack {
-                        Toggle("只看未合焦", isOn: $store.onlySuspect)
+                        Toggle("只看需留意", isOn: $store.onlySuspect)
                         Spacer()
                         Text("\(store.shown.count) 张").font(.caption).foregroundColor(.secondary)
                     }.padding(8)
-                    List(selection: $store.selected) {
+                    List(selection: $store.selections) {
                         ForEach(store.shown) { r in
                             ResultRow(r: r).tag(r.id)
+                                .contextMenu {
+                                    Button("在访达中显示") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([r.id])
+                                    }
+                                    Button("打开所在文件夹") {
+                                        NSWorkspace.shared.open(r.id.deletingLastPathComponent())
+                                    }
+                                    Button("删除（移到废纸篓）") {
+                                        store.deleteURLs = [r.id]
+                                        store.confirmDelete = true
+                                    }
+                                }
                         }
                     }
                 }
@@ -2479,7 +3436,7 @@ struct ContentView: View {
                         }
                     } else {
                         // 预览区弹性 + 信息区固定高度 + 可拖动分隔条。
-                        // 高度完全由 store.infoHeight 驱动：导入新素材时重置为默认值（显示到合焦），
+                        // 高度完全由 store.infoHeight 驱动：导入新素材时重置为默认值（显示到清晰度判定），
                         // 同序列内切照片/重算不动它 → 用户调好的比例一直保持。
                         GeometryReader { region in
                             let totalH = region.size.height
@@ -2538,22 +3495,40 @@ struct ContentView: View {
                     Button("恢复批次") { store.clearAnchor() }.font(.caption2)
                 }
 
-                Toggle("附红色标签", isOn: $store.addColorLabel)
+                Toggle("写入判定标签", isOn: $store.addColorLabel)
                     .help("""
-                    开启后，「写入 Bridge 元数据」会给每张未合焦照片加上红色颜色标签（xmp:Label=Red），
-                    在 Bridge 里一眼就能把废片筛出来；关闭则只写关键词和说明，不动颜色标签。
+                    开启后，「写入 Bridge 元数据」把判定词直接写入每张照片的 xmp:Label 字段：
+                    主体清晰 / 焦点正常 / 整片偏软 / 景深不足 / 主体偏软 / 主体拖影。
+                    在 Bridge「偏好设置 → 标签」里把 5 个标签名改成对应判定词后，Bridge 会按词显示颜色并可按名筛选；
+                    未改设置或对不上的词显示白标。照片已有的标签不会被覆盖。本软件不再写任何关键词。
+                    """)
+                Toggle("切换时自动写说明", isOn: $store.autoWriteDescription)
+                    .help("""
+                    切换照片时把上一张的评星依据、清晰度判定（含鸟类识别）写入其元数据「说明」字段
+                    （只动说明，其他元数据一律不碰）。用「清除本软件标记」前建议先关掉这个开关，
+                    否则切照片会把说明重新写回去。
                     """)
                 Spacer()
                 if store.processing {
-                    ProgressView(value: Double(store.done), total: Double(max(store.total, 1)))
-                        .frame(width: 140)
+                    // 进度条旁直接标明这次是读历史还是真在分析新素材，
+                    // 避免看到进度就以为文件夹每次都被重新分析。
+                    HStack(spacing: 6) {
+                        Text(store.sessionPhase).font(.caption2).foregroundColor(.secondary)
+                        ProgressView(value: Double(store.done), total: Double(max(store.total, 1)))
+                            .frame(width: 100)
+                        Text("\(store.done)/\(store.total)")
+                            .font(.caption2).monospacedDigit().foregroundColor(.secondary)
+                    }
                 }
-                Button("写入 Bridge 元数据 (\(store.writableSuspects.count))") { store.confirmWrite = true }
-                    .disabled(store.suspects.isEmpty || store.processing)
-                Button("删除当前照片") {
-                    if let u = store.selected { store.deleteURL = u; store.confirmDelete = true }
+                Button("写入 Bridge 元数据 (\(store.writableTargets.count))") { store.confirmWrite = true }
+                    .disabled(store.writableTargets.isEmpty || store.processing)
+                Button("清除本软件标记 (\(store.writableTargets.count))") { store.confirmCleanup = true }
+                    .disabled(store.writableTargets.isEmpty || store.processing)
+                Button("删除所选 (\(store.deleteTargets.count))") {
+                    store.deleteURLs = store.deleteTargets
+                    store.confirmDelete = !store.deleteURLs.isEmpty
                 }
-                .disabled(store.selected == nil || store.processing)
+                .disabled(store.deleteTargets.isEmpty || store.processing)
                 .foregroundColor(.red)
                 .keyboardShortcut(.delete, modifiers: .command)
             }.padding(10)
@@ -2564,9 +3539,17 @@ struct ContentView: View {
                 // ⌘Z：撤销最近一次删除（隐藏按钮只承载快捷键，从废纸篓原样搬回）
                 Button { store.undoDelete() } label: { EmptyView() }
                     .keyboardShortcut("z", modifiers: .command)
-                if !store.backupPath.isEmpty {
+                if !store.backupDirs.isEmpty {
                     Button("打开写入前备份") {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: store.backupPath))
+                        // 备份就在照片所在目录：优先打开当前选中照片的文件夹。
+                        let target: String?
+                        if let sel = store.selected,
+                           store.backupDirs.contains(sel.deletingLastPathComponent().path) {
+                            target = sel.deletingLastPathComponent().path
+                        } else {
+                            target = store.backupDirs.first
+                        }
+                        if let t = target { NSWorkspace.shared.open(URL(fileURLWithPath: t)) }
                     }.font(.caption)
                 }
             }.padding(.horizontal, 12).padding(.bottom, 8)
@@ -2586,34 +3569,80 @@ struct ContentView: View {
             Button("确认写入") { store.writeMetadata() }
         } message: {
             Text("""
-            将对 \(store.writableSuspects.count) 张未合焦照片追加关键词「未合焦」，并把判定原因写入 IPTC Core 的说明与 Instructions 字段。
+            将对 \(store.writableTargets.count) 张照片把判定原因写入 IPTC Core 的说明与 Instructions 字段，并把判定词（主体清晰/焦点正常/整片偏软/景深不足/主体偏软/主体拖影）直接写入 xmp:Label 标签字段。本软件不再写任何关键词。
 
-            已有的关键词、说明、颜色标签、星级都会被保留。RAW 只生成同名 .xmp 侧车，不改动原片。写入前的元数据会备份到「应用程序支持/Kingfisher-PhotoSelector/backups」。
+            已有的关键词、说明、标签、星级都会被保留（照片已有标签时不覆盖）。RAW 只生成同名 .xmp 侧车，不改动原片。写入前的元数据会备份到照片所在目录（已有备份时不覆盖）。
+            """)
+        }
+        .alert("清除本软件写入的标记", isPresented: $store.confirmCleanup) {
+            Button("取消", role: .cancel) { }
+            Button("确认清除") { store.cleanupMetadata() }
+        } message: {
+            Text("""
+            将对 \(store.writableTargets.count) 张照片清除本软件写入的内容：说明与 Instructions 里的「[Kingfisher-PhotoSelector]」「[合焦质检]」段、本软件写的判定词标签（含旧版英文颜色标签）。写入前的元数据同样先备份到照片所在目录。
+
+            你自己的说明、关键词、星级、拒绝标记、手动打的标签全部不会动。注意：清除后如果「切换时自动写说明」还开着，切照片时会重新写入说明。
             """)
         }
         .alert("删除照片", isPresented: $store.confirmDelete) {
-            Button("取消", role: .cancel) { store.deleteURL = nil }
+            Button("取消", role: .cancel) { store.deleteURLs = [] }
             Button("移到废纸篓", role: .destructive) {
-                if let u = store.deleteURL {
-                    let out = store.deletePhoto(u)
+                if !store.deleteURLs.isEmpty {
+                    let out = store.deletePhotos(store.deleteURLs)
                     let names = out.moved.joined(separator: "、")
                     store.status = "已移到废纸篓：\(names)（⌘Z 可撤销）" +
                         (out.failed.map { "；失败：\($0)" } ?? "")
                 }
-                store.deleteURL = nil
+                store.deleteURLs = []
             }
         } message: {
-            if let u = store.deleteURL {
+            if store.deleteURLs.count == 1, let u = store.deleteURLs.first {
                 let jpg = store.siblingJPG(for: u)
                 Text("""
                 将把 \(u.lastPathComponent) 移到废纸篓\(jpg == nil ? "" : "，以及同名的 \(jpg!.lastPathComponent)")。
 
                 文件会进入废纸篓，确认后可用 ⌘Z 撤销（自动从废纸篓搬回并恢复到列表）。确认继续？
                 """)
+            } else {
+                Text("""
+                将把 \(store.deleteURLs.count) 张照片（连同各自同名 JPG）一起移到废纸篓。
+
+                文件会进入废纸篓，确认后可用 ⌘Z 撤销最近一次。确认继续？
+                """)
             }
+        }
+        // 退出软件前把当前文件夹的判定状态落盘，下次打开同一文件夹直接恢复。
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.willTerminateNotification)) { _ in
+            store.saveSession()
         }
         .sheet(isPresented: $store.showShortcuts) {
             ShortcutsView().environmentObject(store)
+        }
+        .sheet(isPresented: $store.showGenrePrompt) {
+            FolderGenrePromptView().environmentObject(store)
+        }
+        // ↑/↓ 切换照片（用户要求加回）：用本地事件监听，保证焦点在预览或列表都生效。
+        // 输入框里打字、弹窗/面板打开时不拦截，避免抢走系统正常的方向键行为。
+        .onAppear {
+            // 软件一启动就后台预热鸟种模型（低优先级）：用户导入文件夹、翻照片的
+            // 这几秒正好把模型读进内存，点开第一张鸟片就不用再等 5～6 秒。
+            store.prewarmBirdModel()
+            guard arrowKeyMonitor == nil else { return }
+            arrowKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+                guard e.keyCode == 125 || e.keyCode == 126 else { return e }   // 125=↓ 126=↑
+                guard e.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return e }
+                guard NSApp.modalWindow == nil, e.window === NSApp.mainWindow else { return e }
+                if let fr = NSApp.keyWindow?.firstResponder, fr is NSText { return e }
+                store.moveSelection(by: e.keyCode == 125 ? 1 : -1)
+                return nil
+            }
+        }
+        .onDisappear {
+            if let m = arrowKeyMonitor {
+                NSEvent.removeMonitor(m)
+                arrowKeyMonitor = nil
+            }
         }
     }
 
@@ -2952,6 +3981,26 @@ struct KingfisherPhotoSelectorApp: App {
         }
         .defaultSize(width: 1060, height: 700)
     }
+}
+
+/// 把题材判定依据里的旧短词换成规范用词（内部 rawValue / CSV 保持原样）。
+/// 用正则只替换没跟"摄影"的裸词，避免把"风光摄影"再变成"风光摄影摄影"。
+func genreDisplayText(_ s: String) -> String {
+    guard let re = try? NSRegularExpression(pattern: "(拍鸟|风光|人像)(?!摄影)") else { return s }
+    var out = s
+    let matches = re.matches(in: s, range: NSRange(s.startIndex..., in: s))
+    for m in matches.reversed() {
+        guard let range = Range(m.range, in: s) else { continue }
+        let word = String(s[range])
+        let full: String
+        switch word {
+        case "拍鸟": full = "鸟类摄影"
+        case "风光": full = "风光摄影"
+        default:   full = "人像摄影"
+        }
+        out.replaceSubrange(range, with: full)
+    }
+    return out
 }
 
 /// 把「红:蓝」比例（以绿=1）翻成人话结论，直接告诉用户偏黄还是偏蓝。

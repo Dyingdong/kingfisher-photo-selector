@@ -25,8 +25,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "kingfisher-photoselector"
 
-SUSPECT = {"全片未合焦", "主体未合焦", "景深不足"}
-UNCERTAIN = {"运动模糊/拖影", "无法解码"}
+SUSPECT = {"整片偏软", "主体偏软", "景深不足"}
+UNCERTAIN = {"主体拖影", "无法解码"}
 DC = "http://purl.org/dc/elements/1.1/"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 XMP = "http://ns.adobe.com/xap/1.0/"
@@ -64,29 +64,31 @@ def classify(row, hi_min):
     """与 Sources/Analyze.swift 的 classify() 逐条对应，用于离线复算判定。
 
     阈值由 50 张真实 RAW + 人工真值标定：召回 13/13，误杀 1/37。
+    判定文案为主体清晰度体系：主体清晰 / 焦点正常 / 主体偏软 / 整片偏软 / 主体拖影。
     """
     hi, an = num(row, "最锐区P99"), num(row, "方向性")
     f, g, h = num(row, "判定用锐度比"), num(row, "中心锐度比"), num(row, "主体锐度比")
     reblur, soft = num(row, "主体重模糊比"), num(row, "偏软占比")
     margin = num(row, "基准余量")
     src = row.get("主体定位", "")
+    trusted = src in ("前景主体", "人脸检测")
     if hi <= 0:
         return "无法解码"
     if an > 2.2 and (soft > 0.85 or hi < hi_min):
-        return "运动模糊/拖影"
+        return "主体拖影"
     if margin < 1 or hi < hi_min:
-        return "全片未合焦"
+        return "整片偏软"
     if src == "前景主体":
         if g - f > 0.03 and f < 0.25:
-            return "主体未合焦"
+            return "主体偏软"
         if f < 0.10 and reblur < 0.12 and soft < 0.85:
-            return "主体未合焦"
+            return "主体偏软"
     elif src == "显著性区域":
         if h > 0.105 and f < 0.25:
-            return "主体未合焦"
+            return "主体偏软"
     elif f < 0.35:
-        return "主体未合焦"
-    return "合焦"
+        return "主体偏软"
+    return "主体清晰" if trusted else "焦点正常"
 
 
 def parse_truth(s):
@@ -396,13 +398,14 @@ def cmd_bytes(args):
             except ET.ParseError as e:
                 problems.append(f"{p.name}: XMP 不是合法 XML（{e}）")
                 continue
-            if "失焦" not in kws:
-                problems.append(f"{p.name}: 缺关键词「失焦」")
-            if "[失焦质检]" not in desc or "[失焦质检]" not in ins:
+            # 2026-11 起本软件不再写任何关键词；若出现旧版写入的「未合焦」属于历史遗留，不算问题。
+            if "未合焦" in kws:
+                print(f"  JPG {p.name[:40]:<40} 含旧版遗留关键词「未合焦」（历史遗留，本版已停用关键词）")
+            if "[合焦质检]" not in desc or "[合焦质检]" not in ins:
                 problems.append(f"{p.name}: 缺判定原因说明")
             print(f"  JPG {p.name[:40]:<40} XMP段={len(xmps)} "
-                  f"关键词={'失焦' if '失焦' in kws else '缺失':<4} "
-                  f"说明={'有' if '[失焦质检]' in desc else '缺失'} "
+                  f"关键词={','.join(kws) if kws else '无':<8} "
+                  f"说明={'有' if '[合焦质检]' in desc else '缺失'} "
                   f"标签={label or '无':<6} Exif保留={'是' if has_exif else '原本无'}")
         elif ext in raw_ext:
             checked["raw"] += 1
@@ -414,10 +417,11 @@ def cmd_bytes(args):
             except (ET.ParseError, UnicodeDecodeError) as e:
                 problems.append(f"{p.name}: 侧车不是合法 XMP（{e}）")
                 continue
-            if "失焦" not in kws:
-                problems.append(f"{p.name}: 侧车缺关键词「失焦」")
+            if "未合焦" in kws:
+                print(f"  RAW {p.name[:40]:<40} 侧车含旧版遗留关键词「未合焦」（历史遗留，本版已停用关键词）")
             print(f"  RAW {p.name[:40]:<40} 侧车=有 "
-                  f"关键词={'失焦' if '失焦' in kws else '缺失':<4} "
+                  f"关键词={','.join(kws) if kws else '无':<8} "
+                  f"标签={label or '无':<6} "
                   f"原片={len(data):,} 字节（不写入）")
 
     print(f"\n检查 {checked['jpg']} 张 JPG / {checked['raw']} 张 RAW")

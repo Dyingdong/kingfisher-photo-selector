@@ -13,3 +13,6 @@ __pycache__/
 
 # 命令行编译产物
 kingfisher-photoselector
+
+# 鸟种识别大模型资源（约 580MB，随 Release 包分发，不进 Git 仓库）
+Resources/

@@ -13,6 +13,12 @@ enum Report {
         "自动题材", "题材依据", "最终题材", "人工指定", "建议星级", "综合分",
         // 对焦失误提示（只提示、不改判定）：疑似焦点拧偏时给出线索，供人工排除。
         "对焦失误提示", "对焦失误说明",
+        // 主体占画幅比例（最大实例包围盒面积）。追加在末尾，不影响 verify.py 的列号。
+        "主体面积",
+        // 最大主体框坐标（归一化、左下原点：x|y|w|h），供离线裁剪实验用；无框为空。
+        "主体框",
+        // 鸟种识别（继续追加在末尾，不打乱旧列号）。
+        "识别鸟种", "鸟种置信", "鸟种来源", "鸟种依据", "鸟种Top3",
     ]
 
     /// 每张照片的题材/评分摘要，由 App 在导出前算好传入。
@@ -23,6 +29,15 @@ enum Report {
         let manualGenre: String?   // 用户手动指定的题材（nil = 没改过）
         let stars: Int
         let total: Int
+    }
+
+    /// 鸟种摘要，由 App 从鸟种日志取最终采用值传入；命令行工具不填。
+    struct BirdInfo {
+        let name: String
+        let confidence: Double
+        let source: String
+        let reason: String
+        let top3: String
     }
 
     static func q(_ s: String) -> String {
@@ -45,11 +60,13 @@ enum Report {
     static func csv(_ results: [PhotoResult], hiMin: Double, sensitivity: Double,
                     anchor: Double? = nil,
                     genres: [URL: GenreRecord] = [:],
-                    focusMiss: [URL: FocusMissDiagnosis] = [:]) -> String {
+                    focusMiss: [URL: FocusMissDiagnosis] = [:],
+                    birds: [URL: BirdInfo] = [:]) -> String {
         var lines = [columns.joined(separator: ",")]
         for r in results {
             let m = r.metrics
             let g = genres[r.id]
+            let b = birds[r.id]
             let fields = [
                 q(r.id.lastPathComponent), q(r.verdict.rawValue),
                 f(m.globalHi, 1), f(hiMin, 1),
@@ -64,6 +81,12 @@ enum Report {
                 q(g?.manualGenre ?? ""),
                 g.map { String($0.stars) } ?? "", g.map { String($0.total) } ?? "",
                 q(focusMiss[r.id]?.short ?? ""), q(focusMiss[r.id]?.detail ?? ""),
+                f(m.bboxes.map { $0.width * $0.height }.max() ?? 0),
+                q(m.bboxes.max { $0.width * $0.height < $1.width * $1.height }
+                    .map { [ $0.origin.x, $0.origin.y, $0.width, $0.height ]
+                        .map { f($0, 4) }.joined(separator: "|") } ?? ""),
+                q(b?.name ?? ""), b.map { f($0.confidence, 3) } ?? "",
+                q(b?.source ?? ""), q(b?.reason ?? ""), q(b?.top3 ?? ""),
             ]
             lines.append(fields.joined(separator: ","))
         }

@@ -19,11 +19,25 @@ if [ -f "$ROOT/Tools/exiftool/exiftool" ]; then
     chmod +x "$RES/exiftool"
 fi
 
+# 鸟种识别：BioCLIP 2 图像塔 Core ML + 预计算文本特征（2026-11-23 换回）。
+# 资源已随项目放在 Resources/，构建时覆盖 App 包内的旧副本，保证可重复构建。
+if [ -d "$ROOT/Resources/BioCLIPImage.mlmodelc" ]; then
+    rm -rf "$RES/BioCLIPImage.mlmodelc"
+    cp -R "$ROOT/Resources/BioCLIPImage.mlmodelc" "$RES/"
+fi
+if [ -f "$ROOT/Resources/bioclip_text_features.bin" ]; then
+    cp "$ROOT/Resources/bioclip_text_features.bin" "$RES/bioclip_text_features.bin"
+fi
+if [ -f "$ROOT/Resources/bioclip_labels.txt" ]; then
+    cp "$ROOT/Resources/bioclip_labels.txt" "$RES/bioclip_labels.txt"
+fi
+
 SRC=(
     "$ROOT/Sources/Metadata.swift"
     "$ROOT/Sources/Analyze.swift"
     "$ROOT/Sources/Subject.swift"
     "$ROOT/Sources/Report.swift"
+    "$ROOT/Sources/SessionCache.swift"
     "$ROOT/Sources/WhiteBalance.swift"
     "$ROOT/Sources/AFPoints.swift"
     "$ROOT/Sources/ExifInfo.swift"
@@ -33,10 +47,16 @@ SRC=(
     "$ROOT/Sources/GenreMemory.swift"
     "$ROOT/Sources/Score.swift"
 )
+# 鸟种模块只有 GUI 用：Core ML 依赖不进命令行工具，
+# 命令行继续只做判定复核，保持轻量。纯离线，不含任何网络/钥匙串代码。
+GUI_EXTRA=(
+    "$ROOT/Sources/BirdSpecies.swift"
+    "$ROOT/Sources/BirdLog.swift"
+)
 FLAGS=(-O -swift-version 5 -target arm64-apple-macosx13.0)
 
 # GUI App
-swiftc "${FLAGS[@]}" "${SRC[@]}" "$ROOT/App/App.swift" \
+swiftc "${FLAGS[@]}" "${SRC[@]}" "${GUI_EXTRA[@]}" "$ROOT/App/App.swift" \
     -o "$APP/Contents/MacOS/Kingfisher-PhotoSelector"
 # 清掉更名前（FocusScreener / PhotoSelector 时代）可能残留的旧可执行文件
 rm -f "$APP/Contents/MacOS/FocusScreener" "$APP/Contents/MacOS/PhotoSelector"

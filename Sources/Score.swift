@@ -10,6 +10,16 @@ enum PhotoGenre: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
+    /// 界面显示的规范用词（2026-11-23 用户要求）。rawValue 仍是旧短词，
+    /// 保持会话缓存 / 纠正记忆 / CSV 的历史数据可读，不做破坏性迁移。
+    var display: String {
+        switch self {
+        case .bird:      return "鸟类摄影"
+        case .landscape: return "风光摄影"
+        case .portrait:  return "人像摄影"
+        }
+    }
+
     /// 该题材的一句话评分口径，界面上直接给用户看。
     var rule: String {
         switch self {
@@ -47,14 +57,16 @@ struct PhotoScore {
     /// 主要短板（得分最低且权重不为零的维度），用于解释为什么不是更高星。
     var weakest: ScorePart? { parts.min { $0.score < $1.score } }
 
-    /// 合焦判定决定的星级上限。失焦/拖影属于硬伤，其他维度再高也不能拿高星
+    /// 清晰度判定决定的星级上限。主体偏软/拖影属于硬伤，其他维度再高也不能拿高星
     /// ——与慧眼识鸟「失焦直接降星」一致，也是选片时最直接的一道门槛。
+    /// 「整片偏软」只轻压（≤3 星）：整片都软时主体未必真的废（天空小主体记录照
+    /// 主体常是全图最锐区域），是否保留交给用户自己判断，不再压到 1~2 星。
     static func starCap(for v: Verdict) -> Int {
         switch v {
-        case .pass:       return 5
-        case .depthIssue: return 3
+        case .pass, .passUnverified: return 5
+        case .depthIssue, .globalBlur: return 3
         case .subjectBlur: return 2
-        case .globalBlur, .motionBlur, .unreadable: return 1
+        case .motionBlur, .unreadable: return 1
         }
     }
 }
@@ -65,7 +77,7 @@ struct PhotoScore {
 /// 但维度全部取自本项目已经可解释、可复核的指标，不引入无法验证的美学模型。
 ///
 /// 重要边界：
-/// - 相机对焦点只参与「人像」题材的评分微调，不改变原有的合焦判定；
+/// - 相机对焦点只参与「人像」题材的评分微调，不改变原有的主体清晰度判定；
 ///   实测 9 张真废片里 7 张焦点就在主体上，焦点位置不能等同合焦。
 /// - 构图没有可靠的自动打分依据，不进入分数，交给九宫格/对角线辅助线人工判断。
 /// - 所有阈值都是在这批 Canon EOS R6m2 / R7 样本上标定的经验值，换设备需重新标定。
@@ -305,12 +317,12 @@ enum ScoreEngine {
                           g, Analyzer.independentFloor, m.softRatio * 100))
     }
 
-    /// 合焦 / 对焦准确度：以已经标定的合焦判定为主，相机对焦点只做小幅微调。
+    /// 主体清晰度 / 对焦准确度：以已经标定的清晰度判定为主，相机对焦点只做小幅微调。
     private static func focusScore(_ m: PhotoMetrics, verdict: Verdict,
                                    af: AFInfo?) -> (Double, String) {
         var s: Double
         switch verdict {
-        case .pass:        s = 100
+        case .pass, .passUnverified: s = 100
         case .depthIssue:  s = 55
         case .subjectBlur: s = 30
         case .globalBlur:  s = 15
@@ -390,7 +402,8 @@ enum ScoreEngine {
 
         let total = parts.reduce(0) { $0 + $1.contribution }
 
-        // 先按加权总分定星，再用合焦硬门槛压顶：失焦片不会靠「整体锐度高」拿高星。
+        // 先按加权总分定星，再用主体清晰度硬门槛压顶：主体偏软的片子不会靠「整体锐度高」拿高星。
+        // 整片偏软只轻压到 ≤3 星：整片都软时主体未必真的废，保留与否交给用户判断。
         var stars = total >= 85 && clarity.0 >= 60 ? 5
                   : total >= 70 ? 4
                   : total >= 50 ? 3
@@ -407,7 +420,7 @@ enum ScoreEngine {
         case .landscape:
             tips.append("构图不计入自动分：打开工具栏的九宫格/对角线，自己看主体是否压线。")
         case .portrait:
-            tips.append("对焦位置只作评分参考，不改变原来的合焦判定。")
+            tips.append("对焦位置只作评分参考，不改变原来的主体清晰度判定。")
             if wb?.faceRG == nil { tips.append("没检测到人脸，白平衡按整张照片估算。") }
         }
         if genreIsGuess { tips.append("题材是软件猜的，不对的话在上面手动改成正确题材。") }
@@ -426,8 +439,8 @@ enum ScoreEngine {
             if let w = weakest { return "主要差在「\(w.name)」，留作备选比较合适。" }
             return "画面明显偏软，留作备选。"
         default:
-            if verdict == .motionBlur { return "有拖影或抖动痕迹，建议淘汰。" }
-            return "失焦或画质太差，建议淘汰。"
+            if verdict == .motionBlur { return "主体有拖影或抖动痕迹，建议淘汰。" }
+            return "主体偏软或画质太差，建议淘汰。"
         }
     }
 }
