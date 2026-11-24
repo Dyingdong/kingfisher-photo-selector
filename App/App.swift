@@ -78,10 +78,109 @@ enum DragAction {
     case divider   // 拖动分隔条（在预览区外、下方的 8pt 区域）
 }
 
+/// 预览工具栏里可切换显示的辅助项。快捷键与一键隐藏/恢复都按这个列表走。
+enum OverlayItem: String, CaseIterable, Identifiable {
+    case heatmap, afPoints, thirds, diagonals, aiBox, manualBox
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .heatmap:   return "锐度热力图"
+        case .afPoints:  return "对焦点"
+        case .thirds:    return "九宫格"
+        case .diagonals: return "对角线"
+        case .aiBox:     return "AI主体蓝框"
+        case .manualBox: return "自选主体黄框"
+        }
+    }
+}
+
+/// 一个按键组合：key 是小写字母/符号（如 "h"、"/"），modifiers 是需要的修饰键。
+/// 空 modifiers 表示直接按字母；空 key 表示未设置（不响应）。
+struct KeyCombo: Codable, Equatable, Hashable {
+    var key: String
+    var modifiers: [ModifierKey]
+
+    init(_ key: String = "", _ modifiers: [ModifierKey] = []) {
+        self.key = KeyCombo.normalize(key)
+        self.modifiers = modifiers
+    }
+
+    private enum CodingKeys: String, CodingKey { case key, modifiers }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = KeyCombo.normalize(try c.decodeIfPresent(String.self, forKey: .key) ?? "")
+        modifiers = try c.decodeIfPresent([ModifierKey].self, forKey: .modifiers) ?? []
+    }
+
+    /// 中文输入法下「、」和「/」是同一个物理键，统一成 "/"，这样 ⌘/ 与 ⌘、 都生效。
+    static func normalize(_ s: String) -> String {
+        switch s {
+        case "、", "／": return "/"
+        default: return s.lowercased()
+        }
+    }
+
+    /// 显示用：⌃⌥⇧⌘ + 大写按键，例如 "H"、"⌘/"。
+    var display: String {
+        let ordered: [ModifierKey] = [.control, .option, .shift, .command]
+        let prefix = ordered.compactMap { modifiers.contains($0) ? $0.symbol : nil }.joined()
+        return prefix + key.uppercased()
+    }
+
+    var flags: NSEvent.ModifierFlags {
+        var f: NSEvent.ModifierFlags = []
+        for m in modifiers { f.insert(m.flag) }
+        return f
+    }
+
+    /// 是否与这次按键事件匹配；修饰键必须完全一致，避免 ⌘H 触发 H。
+    func matches(_ e: NSEvent) -> Bool {
+        guard !key.isEmpty else { return false }
+        let pressed = e.modifierFlags.intersection([.command, .control, .option, .shift])
+        guard pressed == flags else { return false }
+        if let ch = e.characters?.first {
+            return KeyCombo.normalize(String(ch)) == key
+        }
+        // 中文输入法偶发 characters 为空：42 是美式键盘的 "/" 键码，给一键隐藏兜底。
+        if key == "/", e.keyCode == 42 { return true }
+        return false
+    }
+}
+
 /// 用户可自定义的快捷键，持久化到 UserDefaults。
 struct ShortcutSettings: Codable, Equatable {
     var zoom: ModifierKey = .command       // 框选放大，默认 ⌘
     var subject: ModifierKey = .control    // 圈选主体，默认 ⌃(Control)
+
+    // 六个辅助项的显示/隐藏快捷键（2026-11-23 用户要求，可自定义）。
+    var heatmap = KeyCombo("h")
+    var afPoints = KeyCombo("f")
+    var thirds = KeyCombo("g")
+    var diagonals = KeyCombo("d")
+    var aiBox = KeyCombo("b")              // AI 主体蓝框
+    var manualBox = KeyCombo("y")          // 自选主体黄框
+    /// 一键隐藏当前勾选的辅助项 / 再按一次恢复（默认 ⌘/，中文输入法下 ⌘、 等效）。
+    var overlayToggle = KeyCombo("/", [.command])
+
+    private enum CodingKeys: String, CodingKey {
+        case zoom, subject, heatmap, afPoints, thirds, diagonals, aiBox, manualBox, overlayToggle
+    }
+    /// 显式无参构造：自定义 init(from:) 后保留 ShortcutSettings() 用法。
+    init() {}
+    /// 老版本保存的 JSON 只有 zoom/subject，缺失字段用默认值补齐，不丢用户原来的修饰键设置。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        zoom = try c.decodeIfPresent(ModifierKey.self, forKey: .zoom) ?? .command
+        subject = try c.decodeIfPresent(ModifierKey.self, forKey: .subject) ?? .control
+        heatmap = try c.decodeIfPresent(KeyCombo.self, forKey: .heatmap) ?? KeyCombo("h")
+        afPoints = try c.decodeIfPresent(KeyCombo.self, forKey: .afPoints) ?? KeyCombo("f")
+        thirds = try c.decodeIfPresent(KeyCombo.self, forKey: .thirds) ?? KeyCombo("g")
+        diagonals = try c.decodeIfPresent(KeyCombo.self, forKey: .diagonals) ?? KeyCombo("d")
+        aiBox = try c.decodeIfPresent(KeyCombo.self, forKey: .aiBox) ?? KeyCombo("b")
+        manualBox = try c.decodeIfPresent(KeyCombo.self, forKey: .manualBox) ?? KeyCombo("y")
+        overlayToggle = try c.decodeIfPresent(KeyCombo.self, forKey: .overlayToggle) ?? KeyCombo("/", [.command])
+    }
 
     private static let storeKey = "Kingfisher-PhotoSelector.shortcuts.v1"
     /// 更名前的旧存储 key（FocusScreener / PhotoSelector 时代），只用于一次性迁移读取。
@@ -109,6 +208,32 @@ struct ShortcutSettings: Codable, Equatable {
             UserDefaults.standard.set(data, forKey: Self.storeKey)
         }
     }
+    func combo(for item: OverlayItem) -> KeyCombo {
+        switch item {
+        case .heatmap:   return heatmap
+        case .afPoints:  return afPoints
+        case .thirds:    return thirds
+        case .diagonals: return diagonals
+        case .aiBox:     return aiBox
+        case .manualBox: return manualBox
+        }
+    }
+    mutating func setCombo(_ combo: KeyCombo, for item: OverlayItem) {
+        switch item {
+        case .heatmap:   heatmap = combo
+        case .afPoints:  afPoints = combo
+        case .thirds:    thirds = combo
+        case .diagonals: diagonals = combo
+        case .aiBox:     aiBox = combo
+        case .manualBox: manualBox = combo
+        }
+    }
+    /// 所有按键组合，供设置面板查重；空 key（未设置）不参与查重。
+    var allCombos: [(name: String, combo: KeyCombo)] {
+        var list = OverlayItem.allCases.map { (name: $0.label, combo: combo(for: $0)) }
+        list.append((name: "一键隐藏/恢复辅助项", combo: overlayToggle))
+        return list.filter { !$0.combo.key.isEmpty }
+    }
     /// 判断当前按下的修饰键对应哪个框选动作；无匹配返回 nil（交给平移/复位）。
     func action(for flags: NSEvent.ModifierFlags) -> DragAction? {
         let f = flags.intersection([.command, .control, .option, .shift])
@@ -121,7 +246,23 @@ struct ShortcutSettings: Codable, Equatable {
 // MARK: - 状态
 
 final class Store: ObservableObject {
-    @Published var results: [PhotoResult] = []
+    /// results 整体替换时让派生快照失效（元素原地改 verdict 的两处另行显式失效）。
+    /// 1458 张规模下 shown / displayName 每次现算都会重复扫全表，放大切图开销。
+    @Published var results: [PhotoResult] = [] {
+        didSet { invalidateDerivedCaches() }
+    }
+    private var suspectCache: [PhotoResult]?
+    private var shownCache: [PhotoResult]?
+    private var displayNameCache: [URL: String] = [:]
+    /// 底部工具栏每次 body 重算都要数「写入/清除/删除」目标，原实现扫全表 3 次；
+    /// 方向键切图会连续触发多次 @Published 广播，1458 张时明显拖慢。按 results/excluded 失效。
+    private var writableCache: [PhotoResult]?
+    private func invalidateDerivedCaches() {
+        suspectCache = nil
+        shownCache = nil
+        displayNameCache = [:]
+        writableCache = nil
+    }
     /// 信息区高度（像素）。默认 = 刚好显示到清晰度判定结论；用户拖分隔条调整。
     /// 同一序列内切照片/重算都不改它，导入新素材时重置为默认值。
     @Published var infoHeight: CGFloat = Store.defaultInfoHeight
@@ -132,6 +273,9 @@ final class Store: ObservableObject {
     @Published var total = 0
     /// 进度条旁的阶段标注：区分「读取历史数据」与「新素材分析」，避免误以为每次都在重算。
     @Published var sessionPhase = ""
+    /// 后台正在读会话日志（读文件 + JSON 解码）。为真时工具栏显示明确提示，
+    /// 让用户知道这几百毫秒的停顿是在读历史日志，而不是界面卡死。
+    @Published var historyReading = false
     @Published var status = "把照片文件夹拖进窗口，或点「选择文件夹」开始"
     @Published var selected: URL? {
         didSet {
@@ -141,31 +285,54 @@ final class Store: ObservableObject {
             //    可用「切换时自动写说明」开关关闭（配合一键清除标记使用）；
             // 2) 缩放/平移复位；人工圈选记录按照片持久保留，切走再切回来仍在。
             guard oldValue != selected else { return }
-            if let old = oldValue, autoWriteDescription { writeDescription(for: old) }
-            resetZoom()
+            // 说明改为导入/读取完成时批量写（2026-11-23）：原来切一张写一张 XMP，
+            // 选片时每张都落盘会卡顿。切照片这里不再写盘，只管缩放复位。
+            // 锁定缩放开启时切换照片保留当前放大倍数/位置，便于连续看同一区域。
+            if !lockZoom { resetZoom() }
+            // 相邻照片预热：当前图的信息区照常按需加载，同时把上一张/下一张的
+            // EXIF、白平衡、对焦点、鸟种等提前算好，避免按方向键切过去后才现等。
+            scheduleNeighborPrefetch()
         }
     }
-    /// 左侧列表多选（⌘/⇧ 与访达一致）：预览仍跟随单选 selected。
-    /// 单张点击 = selections 只有一个元素并同步 selected；
-    /// 多选时 selected 不变（保持最后单击的那张），批量操作针对整个 selections。
+    /// 左侧列表多选（⌘/⇧ 与访达一致）：预览始终跟随最新选中的那张。
+    /// 单张点击 / ⌘+点击新增 = 预览切到刚点的那张；Shift+方向键区间 = moveSelection
+    /// 已自行设好最新一张，这里用标志位避免被 Set 的无序 first 抢走。
     @Published var selections: Set<URL> = [] {
         didSet {
             guard selections != oldValue else { return }
-            if selections.count == 1, let only = selections.first {
+            defer { settingSelectionFromRange = false }
+            if settingSelectionFromRange {
+                if selections.count <= 1 { shiftAnchor = nil; shiftCursor = nil }
+                return
+            }
+            // 多选期间保留 Shift+方向键的区间锚点；退回单选/清空时重置。
+            if selections.count <= 1 { shiftAnchor = nil; shiftCursor = nil }
+            // 鼠标新点的那张（相对旧集合新增的）＝最新选择，预览跟着走。
+            let added = selections.subtracting(oldValue)
+            if let newest = added.first {
+                selected = newest
+            } else if selections.count == 1, let only = selections.first {
                 selected = only
             } else if let cur = selected, !selections.contains(cur) {
-                // 从多选缩小到不含当前预览图时，预览切到所选里的第一张
+                // 从多选里取消掉当前预览图时，预览切到剩下的一张（若还有）。
                 selected = selections.first
             }
         }
     }
+    /// Shift+↑/↓ 连续多选的区间起点与当前游标（列表下标）。非 @Published，纯内部状态。
+    private var shiftAnchor: Int?
+    private var shiftCursor: Int?
+    /// moveSelection 的 Shift 分支在写 selections 前置位，避免 didSet 用 Set.first 抢预览。
+    private var settingSelectionFromRange = false
     /// 批量删除/操作的目标：有多选就整组，否则当前预览那张。
     var deleteTargets: [URL] {
         let live = Set(results.map { $0.id })
         let picked = selections.isEmpty ? (selected.map { [$0] } ?? []) : Array(selections)
         return picked.filter { live.contains($0) }
     }
-    @Published var onlySuspect = true
+    @Published var onlySuspect = true {
+        didSet { shownCache = nil }
+    }
     @Published var sensitivity: Double = 1.0
     @Published var preferFaces = false
     @Published var addColorLabel = true
@@ -192,14 +359,19 @@ final class Store: ObservableObject {
     /// 写入前备份所在的照片目录（备份已随照片放到各自文件夹，可能多个目录）。
     @Published var backupDirs: [String] = []
     @Published var dropTarget = false
-    @Published var showHeatmap = true
+    /// 热力图默认关闭（2026-11-23 用户要求）；需要时按 H 或勾工具栏。
+    @Published var showHeatmap = false
+    /// 锁定缩放：开启后切换照片不再复位放大/平移，方便逐张对比同一区域。
+    @Published var lockZoom = false
     @Published var dragStart: CGPoint?
     @Published var dragCurrent: CGPoint?
     @Published var dragIsZoom = false
     /// 当前左键拖动意图（⌘=放大 / ⌃=圈选主体 / 无修饰键=平移）；nil 表示未在拖动。
     @Published var dragAction: DragAction?
     @Published var didDrag = false
-    @Published var excluded: Set<URL> = []
+    @Published var excluded: Set<URL> = [] {
+        didSet { writableCache = nil }
+    }
     @Published var anchorHi: Double?
     @Published var zoom: CGFloat = 1
     @Published var zoomCenter = CGPoint(x: 0.5, y: 0.5)
@@ -229,7 +401,8 @@ final class Store: ObservableObject {
     @Published var afCache: [URL: AFInfo] = [:]
     /// 对焦点读取状态：loading 驱动"读取中"提示；attempted 避免 nil 结果反复跑 exiftool。
     @Published var afLoading: Set<URL> = []
-    @Published var afAttempted: Set<URL> = []
+    /// 只被 ensureAF 读写，没有视图观察；非 @Published 避免每次切图广播全树重算。
+    var afAttempted: Set<URL> = []
     @Published var exifCache: [URL: ExifInfo] = [:]
     /// 对焦点处语义（人脸/鸟/其他），用于题材识别；随 AF 加载后异步算一次。
     @Published var focusCache: [URL: FocusSemantics] = [:]
@@ -239,6 +412,28 @@ final class Store: ObservableObject {
     @Published var aiCache: [URL: AISubject?] = [:]
     /// Bridge 星级：-1 = 拒绝，0~5 = 星级，nil = 未评分。
     @Published var ratingCache: [URL: Int] = [:]
+    /// 分析任务「已经跑过」标记（非 @Published）。WB / EXIF / 对焦点语义 / 人体 /
+    /// 缩略图的结果都可能是 nil；nil 写不进字典，若只按缓存判空，每次切回这张照片
+    /// 都会重新解码 RAW、重跑 exiftool 与 Vision —— 这是切图卡顿的主因。
+    private var wbAttempted: Set<URL> = []
+    private var exifAttempted: Set<URL> = []
+    private var focusAttempted: Set<URL> = []
+    private var humanAttempted: Set<URL> = []
+    private var thumbAttempted: Set<URL> = []
+    /// 目录逐行读星级时把结果攒成一批再写：ratingCache 是 @Published，
+    /// 97 行各自回写会让整个目录/信息区重绘 97 轮，导入后明显卡顿。
+    private var pendingRatings: [URL: Int] = [:]
+    private var ratingLoading: Set<URL> = []
+    private var ratingFlushWork: DispatchWorkItem?
+
+    /// 相邻照片元数据预取。信息区全部按 URL 缓存，切到新照片时缓存是空的：
+    /// EXIF / RAW 解码 / 对焦点语义 / 鸟种模型都要现跑，录屏里表现为切图后参数区空白、
+    /// 鸟种区等待。方向键连翻时提前把 ±1 张的这些结果跑进缓存，翻到就有内容。
+    /// 串行队列避免同时给多张照片各解码 4~5 次 RAW 抢 CPU（那会让当前图也跟着卡）。
+    /// 轻队列只放 EXIF / 对焦点 / 白平衡 / 星级，重队列放语义（鸟种走并发 utility）：
+    /// 否则一次耗时的 Vision 预取会把下一张最显眼的 EXIF 堵在后面。
+    private let prefetchQueue = DispatchQueue(label: "kingfisher.meta.prefetch", qos: .utility)
+    private let prefetchHeavyQueue = DispatchQueue(label: "kingfisher.meta.prefetch.heavy", qos: .background)
 
     // MARK: - 鸟种识别（BioCLIP 2 本地，纯离线）
     /// 当前采用的鸟种（BioCLIP 2 本地识别 / 人工确认；人工确认优先）。
@@ -257,15 +452,71 @@ final class Store: ObservableObject {
     /// 首启预热状态：580MB 本地模型首次载入要 5～6 秒，放进后台做，避免点开照片才等。
     @Published var birdModelWarming = false
     /// 每次重新启动识别自增；旧任务完成时 token 对不上就丢弃，避免圈选后旧结果覆盖新结果。
-    @Published var birdTaskToken: [URL: Int] = [:]
+    /// 纯内部令牌：没有任何视图读取，非 @Published，避免识别中反复广播全树重算。
+    private var birdTaskToken: [URL: Int] = [:]
     /// 鸟种日志按根目录缓存在内存里，靠文件修改时间失效；切照片不再反复读盘。
     private var birdLogMemory: [URL: (stamp: Date?, rows: [BirdRecord])] = [:]
 
     @Published var showAFPoints = true
+    /// 主体框显示开关（2026-11-23 用户要求，工具栏可勾选）：
+    /// AI 主体框＝自动识别的青框；自选主体框＝人工圈选的黄框。
+    /// 仅控制画面里画不画框，不影响判定/评分/圈选记录本身。
+    @Published var showAISubjectBox = true
+    @Published var showManualSubjectBox = true
     /// 构图辅助线：九宫格与对角线。默认开启（2026-11-19 用户要求），
     /// 线条画得很淡（见 CompositionGuides），不影响看图。
     @Published var showThirds = true
     @Published var showDiagonals = true
+    /// 一键隐藏时的勾选快照：再按一次只恢复这些项，不动用户原本没勾的项。
+    private var hiddenOverlaySnapshot: Set<OverlayItem>?
+
+    /// 辅助项开关：快捷键和一键隐藏/恢复都从这里走，状态栏给出文字提示。
+    func isOverlayOn(_ item: OverlayItem) -> Bool {
+        switch item {
+        case .heatmap:   return showHeatmap
+        case .afPoints:  return showAFPoints
+        case .thirds:    return showThirds
+        case .diagonals: return showDiagonals
+        case .aiBox:     return showAISubjectBox
+        case .manualBox: return showManualSubjectBox
+        }
+    }
+    private func setOverlay(_ item: OverlayItem, _ on: Bool) {
+        switch item {
+        case .heatmap:   showHeatmap = on
+        case .afPoints:  showAFPoints = on
+        case .thirds:    showThirds = on
+        case .diagonals: showDiagonals = on
+        case .aiBox:     showAISubjectBox = on
+        case .manualBox: showManualSubjectBox = on
+        }
+    }
+    private func overlayLabels(_ items: Set<OverlayItem>) -> String {
+        OverlayItem.allCases.filter { items.contains($0) }.map(\.label).joined(separator: "、")
+    }
+    func toggleOverlay(_ item: OverlayItem) {
+        let on = !isOverlayOn(item)
+        setOverlay(item, on)
+        status = "\(on ? "已显示" : "已隐藏")\(item.label)（快捷键 \(shortcuts.combo(for: item).display)）"
+    }
+    /// 一键隐藏当前勾选的辅助项；再按一次按快照恢复，不会把原本没勾的项打开。
+    func toggleAllOverlays() {
+        let key = shortcuts.overlayToggle.display
+        if let snapshot = hiddenOverlaySnapshot {
+            for item in OverlayItem.allCases { setOverlay(item, snapshot.contains(item)) }
+            hiddenOverlaySnapshot = nil
+            status = "已恢复 \(snapshot.count) 个辅助项：\(overlayLabels(snapshot))（\(key) 再按隐藏）"
+            return
+        }
+        let onItems = Set(OverlayItem.allCases.filter { isOverlayOn($0) })
+        guard !onItems.isEmpty else {
+            status = "当前没有显示中的辅助项可隐藏"
+            return
+        }
+        hiddenOverlaySnapshot = onItems
+        for item in onItems { setOverlay(item, false) }
+        status = "已隐藏 \(onItems.count) 个辅助项：\(overlayLabels(onItems))（\(key) 恢复）"
+    }
     /// 信息区位置：true=画面最右侧竖排（默认）；false=预览下方（原布局，可切回）。
     /// 右侧竖排窄栏时用紧凑尺寸；默认下方布局保持原样。
     /// 默认改为右侧布局（2026-11-18 用户要求），可在顶部按钮切回下方。
@@ -303,7 +554,28 @@ final class Store: ObservableObject {
     @Published var showShortcuts = false
     /// 当前选中照片的原尺寸预览；分析用小图只用于缩略图与打分。
     @Published var fullPreview: CGImage?
-    @Published var fullPreviewURL: URL?
+    /// 仅供 Store 内部判断"这张的预览是否已加载"；视图只看 fullPreview，非 @Published。
+    var fullPreviewURL: URL?
+    /// 原尺寸预览 LRU（上一张 / 当前 / 下一张，最多 3 张）。
+    /// 2026-11-24 修复"切图先虚化后清晰"：以前每次切图都把 fullPreview 置 nil 再异步重解，
+    /// 主预览在解码期间回退到 160px 列表缩略图；切回看过的照片也会重复解码。
+    /// 命中缓存时同步赋清晰图，零延迟、无低清中间帧。
+    private var fullPreviewCache: [URL: CGImage] = [:]
+    private var fullPreviewOrder: [URL] = []
+    private var fullPreviewLoading: Set<URL> = []
+    /// 原图解码失败的照片：DetailView 用它显示明确提示，避免"进度提示消失后永久空白"。
+    /// 非 @Published；失败发生在当前图时由 objectWillChange 主动刷新一次。
+    private var previewFailed: Set<URL> = []
+    /// 被删除照片的 per-URL 失效标记：只丢弃这些 URL 的在途解码，
+    /// 不能用全局 generation++（会把同时预取的其他照片也一起作废，
+    /// 导致切到那张时 loading 被去重挡住、旧结果又被丢弃 → 永久空白）。
+    private var invalidatedPreviewURLs: Set<URL> = []
+    /// 换文件夹/导入新会话时自增，丢弃整批旧任务结果；删除照片不走这里。
+    private var fullPreviewGeneration: UInt = 0
+    private let fullPreviewMax = 3
+    /// 当前图与相邻图的解码分开排队：当前图优先，预取不抢它的 CPU。
+    private let fullPreviewQueue = DispatchQueue(label: "kingfisher.fullpreview.decode", qos: .userInitiated)
+    private let fullPreviewPrefetchQueue = DispatchQueue(label: "kingfisher.fullpreview.prefetch", qos: .utility)
     @Published var panOffset = CGSize.zero
     @Published var panStart: CGPoint?
     @Published var panBegin = CGSize.zero
@@ -329,8 +601,11 @@ final class Store: ObservableObject {
     /// 列表缩略图：历史恢复时 preview=nil，这里按需解码 160px 小图并缓存。
     /// 单张 CR3 解到 160px 约 260ms，但只在行出现时解一次，不阻塞进入页面。
     func ensureThumbnail(for url: URL) {
-        guard thumbnailCache[url] == nil, !thumbLoading.contains(url) else { return }
+        // 解不出图时也记「已尝试」：否则每次滚动到这行都重解一次 RAW（约 260ms）。
+        guard thumbnailCache[url] == nil, !thumbLoading.contains(url),
+              !thumbAttempted.contains(url) else { return }
         thumbLoading.insert(url)
+        thumbAttempted.insert(url)
         DispatchQueue.global(qos: .utility).async {
             let img = Analyzer.decode(url, maxSide: 160)?.image
             DispatchQueue.main.async {
@@ -347,13 +622,16 @@ final class Store: ObservableObject {
         thumbnailCache[url] ?? fallback
     }
 
+    /// 主预览图：只接受原尺寸解码结果。
+    /// 2026-11-24 修复"切图先虚化后清晰"的显示端：旧版在 fullPreview 被清空的那一帧
+    /// 回退到 thumbnail(for: fallback:)（历史恢复时只有 160px），放大铺满预览区就是
+    /// 用户看到的"虚化一下"；解码完成后再换清晰图。现在未解码完成返回空图，
+    /// 露出预览区底色并由 DetailView 显示读取提示，绝不让低清缩略图闪现。
     func baseImage(for r: PhotoResult) -> NSImage {
         let useFull = fullPreviewURL == r.id && fullPreview != nil
         if let c = baseCache[r.id], c.full == useFull { return c.img }
-        let cg = useFull ? (fullPreview ?? thumbnail(for: r.id, fallback: r.metrics.preview))
-                         : thumbnail(for: r.id, fallback: r.metrics.preview)
         let img: NSImage
-        if let cg {
+        if useFull, let cg = fullPreview {
             img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         } else {
             img = NSImage()
@@ -368,20 +646,36 @@ final class Store: ObservableObject {
 
     /// 需留意的照片（列表默认筛选、状态栏计数口径）：主体偏软 / 整片偏软 / 景深不足。
     /// 主体拖影是橙色独立档，不算「需留意」，但要打红色标签（见 Verdict.bridgeLabelColor）。
-    var suspects: [PhotoResult] { results.filter { $0.verdict.isSuspect } }
+    var suspects: [PhotoResult] {
+        if let c = suspectCache { return c }
+        let c = results.filter { $0.verdict.isSuspect }
+        suspectCache = c
+        return c
+    }
     /// 批量写元数据的目标（2026-11-20 起为全部照片）：每张照片把判定词写入 xmp:Label
     /// （主体清晰/焦点正常/整片偏软/景深不足/主体偏软/主体拖影），原因写说明字段。
     var writableTargets: [PhotoResult] {
-        results.filter { !excluded.contains($0.id) && $0.verdict != .unreadable }
+        if let c = writableCache { return c }
+        let c = results.filter { !excluded.contains($0.id) && $0.verdict != .unreadable }
+        writableCache = c
+        return c
     }
-    var shown: [PhotoResult] { onlySuspect ? suspects : results }
+    var shown: [PhotoResult] {
+        if let c = shownCache { return c }
+        let c = onlySuspect ? suspects : results
+        shownCache = c
+        return c
+    }
 
     /// ↑/↓ 在当前列表（含"只看需留意"过滤）内切换照片，与列表顺序一致。
-    func moveSelection(by delta: Int) {
+    /// 2026-11-23： Shift+↑/↓ 连续多选区间，并把预览跟着切到刚选中的那张。
+    func moveSelection(by delta: Int, shift: Bool = false) {
         let items = shown
         guard !items.isEmpty else { return }
         let base: Int
-        if let cur = selected, let i = items.firstIndex(where: { $0.id == cur }) {
+        if shift, let cursor = shiftCursor {
+            base = cursor
+        } else if let cur = selected, let i = items.firstIndex(where: { $0.id == cur }) {
             base = i
         } else {
             // 当前照片不在过滤列表里：向下从头开始，向上从尾开始。
@@ -389,8 +683,31 @@ final class Store: ObservableObject {
         }
         let target = max(0, min(items.count - 1, base + delta))
         let next = items[target].id
-        selected = next
-        selections = [next]
+        if shift {
+            // 第一次按 Shift+方向键时，以当前预览图为区间起点。
+            // 注意 base 可能是 -1/count 哨兵（当前图不在过滤列表里），必须钳到合法下标。
+            let anchor: Int
+            if let a = shiftAnchor {
+                anchor = max(0, min(items.count - 1, a))
+            } else if let cur = selected, let i = items.firstIndex(where: { $0.id == cur }) {
+                anchor = i
+            } else {
+                anchor = target
+            }
+            shiftAnchor = anchor
+            shiftCursor = target
+            let lo = min(anchor, target), hi = max(anchor, target)
+            // 先设 selected 再设 selections：置标志位让 didSet 不按 Set.first 抢预览，
+            // 这样区间多选中仍显示刚按方向键选到的那张。
+            selected = next
+            settingSelectionFromRange = true
+            selections = Set(items[lo...hi].map { $0.id })
+            status = "已连续选中 \(hi - lo + 1) 张，当前显示：\(displayName(next))"
+        } else {
+            shiftAnchor = nil; shiftCursor = nil
+            selected = next
+            selections = [next]
+        }
     }
 
     /// 热力图的固定标尺：有锚点用锚点，否则用本批 P75。
@@ -403,9 +720,12 @@ final class Store: ObservableObject {
     }
 
     func displayName(_ u: URL) -> String {
+        if let cached = displayNameCache[u] { return cached }
         let stem = u.deletingPathExtension().lastPathComponent
         let same = results.filter { $0.id.deletingPathExtension().lastPathComponent == stem }.count
-        return same > 1 ? u.lastPathComponent : stem
+        let name = same > 1 ? u.lastPathComponent : stem
+        displayNameCache[u] = name
+        return name
     }
 
     /// 导入素材根文件夹名（取扫描目录最后一段），用于导出 CSV 的默认文件名。
@@ -464,15 +784,6 @@ final class Store: ObservableObject {
         return mergedChildSession(for: folder, fileNames: fileNames)
     }
 
-    /// 轻量 peek：log 里是否已经记过这批的题材选择（含"自动识别题材"）。
-    /// 只解码 JSON 的 folderGenreChoice 字段，不做任何缩略图解码/重建，几十毫秒。
-    /// 有记录就跳过题材弹窗，直接进入处理好的页面。
-    private func loggedGenreChoice(for folder: URL, files: [URL]) -> FolderGenreChoice? {
-        guard let snap = cachedSession(for: folder, files: files),
-              let raw = snap.folderGenreChoice else { return nil }
-        return FolderGenreChoice(rawValue: raw)
-    }
-
     /// 向下扫描导入目录里的所有会话日志，按文件名合并成一份虚拟快照。
     /// 只取与本批照片有交集的日志，避免把无关子目录的历史混进来。
     private func mergedChildSession(for folder: URL, fileNames: Set<String>) -> SessionSnapshot? {
@@ -527,24 +838,53 @@ final class Store: ObservableObject {
         pendingScan = (folder, sorted, forceReload)
         pendingGenreChoice = nil
         pendingGenreResolved = false
-        // 2026-11-23：题材选择提前到"读取历史数据/分析"之前，用户答完才真正开扫。
-        // 但如果 log 里已经记着这批的题材选择（说明之前导入过），就不再打扰用户。
-        if !forceReload, !genrePromptAsked.contains(folder) {
-            genrePromptAsked.insert(folder)
-            if loggedGenreChoice(for: folder, files: sorted) != nil {
-                pendingGenreResolved = true
-                startPendingScan()
-                return
-            }
-            genrePromptFolder = folder
-            showGenrePrompt = true
+        pendingHistorySnapshot = nil
+        // 「重新分析」强制全量重算，不读历史日志，也就不该显示历史读取提示。
+        guard !forceReload else {
+            historyReadToken += 1   // 作废可能在途的旧读取回调
+            endHistoryRead()
+            pendingGenreResolved = true
+            startPendingScan()
             return
         }
-        pendingGenreResolved = true
-        startPendingScan()
+        // 2026-11-24：读历史日志（读文件 + JSON 解码）放后台，期间显示进度提示。
+        // 大文件夹（上千张、含子目录日志）的日志解码在主线程会卡住界面，用户会以为死机。
+        // 用 token 杜绝竞态：用户在读盘期间又导入别的文件夹时，旧的后台结果直接丢弃。
+        historyReadToken += 1
+        let token = historyReadToken
+        beginHistoryRead("正在读取历史日志文件…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 两件事一次读完：题材是否记过 + 完整历史快照，避免读两遍盘。
+            let snap = self.cachedSession(for: folder, files: sorted)
+            let choice = snap.flatMap { s -> FolderGenreChoice? in
+                guard let raw = s.folderGenreChoice else { return nil }
+                return FolderGenreChoice(rawValue: raw)
+            }
+            DispatchQueue.main.async {
+                guard token == self.historyReadToken else { return }
+                self.endHistoryRead()
+                self.pendingHistorySnapshot = snap
+                // 2026-11-23：题材选择提前到"读取历史数据/分析"之前，用户答完才真正开扫。
+                // 但如果 log 里已经记着这批的题材选择（说明之前导入过），就不再打扰用户。
+                if !self.genrePromptAsked.contains(folder) {
+                    self.genrePromptAsked.insert(folder)
+                    if choice != nil {
+                        self.pendingGenreResolved = true
+                        self.startPendingScan()
+                        return
+                    }
+                    self.genrePromptFolder = folder
+                    self.showGenrePrompt = true
+                    return
+                }
+                self.pendingGenreResolved = true
+                self.startPendingScan()
+            }
+        }
     }
 
     /// 用户答完题材弹窗（或无需提问）后才真正开始读缓存/分析。
+    /// 历史快照已在 scan(folder:) 后台读好并存 pendingHistorySnapshot，这里直接复用，不再同步读盘。
     private func startPendingScan() {
         guard let job = pendingScan, pendingGenreResolved else { return }
         showGenrePrompt = false
@@ -552,7 +892,9 @@ final class Store: ObservableObject {
         currentFolder = job.folder
         resetBirdState()
         scanNote = ""
-        if !job.forceReload, let snap = cachedSession(for: job.folder, files: job.files) {
+        let snap = job.forceReload ? nil : pendingHistorySnapshot
+        pendingHistorySnapshot = nil
+        if let snap {
             let cachedNames = Set(snap.photos.map { $0.file })
             let hits = job.files.filter { cachedNames.contains($0.lastPathComponent) }.count
             if hits > 0 {
@@ -564,6 +906,35 @@ final class Store: ObservableObject {
         }
         process(job.files)
     }
+
+    /// 读历史日志的代次与暂存快照。代次用于丢弃过期后台结果；
+    /// 快照在题材弹窗等待期间暂存，弹窗答完后由 startPendingScan 直接复用。
+    private var historyReadToken = 0
+    private var pendingHistorySnapshot: SessionSnapshot?
+
+    /// 标记「正在读历史日志」：进度提示 + 阶段文案，让主线程界面立即刷新出提示。
+    private func beginHistoryRead(_ message: String) {
+        historyReading = true
+        sessionPhase = "读取历史数据"
+        status = message
+        historyReadStarted = Date()
+    }
+    /// 收起提示。读日志可能只要几十~几百毫秒，提示一闪而过用户看不清，
+    /// 因此保证至少显示 0.5 秒；后续流程（题材弹窗/分析）照常进行，不受延时阻塞。
+    private func endHistoryRead() {
+        let elapsed = historyReadStarted.map { Date().timeIntervalSince($0) } ?? 1
+        let remaining = max(0, 0.5 - elapsed)
+        let token = historyReadToken
+        if remaining <= 0 {
+            historyReading = false
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) {
+            guard token == self.historyReadToken else { return }
+            self.historyReading = false
+        }
+    }
+    private var historyReadStarted: Date?
 
     func scan(files: [URL]) {
         // 散拖文件没有明确的扫描根目录：清掉 currentFolder，
@@ -601,6 +972,12 @@ final class Store: ObservableObject {
         baseCache = [:]
         thumbnailCache = [:]
         thumbLoading = []
+        // 原尺寸预览是重量级缓存：换文件夹必须整批失效，并让在途解码作废。
+        resetFullPreviewCache()
+        wbAttempted = []; exifAttempted = []; focusAttempted = []
+        humanAttempted = []; thumbAttempted = []
+        pendingRatings = [:]; ratingLoading = []
+        ratingFlushWork?.cancel(); ratingFlushWork = nil
         sessionPhase = "新素材分析"
         status = "新文件夹：正在分析…"
         let faces = preferFaces
@@ -631,6 +1008,8 @@ final class Store: ObservableObject {
                 }
                 self.applyPendingGenre()
                 self.saveSession()
+                // 导入完成即批量写好说明：选片切图时不再写盘（2026-11-23）。
+                self.writeAllDescriptions()
                 self.scanNote = ""
             }
         }
@@ -659,6 +1038,12 @@ final class Store: ObservableObject {
         baseCache = [:]
         thumbnailCache = [:]
         thumbLoading = []
+        // 原尺寸预览是重量级缓存：换文件夹必须整批失效，并让在途解码作废。
+        resetFullPreviewCache()
+        wbAttempted = []; exifAttempted = []; focusAttempted = []
+        humanAttempted = []; thumbAttempted = []
+        pendingRatings = [:]; ratingLoading = []
+        ratingFlushWork?.cancel(); ratingFlushWork = nil
         selectionRects = [:]
         excluded = []
         sessionPhase = "读取历史数据"
@@ -724,6 +1109,8 @@ final class Store: ObservableObject {
         }
         self.applyPendingGenre()
         self.saveSession()
+        // 读取历史数据后也补齐说明（若之前没写过/内容有更新），同样只在后台批量写。
+        self.writeAllDescriptions()
         self.scanNote = ""
     }
 
@@ -757,15 +1144,52 @@ final class Store: ObservableObject {
     func recheck(id: URL, rect: CGRect) {
         guard let idx = results.firstIndex(where: { $0.id == id }),
               let m = metrics.first(where: { $0.url == id }) else { return }
+        // 2026-11-23：记录重判前的「只看需留意」列表顺序。若圈选后这张不再需留意、
+        // 从过滤列表消失，就自动选中它原来的下一张（仍在列表里的），并明确提示，
+        // 避免界面停在已消失的照片上、用户找不到下一张该处理的。
+        let wasFiltered = onlySuspect
+        let oldShown = shown
+        let oldIndex = oldShown.firstIndex(where: { $0.id == id })
+        let wasSelected = selected == id
+
         let cr = Analyzer.rectRatio(m, rect: rect)
         let (v, why) = Analyzer.classify(m, hiMin: hiMin, subjectOverride: cr)
         objectWillChange.send()
         results[idx].verdict = v
         results[idx].reason = why + "（人工圈选）"
         results[idx].overrideRect = rect
+        // 元素原地改动不触发 results 的 didSet，手动失效派生快照。
+        suspectCache = nil; shownCache = nil; writableCache = nil
         // 同时持久记录显示用圈选框：切照片/复位缩放后仍按这张照片恢复。
         selectionRects[id] = rect
-        status = "已按圈选区域重判 \(id.deletingPathExtension().lastPathComponent)：\(v.rawValue)"
+
+        var msg = "已按圈选区域重判 \(id.deletingPathExtension().lastPathComponent)：\(v.rawValue)"
+        if wasFiltered && wasSelected && !v.isSuspect {
+            // 当前这张已不在「只看需留意」列表里——找接替者并提示
+            var next: URL?
+            if let i = oldIndex {
+                // 从原位置往后找第一张仍在过滤列表里的
+                for j in (i + 1)..<oldShown.count where shown.contains(where: { $0.id == oldShown[j].id }) {
+                    next = oldShown[j].id
+                    break
+                }
+                if next == nil {
+                    for j in (0..<i).reversed() where shown.contains(where: { $0.id == oldShown[j].id }) {
+                        next = oldShown[j].id
+                        break
+                    }
+                }
+            }
+            if let n = next {
+                selected = n
+                selections = [n]
+                msg += "；已不再需留意，自动跳到下一张：\(displayName(n))"
+            } else {
+                // 过滤列表已空
+                msg += "；已不再需留意，需留意列表已空"
+            }
+        }
+        status = msg
         // 拍鸟题材：用新圈选的主体框重新识别鸟种（人工确认结果不覆盖）。
         refreshBirdAfterSubjectSelection(for: id)
         saveSession()
@@ -782,6 +1206,7 @@ final class Store: ObservableObject {
         results[idx].verdict = v
         results[idx].reason = why
         results[idx].overrideRect = nil
+        suspectCache = nil; shownCache = nil; writableCache = nil
         selectionRects.removeValue(forKey: id)
         resetZoom()
         status = "已取消 \(id.deletingPathExtension().lastPathComponent) 的自选主体，恢复自动判定"
@@ -808,20 +1233,22 @@ final class Store: ObservableObject {
         status = "已恢复独立固定阈值，每张照片单独判定"
     }
 
-    func ensureWB(for url: URL) {
-        guard wbCache[url] == nil else { return }
-        DispatchQueue.global(qos: .utility).async {
+    func ensureWB(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
+        // analyze 返回 nil 时字典里不会留下值，靠 attempted 防止反复解码 RAW。
+        guard wbCache[url] == nil, !wbAttempted.contains(url) else { return }
+        wbAttempted.insert(url)
+        queue.async {
             let s = WhiteBalance.analyze(url)
             DispatchQueue.main.async { self.wbCache[url] = s }
         }
     }
 
-    func ensureAF(for url: URL) {
+    func ensureAF(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
         // attempted 同时覆盖"读到数据"与"确认无数据"，避免无数据的图反复跑 exiftool。
         guard !afAttempted.contains(url) else { return }
         afAttempted.insert(url)
         afLoading.insert(url)
-        DispatchQueue.global(qos: .utility).async {
+        queue.async {
             let info = AFReader.read(url)
             DispatchQueue.main.async {
                 self.afLoading.remove(url)
@@ -830,9 +1257,10 @@ final class Store: ObservableObject {
         }
     }
 
-    func ensureExif(for url: URL) {
-        guard exifCache[url] == nil else { return }
-        DispatchQueue.global(qos: .utility).async {
+    func ensureExif(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
+        guard exifCache[url] == nil, !exifAttempted.contains(url) else { return }
+        exifAttempted.insert(url)
+        queue.async {
             let info = ExifInfo.read(url)
             DispatchQueue.main.async { self.exifCache[url] = info }
         }
@@ -840,18 +1268,22 @@ final class Store: ObservableObject {
 
     /// 对焦点语义：算一次缓存住。结果只影响题材识别，不算出来也能用原有规则。
     /// 传入主体检测框：对焦点没认出鸟时，拿主体框再复核一次能不能认出鸟。
-    func ensureFocus(for url: URL, subjectBoxes: [CGRect] = []) {
-        guard focusCache[url] == nil else { return }
-        DispatchQueue.global(qos: .utility).async {
+    func ensureFocus(for url: URL, subjectBoxes: [CGRect] = [],
+                     on queue: DispatchQueue = .global(qos: .utility)) {
+        // detect 内部会解码 2048px 缩略图、跑 exiftool 与 Vision，nil 时不能重跑。
+        guard focusCache[url] == nil, !focusAttempted.contains(url) else { return }
+        focusAttempted.insert(url)
+        queue.async {
             let s = FocusSemanticsEngine.detect(url: url, subjectBoxes: subjectBoxes)
             DispatchQueue.main.async { self.focusCache[url] = s }
         }
     }
 
     /// 人体存在检测（背影/侧身也算人）：算一次缓存住。只影响题材识别的兜底判断。
-    func ensureHuman(for url: URL) {
-        guard humanCache[url] == nil else { return }
-        DispatchQueue.global(qos: .utility).async {
+    func ensureHuman(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
+        guard humanCache[url] == nil, !humanAttempted.contains(url) else { return }
+        humanAttempted.insert(url)
+        queue.async {
             let h = HumanPresenceEngine.detect(url: url)
             DispatchQueue.main.async { self.humanCache[url] = h }
         }
@@ -860,10 +1292,10 @@ final class Store: ObservableObject {
     /// AI 主体识别（前景实例分割 + 逐主体分类）：算一次缓存住。
     /// 与对焦点语义互补——对焦点认不出时看画面主体本身是什么。
     /// macOS 14 以下没有分割 API，结果是 nil，识别链退回原有规则。
-    func ensureAI(for url: URL) {
+    func ensureAI(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
         guard aiCache[url] == nil else { return }
         aiCache[url] = AISubject(kind: .none, reason: "AI 主体识别进行中…", labels: [])
-        DispatchQueue.global(qos: .utility).async {
+        queue.async {
             let s = AISubjectEngine.detect(url: url)
             DispatchQueue.main.async {
                 self.aiCache[url] = s ?? AISubject(kind: .none, reason: "本机系统不支持前景分割（需 macOS 14+）", labels: [])
@@ -871,26 +1303,104 @@ final class Store: ObservableObject {
         }
     }
 
-    func ensureRating(for url: URL) {
-        guard ratingCache[url] == nil else { return }
-        DispatchQueue.global(qos: .utility).async {
-            let rating = MetadataWriter.snapshot(url).rating
-            DispatchQueue.main.async { self.ratingCache[url] = rating }
+    func ensureRating(for url: URL, on queue: DispatchQueue = .global(qos: .utility)) {
+        guard ratingCache[url] == nil, pendingRatings[url] == nil,
+              !ratingLoading.contains(url) else { return }
+        ratingLoading.insert(url)
+        queue.async {
+            let rating = MetadataWriter.snapshot(url).rating ?? 0
+            DispatchQueue.main.async {
+                self.ratingLoading.remove(url)
+                // 读取期间用户可能已经用快捷键改了星级，别用旧值盖掉新评分。
+                guard self.ratingCache[url] == nil, self.pendingRatings[url] == nil else { return }
+                self.pendingRatings[url] = rating
+                self.scheduleRatingFlush()
+            }
         }
     }
 
-    /// 设置星级：0~5 星，-1 为 Bridge 的「拒绝」。即时写入元数据，失败则回滚 UI。
+    /// 短延时把这一批星级合并成一次字典赋值，@Published 只发一次通知。
+    private func scheduleRatingFlush() {
+        guard ratingFlushWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.ratingFlushWork = nil
+            let batch = self.pendingRatings
+            self.pendingRatings = [:]
+            guard !batch.isEmpty else { return }
+            var updated = self.ratingCache
+            for (url, rating) in batch where updated[url] == nil { updated[url] = rating }
+            self.ratingCache = updated
+        }
+        ratingFlushWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    /// 切图时预取相邻 ±1 张的信息区数据（selected.didSet 调用，方向键与鼠标点选都覆盖）。
+    ///
+    /// 信息区各字段都按 URL 缓存：EXIF、白平衡、对焦点语义、星级、鸟种都是首次打开这张
+    /// 才现算。录屏里切到下一张时参数区空白、鸟种区等待，就是这个冷缓存等待过程，不是
+    /// 预览区渲染慢。预取让按方向键到达时缓存已经热了。
+    /// 预取走串行队列：否则相邻两张各解码 4~5 次 RAW 会抢当前图的 CPU。
+    /// 轻/重分开排队，避免一个慢 Vision 任务把下一张最显眼的 EXIF 堵在后面。
+    func scheduleNeighborPrefetch() {
+        guard let anchor = selected, !processing else { return }
+        // 放到下一个 runloop，避免在 didSet（SwiftUI 更新过程中）做列表查找。
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.selected == anchor else { return }
+            let items = self.shown
+            guard let idx = items.firstIndex(where: { $0.id == anchor }) else { return }
+            var targets: [URL] = []
+            if idx + 1 < items.count { targets.append(items[idx + 1].id) }
+            if idx > 0 { targets.append(items[idx - 1].id) }
+            guard !targets.isEmpty else { return }
+
+            for url in targets {
+                guard let r = self.results.first(where: { $0.id == url }) else { continue }
+                // 先排队解码相邻两张的原尺寸预览：翻过去时命中缓存，直接显示清晰图。
+                self.preloadFullPreview(for: url)
+                self.ensureExif(for: url, on: self.prefetchQueue)
+                self.ensureAF(for: url, on: self.prefetchQueue)
+                self.ensureWB(for: url, on: self.prefetchQueue)
+                self.ensureRating(for: url, on: self.prefetchQueue)
+                self.ensureFocus(for: url, subjectBoxes: r.metrics.bboxes,
+                                 on: self.prefetchHeavyQueue)
+                self.ensureHuman(for: url, on: self.prefetchHeavyQueue)
+                self.ensureAI(for: url, on: self.prefetchHeavyQueue)
+            }
+            // 题材判定依赖上面异步填充的 EXIF / 对焦点 / AI 缓存；太早调 ensureBird
+            // 会被 genre(for:) 判成非鸟而直接跳过，所以等这些结果落地后再补一次。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, self.selected == anchor else { return }
+                // 鸟种直接进并发 utility 队列：排在重队列末尾会被 Vision 任务堵住，
+                // 等轮到时用户早就翻过去了。模型本身启动预热，单次推理耗时很短。
+                for url in targets {
+                    self.ensureBird(for: url, on: .global(qos: .utility))
+                }
+            }
+        }
+    }
+
+    /// 设置星级：0~5 星，-1 为 Bridge 的「拒绝」。
+    /// 先立刻更新 ratingCache（快捷键/目录/信息区同一数据源，按完马上能看到），
+    /// 再后台写元数据；写失败才回滚。2026-11-23 修：原来等写盘才刷新，快捷键按完界面像没反应。
     func setRating(_ url: URL, rating: Int) {
         let previous = ratingCache[url]
+        // 正在排队的旧 XMP 读数不能盖掉用户刚按下的星级。
+        pendingRatings[url] = nil
+        ratingCache[url] = rating
         let dir = url.deletingLastPathComponent()
+        let name = url.deletingPathExtension().lastPathComponent
+        // 0 = 未评分：既是取消星级，也是取消拒绝（-1）。文案别写成「0 星」误导。
+        let label = rating == -1 ? "拒绝" : rating == 0 ? "取消评级（星级/拒绝）" : "\(rating) 星"
+        status = "已设 \(name) 为\(label)，正在写入元数据…"
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try MetadataWriter.setRating(to: url, rating: rating, backupDir: dir)
                 DispatchQueue.main.async {
                     self.ratingCache[url] = rating
                     if !self.backupDirs.contains(dir.path) { self.backupDirs.append(dir.path) }
-                    let label = rating == -1 ? "拒绝" : "\(rating) 星"
-                    self.status = "已设 \(url.deletingPathExtension().lastPathComponent) 为\(label)，并写入元数据"
+                    self.status = "已设 \(name) 为\(label)，并写入元数据"
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1020,19 +1530,100 @@ final class Store: ObservableObject {
         status = "已清空题材纠正记忆"
     }
 
+    /// 切到新照片时请求原尺寸预览。
+    /// 旧实现无条件 `fullPreview = nil` 并重新解码：回看任何一张都要重解 RAW，
+    /// 且解码期间主预览回退到 160px 缩略图（虚化→清晰）。现在优先命中 LRU 缓存，
+    /// 命中即同步显示清晰图；未命中只显示占位，解码完成后一次性换成清晰图。
     func ensureFullPreview(for url: URL) {
-        if fullPreviewURL == url {
-            if fullPreview != nil { return }
-        }
+        if fullPreviewURL == url, fullPreview != nil { return }
         fullPreviewURL = url
-        fullPreview = nil
-        DispatchQueue.global(qos: .userInitiated).async {
+        if let cached = fullPreviewCache[url] {
+            touchFullPreview(url)
+            if fullPreview !== cached { fullPreview = cached }
+            return
+        }
+        // 只有真的从"有图"变"没图"才广播，避免重复写 nil 触发无谓的 body 重算。
+        if fullPreview != nil { fullPreview = nil }
+        requestFullPreview(for: url, prefetch: false)
+    }
+
+    /// 预取相邻照片的原尺寸预览：方向键连翻时基本都能命中缓存，切图零延迟。
+    /// 与当前图分队列，避免预取抢正在显示那张的解码资源。
+    func preloadFullPreview(for url: URL) {
+        guard fullPreviewCache[url] == nil else { return }
+        requestFullPreview(for: url, prefetch: true)
+    }
+
+    /// 当前图是否还在解码原图（DetailView 用它决定占位提示，避免空白无反馈）。
+    func isPreviewLoading(for url: URL) -> Bool {
+        fullPreviewURL == url && fullPreviewLoading.contains(url)
+    }
+
+    /// 当前图的原图是否解码失败（DetailView 用它显示失败提示，不再留下无解释的空白）。
+    func isPreviewFailed(for url: URL) -> Bool {
+        fullPreviewURL == url && previewFailed.contains(url)
+    }
+
+    /// 后台解码原尺寸预览并写入 LRU。同一 URL 只跑一次（onAppear / onChange
+    /// 可能都触发 ensureFullPreview，旧版会重复解码两次 RAW）。
+    private func requestFullPreview(for url: URL, prefetch: Bool) {
+        guard fullPreviewCache[url] == nil, !fullPreviewLoading.contains(url) else { return }
+        fullPreviewLoading.insert(url)
+        previewFailed.remove(url)   // 重新解码即视为重试，清掉上次的失败标记
+        invalidatedPreviewURLs.remove(url)  // 撤销删除/重新导入同一路径后可以重新解码
+        let generation = fullPreviewGeneration
+        let queue = prefetch ? fullPreviewPrefetchQueue : fullPreviewQueue
+        queue.async {
             let img = Analyzer.loadFullPreview(url)
-            DispatchQueue.main.async {
-                guard self.fullPreviewURL == url else { return }
-                self.fullPreview = img
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.fullPreviewLoading.remove(url)
+                // 换文件夹/导入新会话：整批旧 generation 的结果丢弃。
+                guard self.fullPreviewGeneration == generation else { return }
+                // 删除照片：只丢弃这张被删图的在途结果，别误伤同时预取的其他照片。
+                // loading 已在上面配对清除，失效时不会再写缓存、失败标记或当前预览。
+                guard !self.invalidatedPreviewURLs.contains(url) else { return }
+                guard let img else {
+                    self.previewFailed.insert(url)
+                    // loading 的清除不是 @Published：当前图失败时主动刷一次视图，
+                    // 让"正在解码…"切换成明确的失败提示，而不是留下一片空白。
+                    if self.fullPreviewURL == url { self.objectWillChange.send() }
+                    return
+                }
+                self.previewFailed.remove(url)
+                self.cacheFullPreview(img, for: url)
+                if self.fullPreviewURL == url, self.fullPreview !== img { self.fullPreview = img }
             }
         }
+    }
+
+    private func touchFullPreview(_ url: URL) {
+        if let i = fullPreviewOrder.firstIndex(of: url) { fullPreviewOrder.remove(at: i) }
+        fullPreviewOrder.append(url)
+    }
+
+    private func cacheFullPreview(_ img: CGImage, for url: URL) {
+        fullPreviewCache[url] = img
+        touchFullPreview(url)
+        // 最多留 3 张（上一张/当前/下一张）；正在显示的那张绝不能被驱逐。
+        while fullPreviewOrder.count > fullPreviewMax,
+              let victimIndex = fullPreviewOrder.firstIndex(where: { $0 != fullPreviewURL }) {
+            let victim = fullPreviewOrder.remove(at: victimIndex)
+            fullPreviewCache[victim] = nil
+            baseCache[victim] = nil
+        }
+    }
+
+    /// 换序列 / 删除照片后清空原图预览缓存，防止旧图被当作新会话的结果显示。
+    private func resetFullPreviewCache() {
+        fullPreviewGeneration &+= 1
+        fullPreviewCache = [:]
+        fullPreviewOrder = []
+        fullPreviewLoading = []
+        previewFailed = []
+        invalidatedPreviewURLs.removeAll()
+        fullPreviewURL = nil
+        fullPreview = nil
     }
 
     func resetZoom() {
@@ -1104,62 +1695,14 @@ final class Store: ObservableObject {
         return nil
     }
 
-    /// 删除选中的照片；RAW 会连同同名 JPG 一起移到废纸篓。返回实际处理的文件名。
-    /// 删除当前预览那张时，自动选中列表里的**下一张**（没有下一张才选上一张），
-    /// 不再跳回第一张（用户 2026-11-22 要求）。
-    func deletePhoto(_ url: URL) -> (moved: [String], failed: String?) {
-        // 先在删除前记住相邻关系：shown 的顺序就是列表顺序
-        let oldShown = shown
-        var nextID: URL?
-        if let idx = oldShown.firstIndex(where: { $0.id == url }) {
-            if idx + 1 < oldShown.count { nextID = oldShown[idx + 1].id }
-            else if idx > 0 { nextID = oldShown[idx - 1].id }
-        }
-        var targets = [url]
-        if let jpg = siblingJPG(for: url) { targets.append(jpg) }
-        var moved: [String] = []
-        var failed: String?
-        var removedURLs: Set<URL> = []
-        var trashPairs: [(trash: URL, original: URL)] = []
-        for t in targets {
-            do {
-                var resulting: NSURL?
-                try FileManager.default.trashItem(at: t, resultingItemURL: &resulting)
-                moved.append(t.lastPathComponent)
-                removedURLs.insert(t)
-                // 记录「废纸篓里的位置 ← 原位置」，⌘Z 撤销时原样搬回去
-                if let r = resulting {
-                    trashPairs.append((trash: r as URL, original: t))
-                }
-            } catch {
-                failed = "\(t.lastPathComponent)：\(error.localizedDescription)"
-            }
-        }
-        if !trashPairs.isEmpty { lastDeleted = trashPairs }
-        // 从内存列表与缓存移除（只移除确实删掉的）
-        results.removeAll { removedURLs.contains($0.id) }
-        metrics.removeAll { removedURLs.contains($0.url) }
-        for key in removedURLs {
-            wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
-            focusCache[key] = nil; humanCache[key] = nil
-            genreOverride[key] = nil
-            afLoading.remove(key); afAttempted.remove(key)
-            heatCache[key] = nil; baseCache[key] = nil
-        }
-        excluded = excluded.subtracting(removedURLs)
-        selections.subtract(removedURLs)
-        if let s = selected, removedURLs.contains(s) {
-            selected = (nextID != nil && results.contains(where: { $0.id == nextID! }))
-                ? nextID : shown.first?.id
-        }
-        saveSession()
-        return (moved, failed)
-    }
-
-    /// 批量删除：多选后整组移到废纸篓（连同同名 JPG）。逐张走 deletePhoto 的
-    /// 废纸篓/撤销记录逻辑。删完后选「删除块后面的第一张」（没有则前面的），
-    /// 与单删行为一致（用户 2026-11-22 要求，不再跳回第一张）。
-    func deletePhotos(_ urls: [URL]) -> (moved: [String], failed: String?) {
+    /// 批量删除：多选后整组移到废纸篓（连同同名 JPG）。删完后选「删除块后面的第一张」
+    /// （没有则前面的），与单删行为一致（用户 2026-11-22 要求，不再跳回第一张）。
+    ///
+    /// 2026-11-23 提速：旧实现逐张调 deletePhoto，每张都写一次会话 JSON（97 张时
+    /// 单次数 MB）+ 触发一次列表重绘，删 6 张要卡好几秒。现在改成：
+    /// 主线程一次性把目标从内存移除（列表立即响应），文件 IO 放后台队列，
+    /// 完成后回主线程只写一次会话日志并回调状态文字。
+    func deletePhotos(_ urls: [URL], completion: @escaping (String) -> Void) {
         // 删除前按 shown 顺序定位接替者：取删除集合中列表序最后一张的下一张
         let oldShown = shown
         let ordered = oldShown.filter { urls.contains($0.id) }
@@ -1172,13 +1715,50 @@ final class Store: ObservableObject {
                 nextID = oldShown[fidx - 1].id
             }
         }
-        var allMoved: [String] = []
-        var firstFailed: String?
+        // 收集全部目标（RAW + 各自同名 JPG），去重
+        var allTargets: [URL] = []
         for u in urls {
-            let out = deletePhoto(u)
-            allMoved += out.moved
-            if firstFailed == nil, let f = out.failed { firstFailed = f }
+            allTargets.append(u)
+            if let jpg = siblingJPG(for: u) { allTargets.append(jpg) }
         }
+        let removed = Set(allTargets)
+
+        // 注意这里不能用 fullPreviewGeneration &+= 1 全局作废：
+        // 同时预取的其他照片在途任务也会被丢弃，切过去时 loading 去重挡住重发、
+        // 旧结果又被作废，界面会停在空白。改为在删除循环里按 URL 精确失效（见下）。
+
+        // 主线程：一次性清内存，只触发一次 UI 刷新
+        objectWillChange.send()
+        results.removeAll { removed.contains($0.id) }
+        metrics.removeAll { removed.contains($0.url) }
+        for key in removed {
+            wbCache[key] = nil; afCache[key] = nil; exifCache[key] = nil; ratingCache[key] = nil
+            focusCache[key] = nil; humanCache[key] = nil
+            genreOverride[key] = nil
+            afLoading.remove(key); afAttempted.remove(key)
+            wbAttempted.remove(key); exifAttempted.remove(key); focusAttempted.remove(key)
+            humanAttempted.remove(key); thumbAttempted.remove(key)
+            pendingRatings[key] = nil; ratingLoading.remove(key)
+            thumbnailCache[key] = nil; thumbLoading.remove(key)
+            fullPreviewCache[key] = nil
+            if let i = fullPreviewOrder.firstIndex(of: key) { fullPreviewOrder.remove(at: i) }
+            fullPreviewLoading.remove(key)
+            previewFailed.remove(key)
+            // 只对被删 URL 失效：在途任务回写时精确丢弃，其他照片的预取照常落地。
+            invalidatedPreviewURLs.insert(key)
+            if fullPreviewURL == key {
+                fullPreviewURL = nil
+                fullPreview = nil
+            }
+            heatCache[key] = nil; baseCache[key] = nil
+            selectionRects[key] = nil
+            birdCache[key] = nil; birdTop3[key] = nil; birdSource[key] = nil
+            birdReason[key] = nil; birdConfirm[key] = nil; birdMessage[key] = nil
+            birdLoading.remove(key); birdTaskToken[key] = nil
+            birdDismissed.remove(key); birdUnreliable.remove(key)
+        }
+        excluded = excluded.subtracting(removed)
+        selections.subtract(removed)
         if let n = nextID, results.contains(where: { $0.id == n }) {
             selected = n
             selections = [n]
@@ -1189,7 +1769,34 @@ final class Store: ObservableObject {
             selected = nil
             selections = []
         }
-        return (allMoved, firstFailed)
+
+        // 后台：逐个移到废纸篓。文件 IO 是主要耗时，放到后台不冻结界面。
+        DispatchQueue.global(qos: .userInitiated).async {
+            var allMoved: [String] = []
+            var firstFailed: String?
+            var trashPairs: [(trash: URL, original: URL)] = []
+            for t in allTargets {
+                do {
+                    var resulting: NSURL?
+                    try FileManager.default.trashItem(at: t, resultingItemURL: &resulting)
+                    allMoved.append(t.lastPathComponent)
+                    if let r = resulting {
+                        trashPairs.append((trash: r as URL, original: t))
+                    }
+                } catch {
+                    if firstFailed == nil {
+                        firstFailed = "\(t.lastPathComponent)：\(error.localizedDescription)"
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                if !trashPairs.isEmpty { self.lastDeleted = trashPairs }
+                self.saveSession()   // 整批只写一次
+                let names = allMoved.joined(separator: "、")
+                completion("已移到废纸篓：\(names)（⌘Z 可撤销）" +
+                    (firstFailed.map { "；失败：\($0)" } ?? ""))
+            }
+        }
     }
 
     /// 最近一次删除的记录（废纸篓位置 ↔ 原位置），⌘Z 撤销用。
@@ -1277,23 +1884,37 @@ final class Store: ObservableObject {
         return nil
     }
 
-    /// 把「说明」写进照片元数据（异步、只动 dc:description 一个字段）。
-    /// 文件已不存在（刚被删除）时跳过，避免往废纸篓里的文件写侧车。
-    func writeDescription(for url: URL) {
-        guard FileManager.default.fileExists(atPath: url.path),
-              let note = describeNote(for: url) else { return }
-        // 备份随照片放同目录（2026-11-20 用户要求）。
-        let dir = url.deletingLastPathComponent()
+    /// 导入/读取完成后的批量写说明：主线程取齐内容，后台顺序写盘。
+    /// 选片切照片不再触发任何 XMP 写入；已有说明的照片跳过（保留旧的鸟种段与用户内容，
+    /// 也避免导入时鸟种尚未识别就把带鸟种的旧说明覆盖成空鸟种版）。
+    func writeAllDescriptions() {
+        guard autoWriteDescription else { return }
+        // 阶段一（主线程）：只算内容，不碰磁盘。describeNote 只读主线程状态。
+        var notes: [(URL, String)] = []
+        for r in writableTargets {
+            guard let note = describeNote(for: r.id) else { continue }
+            notes.append((r.id, note))
+        }
+        guard !notes.isEmpty else { return }
+        // 阶段二（后台）：读现有说明决定跳过，再写盘；全程不碰主线程状态。
         DispatchQueue.global(qos: .utility).async {
-            do {
-                _ = try MetadataWriter.setDescription(to: url, note: note, backupDir: dir)
-                DispatchQueue.main.async {
-                    self.status = "已写入说明：\(url.lastPathComponent)"
+            var written = 0, failed = 0
+            for (url, note) in notes {
+                guard FileManager.default.fileExists(atPath: url.path) else { continue }
+                // 已有说明（含用户自己的或上一版带鸟种的）不动。
+                let existing = MetadataWriter.snapshot(url).description
+                if !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                do {
+                    _ = try MetadataWriter.setDescription(
+                        to: url, note: note, backupDir: url.deletingLastPathComponent())
+                    written += 1
+                } catch {
+                    failed += 1
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self.status = "写入说明失败 \(url.lastPathComponent)：\(error.localizedDescription)"
-                }
+            }
+            DispatchQueue.main.async {
+                self.status = "已写入 \(written) 张照片的说明" +
+                    (failed == 0 ? "" : "（\(failed) 张写入失败）")
             }
         }
     }
@@ -1382,7 +2003,8 @@ final class Store: ObservableObject {
     /// 拍鸟题材照片被点开时自动显示识别结果；风光 / 人像不识别、不显示。
     /// 先读可见日志（人工确认优先），否则跑本地 BioCLIP 2。
     /// forceLocal=true 用于圈选主体后刷新：跳过日志旧结果，强制按新裁剪框重认。
-    func ensureBird(for url: URL, forceLocal: Bool = false) {
+    func ensureBird(for url: URL, forceLocal: Bool = false,
+                    on queue: DispatchQueue = .global(qos: .userInitiated)) {
         guard !birdDismissed.contains(url), !birdUnreliable.contains(url) else { return }
         guard let r = results.first(where: { $0.id == url }), genre(for: r).0 == .bird else { return }
         guard BirdSpeciesEngine.available else {
@@ -1424,8 +2046,9 @@ final class Store: ObservableObject {
             ? "首次加载本地模型…（约 5 秒，之后秒出）" : "读取原图…"
         let crop = birdCrop(for: url)
         // 用原尺寸预览而非分析小图：小图里面临小主体信息不足，会和验证口径不一致。
-        let preferred = fullPreviewURL == url ? fullPreview : nil
-        DispatchQueue.global(qos: .userInitiated).async {
+        // 直接查 LRU：相邻图预取后鸟种任务不必再解一次 RAW（原来只认当前图）。
+        let preferred = fullPreviewCache[url]
+        queue.async {
             guard let cg = preferred ?? Analyzer.loadFullPreview(url) else {
                 DispatchQueue.main.async {
                     guard self.birdTaskToken[url] == token else { return }
@@ -1849,11 +2472,22 @@ struct ResultRow: View {
                     if store.excluded.contains(r.id) {
                         Text("排除写入").font(.caption2).foregroundColor(.orange)
                     }
+                    // 目录星级：和信息区评分行共用 ratingCache，右侧改星后这里同步更新。
+                    if let rating = store.ratingCache[r.id] {
+                        if rating == -1 {
+                            Text("拒绝").font(.caption2).foregroundColor(.red)
+                        } else if rating > 0 {
+                            Text(String(repeating: "★", count: rating)
+                                 + String(repeating: "☆", count: 5 - rating))
+                                .font(.caption2).foregroundColor(.orange)
+                        }
+                    }
                 }
             }
             Spacer(minLength: 0)
         }
         .help(r.id.path)
+        .task { store.ensureRating(for: r.id) }
         .padding(.vertical, 2)
     }
 }
@@ -1938,7 +2572,7 @@ enum LeftMouseGesture {
     case moved(CGPoint)              // 当前点
     case ended(CGPoint)              // 终点
     case tap                         // 单击（无有效位移）→ 复位
-    case doubleTap                   // 双击 → 放大到对焦点所在区域
+    case doubleTap(CGPoint)          // 双击 → 以点击位置为中心放大（位置为预览区左上原点坐标）
 }
 
 struct LeftMouseBridge: NSViewRepresentable {
@@ -2077,14 +2711,14 @@ struct LeftMouseBridge: NSViewRepresentable {
                 let topLeft = CGPoint(x: p.x, y: self.bounds.height - p.y)
                 switch e.type {
                 case .leftMouseDown:
-                    // 双击优先：macOS 会给出 clickCount==2，直接触发对焦点放大，
-                    // 不再进入拖动流程；单击仍走 tap 复位。
+                    // 双击优先：macOS 会给出 clickCount==2，直接以点击位置为中心放大
+                    //（用户 2026-11-23 要求，不再跳到相机对焦点）；单击仍走 tap 复位。
                     if e.clickCount >= 2 {
                         self.action = nil
                         self.start = nil
                         self.last = nil
                         self.swallowNextUp = true
-                        self.coordinator?.onGesture?(.doubleTap)
+                        self.coordinator?.onGesture?(.doubleTap(topLeft))
                         return nil
                     }
                     let flags = e.modifierFlags.intersection([.command, .control, .option, .shift])
@@ -2155,13 +2789,15 @@ struct LeftMouseBridge: NSViewRepresentable {
 
 // MARK: - 右上：预览与缩放
 
-/// 预览区里几种彩色框的图例，放在工具栏下方一行。
+/// 预览区里几种彩色框的图例，放在工具栏下方一行。只显示当前开启的框，
+/// 与工具栏的「AI主体蓝框 / 自选主体黄框 / 对焦点」勾选保持一致（2026-11-23）。
 private struct FrameLegend: View {
+    @EnvironmentObject var store: Store
     var body: some View {
         HStack(spacing: 14) {
-            legend(Color.cyan, "青框＝AI 主体")
-            legend(Color.red, "红框＝相机对焦点")
-            legend(Color.yellow, "黄框＝自选主体（信息区可取消）")
+            if store.showAISubjectBox { legend(Color.cyan, "蓝框＝AI 主体") }
+            if store.showAFPoints { legend(Color.red, "红框＝相机对焦点") }
+            if store.showManualSubjectBox { legend(Color.yellow, "黄框＝自选主体（信息区可取消）") }
         }
         .font(.caption2)
         .foregroundColor(.secondary)
@@ -2177,8 +2813,8 @@ private struct FrameLegend: View {
     }
 }
 
-/// 工具栏开关文字 + 小号灰色快捷键字母。快捷键本身仍由 .keyboardShortcut 绑定，
-/// 这里只把字母显示出来，避免用户看不见 H/F/G/D。
+/// 工具栏开关文字 + 小号灰色快捷键提示。实际按键由 ContentView 的本地监听统一处理
+/// （快捷键可在设置面板自定义），这里只把当前绑定的组合显示出来。
 private struct ShortcutToggleLabel: View {
     let title: String
     let key: String
@@ -2331,35 +2967,19 @@ struct DetailView: View {
         // 放大是「看」的操作：不写判定参数、也不再画黄框（黄框只标注用户圈选的主体）。
     }
 
-    /// 双击预览：把相机对焦点（合焦点）所在区域放大铺满视窗。
-    /// 没有对焦点数据时退回主体框；两者都没有则给出状态提示。
-    private func zoomToFocusArea(metrics m: PhotoMetrics) {
-        // 先取相机对焦点：FocusPoint 是左上原点、y 向下的归一化坐标。
-        var box: CGRect? = nil
-        if let af = store.afCache[r.id], !af.points.isEmpty {
-            let minX = af.points.map { $0.cx }.min() ?? 0.5
-            let maxX = af.points.map { $0.cx }.max() ?? 0.5
-            let minY = af.points.map { $0.cy }.min() ?? 0.5
-            let maxY = af.points.map { $0.cy }.max() ?? 0.5
-            // 把对焦框自身大小也纳入包围盒，避免只框住中心点。
-            let x0 = minX - (af.points.first?.w ?? 0) / 2
-            let x1 = maxX + (af.points.first?.w ?? 0) / 2
-            let y0 = minY - (af.points.first?.h ?? 0) / 2
-            let y1 = maxY + (af.points.first?.h ?? 0) / 2
-            box = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
-        } else if let b = m.bboxes.first {
-            // 主体框是 Vision 坐标（y 向上），转成左上原点。
-            box = CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
-        }
-        guard let b = box, b.width > 0.001, b.height > 0.001 else {
-            store.status = "这张照片没有相机对焦点数据，无法按对焦点放大"
-            return
-        }
-        // 让该区域较长边占视窗约 38%（比之前的 60% 小约 37%），四周留更多上下文。
-        let fill: CGFloat = 0.38
-        let factor = min(fill / max(b.width, 0.001), fill / max(b.height, 0.001))
-        store.zoom = min(8, max(1.2, factor))
-        store.zoomCenter = CGPoint(x: b.midX, y: 1 - b.midY)
+    /// 双击预览：以鼠标点击位置为中心放大（用户 2026-11-23 要求，取代旧的
+    /// 「跳到相机对焦点」）。点击落在图像外的边距上时钳制到最近边缘。
+    /// 放大倍数与旧双击一致：把约 1/2.6 的画面铺满视窗（保留一些上下文）。
+    private func zoomAtPoint(_ p: CGPoint, fitW: CGFloat, fitH: CGFloat,
+                             ox: CGFloat, oy: CGFloat) {
+        let d = displayedImageRect(fitW: fitW, fitH: fitH, ox: ox, oy: oy)
+        guard d.width > 0, d.height > 0 else { return }
+        // 点击点在图像里的归一化位置（左上原点，y 向下）
+        let u = min(max((p.x - d.minX) / d.width, 0), 1)
+        let v = min(max((p.y - d.minY) / d.height, 0), 1)
+        // zoomCenter 的 y 是 Vision 坐标（y 向上），故用 1 - v
+        store.zoomCenter = CGPoint(x: u, y: 1 - v)
+        store.zoom = min(8, max(1.2, store.zoom * 2.6))
         store.panOffset = .zero
         store.panStart = nil
         // 双击放大是「看」的操作：不写判定参数、不画黄框（黄框只标注圈选主体）。
@@ -2371,18 +2991,28 @@ struct DetailView: View {
             if compact {
                 // 右侧窄栏：开关一行、缩放一行，保证最窄时也不超出预览区宽度。
                 HStack(spacing: 12) {
-                    Toggle(isOn: $store.showHeatmap) { ShortcutToggleLabel(title: "锐度热力图", key: "H") }
-                        .keyboardShortcut("h", modifiers: [])
-                        .help("""
-                        把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
-                        （快捷键 H）
-                        """)
-                    Toggle(isOn: $store.showAFPoints) { ShortcutToggleLabel(title: "对焦点", key: "F") }
-                        .keyboardShortcut("f", modifiers: [])
-                    Toggle(isOn: $store.showThirds) { ShortcutToggleLabel(title: "九宫格", key: "G") }
-                        .keyboardShortcut("g", modifiers: [])
-                    Toggle(isOn: $store.showDiagonals) { ShortcutToggleLabel(title: "对角线", key: "D") }
-                        .keyboardShortcut("d", modifiers: [])
+                    Toggle(isOn: $store.showHeatmap) {
+                        ShortcutToggleLabel(title: "锐度热力图", key: store.shortcuts.heatmap.display)
+                    }
+                    .help("""
+                    把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
+                    （快捷键 \(store.shortcuts.heatmap.display)，可在快捷键面板改）
+                    """)
+                    Toggle(isOn: $store.showAFPoints) {
+                        ShortcutToggleLabel(title: "对焦点", key: store.shortcuts.afPoints.display)
+                    }
+                    Toggle(isOn: $store.showThirds) {
+                        ShortcutToggleLabel(title: "九宫格", key: store.shortcuts.thirds.display)
+                    }
+                    Toggle(isOn: $store.showDiagonals) {
+                        ShortcutToggleLabel(title: "对角线", key: store.shortcuts.diagonals.display)
+                    }
+                    Toggle(isOn: $store.showAISubjectBox) {
+                        ShortcutToggleLabel(title: "AI主体蓝框", key: store.shortcuts.aiBox.display)
+                    }
+                    Toggle(isOn: $store.showManualSubjectBox) {
+                        ShortcutToggleLabel(title: "自选主体黄框", key: store.shortcuts.manualBox.display)
+                    }
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.vertical, 4)
@@ -2391,30 +3021,52 @@ struct DetailView: View {
                     Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
                     Button("＋") { store.zoomIn() }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
+                    Toggle(isOn: $store.lockZoom) { Text("锁定缩放").font(.caption) }
+                        .help("开启后切换照片保留当前放大倍数和位置；关闭时切图自动复位")
+                    Button("一键隐藏/恢复") { store.toggleAllOverlays() }
+                        .font(.caption)
+                        .help("一键隐藏当前勾选的辅助项，再按一次恢复原来的勾选。快捷键 \(store.shortcuts.overlayToggle.display)（中文输入法下 ⌘、 也可以），可在快捷键面板改")
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.bottom, 4)
-                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · 快捷键：↑/↓ 切换照片 / H 热力图 / F 对焦点 / G 九宫格 / D 对角线 / ⌘1-5 评星 / ⌘0 清除星级 / ⌘⌫ 删除（⌘Z 撤销）")
+                .help("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大点击处 · 滚轮缩放 · 单击还原 · 快捷键：↑/↓ 切换照片 / ⇧↑↓ 连续多选 / \(store.shortcuts.heatmap.display) 热力图 / \(store.shortcuts.afPoints.display) 对焦点 / \(store.shortcuts.thirds.display) 九宫格 / \(store.shortcuts.diagonals.display) 对角线 / \(store.shortcuts.aiBox.display) AI蓝框 / \(store.shortcuts.manualBox.display) 黄框 / \(store.shortcuts.overlayToggle.display) 一键隐藏或恢复辅助项 / ⌘1-5 评星 / ⌘0 取消评级 / ⌥⌫ 拒绝 / ⌘⌫ 删除（⌘Z 撤销）")
             } else {
                 HStack(spacing: 12) {
-                    Toggle(isOn: $store.showHeatmap) { ShortcutToggleLabel(title: "锐度热力图", key: "H") }
-                        .keyboardShortcut("h", modifiers: [])
-                        .help("""
-                        把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
-                        （快捷键 H）
-                        """)
-                    Toggle(isOn: $store.showAFPoints) { ShortcutToggleLabel(title: "对焦点", key: "F") }
-                        .keyboardShortcut("f", modifiers: [])
-                    Toggle(isOn: $store.showThirds) { ShortcutToggleLabel(title: "九宫格", key: "G") }
-                        .keyboardShortcut("g", modifiers: [])
-                    Toggle(isOn: $store.showDiagonals) { ShortcutToggleLabel(title: "对角线", key: "D") }
-                        .keyboardShortcut("d", modifiers: [])
+                    Toggle(isOn: $store.showHeatmap) {
+                        ShortcutToggleLabel(title: "锐度热力图", key: store.shortcuts.heatmap.display)
+                    }
+                    .help("""
+                    把画面分成小格计算每格的锐度后着色：绿＝锐利、黄＝偏软、红＝发虚、灰＝纹理太少无法判断。主体区域绿说明对焦在主体上；整片偏红说明整体没对上焦。只是相对参考，不影响判定。
+                    （快捷键 \(store.shortcuts.heatmap.display)，可在快捷键面板改）
+                    """)
+                    Toggle(isOn: $store.showAFPoints) {
+                        ShortcutToggleLabel(title: "对焦点", key: store.shortcuts.afPoints.display)
+                    }
+                    Toggle(isOn: $store.showThirds) {
+                        ShortcutToggleLabel(title: "九宫格", key: store.shortcuts.thirds.display)
+                    }
+                    Toggle(isOn: $store.showDiagonals) {
+                        ShortcutToggleLabel(title: "对角线", key: store.shortcuts.diagonals.display)
+                    }
+                    Toggle(isOn: $store.showAISubjectBox) {
+                        ShortcutToggleLabel(title: "AI主体蓝框", key: store.shortcuts.aiBox.display)
+                    }
+                    .help("显示/隐藏 AI 自动识别的主体框（青蓝色）。只管画面显示，不影响判定与评分。快捷键 \(store.shortcuts.aiBox.display)，可在快捷键面板改。")
+                    Toggle(isOn: $store.showManualSubjectBox) {
+                        ShortcutToggleLabel(title: "自选主体黄框", key: store.shortcuts.manualBox.display)
+                    }
+                    .help("显示/隐藏你手动圈选的主体框（黄色）。只管画面显示；取消圈选请用信息区的「取消自选主体」。快捷键 \(store.shortcuts.manualBox.display)，可在快捷键面板改。")
                     Button("－") { store.zoomOut() }.frame(width: 26)
                     Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
                     Button("＋") { store.zoomIn() }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
+                    Toggle(isOn: $store.lockZoom) { Text("锁定缩放").font(.caption) }
+                        .help("开启后切换照片保留当前放大倍数和位置；关闭时切图自动复位")
+                    Button("一键隐藏/恢复") { store.toggleAllOverlays() }
+                        .font(.caption)
+                        .help("一键隐藏当前勾选的辅助项，再按一次恢复原来的勾选。快捷键 \(store.shortcuts.overlayToggle.display)（中文输入法下 ⌘、 也可以），可在快捷键面板改")
                     Spacer()
-                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大对焦点 · 滚轮缩放 · 单击还原 · ↑/↓ 切换照片 · H/F/G/D 切换热力图/对焦点/九宫格/对角线 · ⌘1-5 评星 · ⌘0 清除 · ⌘⌫ 删除（⌘Z 撤销）")
+                    Text("\(store.shortcuts.zoom.symbol)+左键拖框放大 · \(store.shortcuts.subject.symbol)+左键圈选主体 · 按住左键拖动平移 · 双击放大点击处 · 滚轮缩放 · 单击还原 · ↑/↓ 切图 / ⇧↑↓ 连续多选 · \(store.shortcuts.heatmap.display)/\(store.shortcuts.afPoints.display)/\(store.shortcuts.thirds.display)/\(store.shortcuts.diagonals.display)/\(store.shortcuts.aiBox.display)/\(store.shortcuts.manualBox.display) 切换热力图/对焦点/九宫格/对角线/AI蓝框/黄框 · \(store.shortcuts.overlayToggle.display) 一键隐藏或恢复 · ⌘1-5 评星 · ⌘0 取消评级 · ⌥⌫ 拒绝 · ⌘⌫ 删除（⌘Z 撤销）")
                         .font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -2444,11 +3096,13 @@ struct DetailView: View {
                             Image(nsImage: store.heatmapImage(for: r))
                                 .resizable().frame(width: fitW, height: fitH)
                         }
-                        ForEach(Array(m.bboxes.enumerated()), id: \.offset) { _, b in
-                            Rectangle().stroke(Color.cyan, lineWidth: 1.5 / scale)
-                                .frame(width: b.width * fitW, height: b.height * fitH)
-                                .position(x: (b.minX + b.width / 2) * fitW,
-                                          y: (1 - b.minY - b.height / 2) * fitH)
+                        if store.showAISubjectBox {
+                            ForEach(Array(m.bboxes.enumerated()), id: \.offset) { _, b in
+                                Rectangle().stroke(Color.cyan, lineWidth: 1.5 / scale)
+                                    .frame(width: b.width * fitW, height: b.height * fitH)
+                                    .position(x: (b.minX + b.width / 2) * fitW,
+                                              y: (1 - b.minY - b.height / 2) * fitH)
+                            }
                         }
                         // 相机记录的实际对焦点（红色），来自 RAW MakerNote
                         if store.showAFPoints, let af = store.afCache[r.id] {
@@ -2458,8 +3112,9 @@ struct DetailView: View {
                                           thirds: store.showThirds,
                                           diagonals: store.showDiagonals,
                                           scale: scale)
-                        // 黄框＝人工圈选主体：按照片持久保留；青框 AI 主体在上方独立绘制，不受影响
-                        if let sel = store.selectionRect {
+                        // 黄框＝人工圈选主体：按照片持久保留；青框 AI 主体在上方独立绘制，不受影响。
+                        // 隐藏开关只影响画面显示，圈选记录/判定/评分都还在（2026-11-23）。
+                        if store.showManualSubjectBox, let sel = store.selectionRect {
                             Rectangle().stroke(Color.yellow, lineWidth: 1.5 / scale)
                                 .frame(width: sel.width * fitW, height: sel.height * fitH)
                                 .position(x: (sel.minX + sel.width / 2) * fitW,
@@ -2470,6 +3125,27 @@ struct DetailView: View {
                     .scaleEffect(scale, anchor: .center)
                     .offset(x: (0.5 - store.zoomCenter.x) * fitW * scale + store.panOffset.width,
                             y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height)
+
+                    // 原图尚未解码完成时只显示占位 + 提示，不再拿 160px 缩略图冒充主预览。
+                    // 相邻图已预取，通常这一帧不会出现；未命中时也不会有"虚化→清晰"跳变。
+                    // 解码失败时给明确提示，避免进度提示消失后留下无解释的永久空白。
+                    if store.fullPreview == nil {
+                        if store.isPreviewLoading(for: r.id) {
+                            VStack(spacing: 8) {
+                                ProgressView().scaleEffect(0.8)
+                                Text("正在解码原图…").font(.caption).foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else if store.isPreviewFailed(for: r.id) {
+                            VStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .font(.title2).foregroundColor(.orange)
+                                Text("原图无法解码").font(.caption).foregroundColor(.secondary)
+                                Text("可切换照片后重试").font(.caption2).foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                    }
 
                     if let s = store.dragStart, let c = store.dragCurrent {
                         // 拖框预览：圈选主体画黄框（松手后保留）；框选放大画白框（纯看图）
@@ -2591,8 +3267,8 @@ struct DetailView: View {
                             }
                         case .tap:
                             store.resetZoom()
-                        case .doubleTap:
-                            zoomToFocusArea(metrics: m)
+                        case .doubleTap(let p):
+                            zoomAtPoint(p, fitW: fitW, fitH: fitH, ox: ox, oy: oy)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2849,22 +3525,19 @@ struct InfoView: View {
                         Image(systemName: (!rejected && current >= n) ? "star.fill" : "star")
                             .foregroundColor((!rejected && current >= n) ? .orange : .secondary)
                     }
-                    .buttonStyle(.plain).help("\(n) 星")
-                    .keyboardShortcut(KeyEquivalent(n.description.first ?? "1"), modifiers: .command)
+                    .buttonStyle(.plain).help("\(n) 星（快捷键 ⌘\(n)）")
                 }
                 Button {
                     store.setRating(r.id, rating: rejected ? 0 : -1)
                 } label: {
+                    // 未拒绝＝不显眼的灰色；标记拒绝后才变红底白字（2026-11-23 用户要求）。
                     Text("拒绝").font(.caption)
-                        .foregroundColor(rejected ? .white : .red)
+                        .foregroundColor(rejected ? .white : .secondary)
                         .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(rejected ? Color.red : Color.clear)
                         .cornerRadius(4)
                 }
-                .buttonStyle(.plain).help("标记/取消拒绝（Bridge Reject）")
-                // ⌘0：清除星级（隐藏按钮只承载快捷键）
-                Button { store.setRating(r.id, rating: 0) } label: { EmptyView() }
-                    .keyboardShortcut("0", modifiers: .command)
+                .buttonStyle(.plain).help("标记/取消拒绝（Bridge Reject），快捷键 ⌥⌫")
             }
             if let rt = store.ratingCache[r.id] {
                 Text(rt == -1 ? "已拒绝" : "\(rt) 星").font(.caption2).foregroundColor(.secondary)
@@ -2962,9 +3635,14 @@ struct InfoView: View {
                             Text("当前按自选主体判定与评分")
                                 .font(.caption2).foregroundColor(.secondary)
                             Spacer(minLength: 4)
+                            Button(store.showManualSubjectBox ? "隐藏黄框" : "显示黄框") {
+                                store.showManualSubjectBox.toggle()
+                            }
+                            .font(.caption2)
+                            .help("只隐藏/显示画面里的黄框，不影响这张照片按自选主体判定与评分")
                             Button("取消自选主体") { store.clearManualSubject(for: r.id) }
                                 .font(.caption2)
-                                .help("清除这张照片的黄框，恢复按自动识别主体判定与评分；其他照片不受影响")
+                                .help("清除这张照片的黄框和圈选，恢复按 AI 自动识别主体判定与评分；其他照片不受影响")
                         }
                     }
                     if let af = store.afCache[r.id] {
@@ -3228,47 +3906,145 @@ private struct FolderGenrePromptView: View {
 
 // MARK: - 快捷键设置面板
 
+/// 点一下按钮再按实际按键，录制「修饰键 + 字母/符号」的组合；Esc 取消。
+private struct ShortcutRecorder: View {
+    @Binding var combo: KeyCombo
+    @State private var recording = false
+    @State private var monitor: Any?
+
+    var body: some View {
+        Button {
+            if recording { stop() } else { start() }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: recording ? "keyboard.fill" : "keyboard")
+                Text(recording ? "请按按键…" : (combo.key.isEmpty ? "未设置" : combo.display))
+                    .monospacedDigit()
+            }
+            .frame(minWidth: 96)
+        }
+        .buttonStyle(.bordered)
+        .help("点这里后按下你要的按键（可同时按 ⌘/⌃/⌥/⇧）；按 Esc 取消录制")
+        .onDisappear { stop() }
+    }
+
+    private func start() {
+        recording = true
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+            if e.keyCode == 53 || e.keyCode == 36 || e.keyCode == 76 {   // Esc/回车：取消，避免误触「完成」
+                DispatchQueue.main.async { self.stop() }
+                return nil
+            }
+            guard let ch = e.characters?.first, !ch.isWhitespace else { return e }
+            let raw = String(ch)
+            guard raw.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) else { return e }
+            let mods = ModifierKey.allCases.filter { e.modifierFlags.contains($0.flag) }
+            let captured = KeyCombo(raw, mods)
+            DispatchQueue.main.async {
+                self.combo = captured
+                self.stop()
+            }
+            return nil
+        }
+    }
+    private func stop() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        recording = false
+    }
+}
+
 struct ShortcutsView: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) private var dismiss
 
+    private func comboBinding(for item: OverlayItem) -> Binding<KeyCombo> {
+        Binding(get: { store.shortcuts.combo(for: item) },
+                set: { store.shortcuts.setCombo($0, for: item) })
+    }
+
+    /// 查重：同一个组合被分给两个动作时后按的那个不会触发，提示用户改掉。
+    private var conflicts: [String] {
+        var seen: [KeyCombo: String] = [:]
+        var found: [String] = []
+        for entry in store.shortcuts.allCombos {
+            if let previous = seen[entry.combo] {
+                found.append("「\(previous)」和「\(entry.name)」都是 \(entry.combo.display)")
+            } else {
+                seen[entry.combo] = entry.name
+            }
+        }
+        return found
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("快捷键设置").font(.headline)
-            Text("选择各操作使用的修饰键。修改后立即生效并保存在本机；按住左键拖动始终用于平移，单击始终用于复位。↑/↓ 可在当前列表中切换照片。")
-                .font(.caption).foregroundColor(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("上半部分是鼠标手势的修饰键；下面是画面辅助项的按键。点右侧按钮后直接按你要的键（可带 ⌘/⌃/⌥/⇧），按 Esc 取消。修改后立即生效并保存在本机。中文输入法下 ⌘、 与 ⌘/ 等效。")
+                        .font(.caption).foregroundColor(.secondary)
 
-            HStack(spacing: 12) {
-                Text("框选放大").frame(width: 80, alignment: .leading)
-                Picker("", selection: $store.shortcuts.zoom) {
-                    ForEach(ModifierKey.allCases) { k in Text(k.label).tag(k) }
-                }
-                .pickerStyle(.menu).frame(width: 150)
-                Text("按住此键 + 左键拖框，放大选中的区域")
-                    .font(.caption2).foregroundColor(.secondary)
-            }
+                    HStack(spacing: 12) {
+                        Text("框选放大").frame(width: 100, alignment: .leading)
+                        Picker("", selection: $store.shortcuts.zoom) {
+                            ForEach(ModifierKey.allCases) { k in Text(k.label).tag(k) }
+                        }
+                        .pickerStyle(.menu).frame(width: 140)
+                        Text("按住此键 + 左键拖框，放大选中的区域")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        Text("圈选主体").frame(width: 100, alignment: .leading)
+                        Picker("", selection: $store.shortcuts.subject) {
+                            ForEach(ModifierKey.allCases) { k in Text(k.label).tag(k) }
+                        }
+                        .pickerStyle(.menu).frame(width: 140)
+                        Text("按住此键 + 左键拖框，按圈选范围重判这一张")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
 
-            HStack(spacing: 12) {
-                Text("圈选主体").frame(width: 80, alignment: .leading)
-                Picker("", selection: $store.shortcuts.subject) {
-                    ForEach(ModifierKey.allCases) { k in Text(k.label).tag(k) }
-                }
-                .pickerStyle(.menu).frame(width: 150)
-                Text("按住此键 + 左键拖框，按圈选范围重判这一张")
-                    .font(.caption2).foregroundColor(.secondary)
-            }
+                    Divider()
+                    Text("画面辅助项（显示 / 隐藏）").font(.subheadline.weight(.medium))
+                    ForEach(OverlayItem.allCases) { item in
+                        HStack(spacing: 12) {
+                            Text(item.label).frame(width: 100, alignment: .leading)
+                            ShortcutRecorder(combo: comboBinding(for: item))
+                            Text(item == .aiBox ? "AI 自动识别的主体框（青蓝色）"
+                                 : item == .manualBox ? "你手动圈选的主体框（黄色）"
+                                 : "只管画面显示，不影响判定与评分")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                    HStack(spacing: 12) {
+                        Text("一键隐藏/恢复").frame(width: 100, alignment: .leading)
+                        ShortcutRecorder(combo: $store.shortcuts.overlayToggle)
+                        Text("隐藏当前勾选的辅助项，再按一次恢复原来的勾选")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
 
-            if store.shortcuts.zoom == store.shortcuts.subject {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
-                    Text("两个操作用了同一个修饰键，圈选主体将无法触发。请选择不同的键。")
-                        .font(.caption).foregroundColor(.orange)
+                    if store.shortcuts.zoom == store.shortcuts.subject {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                            Text("两个手势用了同一个修饰键，圈选主体将无法触发。请选择不同的键。")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                    ForEach(conflicts, id: \.self) { text in
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                            Text("\(text)，请改掉其中一个。")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                    if store.shortcuts.subject == .control {
+                        Text("提示：若系统开启了「Control + 点击 = 右键」，⌃+左键会被系统拦截。此时请把圈选主体改成 ⌥ Option 或 ⇧ Shift，或在系统设置里关闭该辅助点按。")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    Text("请避开系统/本软件已占用的组合：⌘1-5 评星、⌘0 取消星级/拒绝、⌘⌫ 删除、⌘Z 撤销、↑/↓ 切图。")
+                        .font(.caption2).foregroundColor(.secondary)
                 }
             }
-            if store.shortcuts.subject == .control {
-                Text("提示：若系统开启了「Control + 点击 = 右键」，⌃+左键会被系统拦截。此时请把圈选主体改成 ⌥ Option 或 ⇧ Shift，或在系统设置里关闭该辅助点按。")
-                    .font(.caption2).foregroundColor(.secondary)
-            }
+            .frame(maxHeight: 480)
 
             HStack {
                 Spacer()
@@ -3280,7 +4056,7 @@ struct ShortcutsView: View {
             }
         }
         .padding(20)
-        .frame(width: 520)
+        .frame(width: 620)
         .onChange(of: store.shortcuts) { _ in store.shortcuts.save() }
     }
 }
@@ -3289,7 +4065,7 @@ struct ShortcutsView: View {
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
-    @State private var arrowKeyMonitor: Any?
+    @State private var shortcutMonitor: Any?
 
     /// 预览窗格：选中照片时是 DetailView，否则是空态提示。两种布局共用。
     @ViewBuilder
@@ -3373,21 +4149,30 @@ struct ContentView: View {
                         Spacer()
                         Text("\(store.shown.count) 张").font(.caption).foregroundColor(.secondary)
                     }.padding(8)
-                    List(selection: $store.selections) {
-                        ForEach(store.shown) { r in
-                            ResultRow(r: r).tag(r.id)
-                                .contextMenu {
-                                    Button("在访达中显示") {
-                                        NSWorkspace.shared.activateFileViewerSelecting([r.id])
+                    // 目录跟随当前预览滚动：方向键切图/圈选跳下一张时，左侧自动滚到那张。
+                    ScrollViewReader { proxy in
+                        List(selection: $store.selections) {
+                            ForEach(store.shown) { r in
+                                ResultRow(r: r).tag(r.id).id(r.id)
+                                    .contextMenu {
+                                        Button("在访达中显示") {
+                                            NSWorkspace.shared.activateFileViewerSelecting([r.id])
+                                        }
+                                        Button("打开所在文件夹") {
+                                            NSWorkspace.shared.open(r.id.deletingLastPathComponent())
+                                        }
+                                        Button("删除（移到废纸篓）") {
+                                            store.deleteURLs = [r.id]
+                                            store.confirmDelete = true
+                                        }
                                     }
-                                    Button("打开所在文件夹") {
-                                        NSWorkspace.shared.open(r.id.deletingLastPathComponent())
-                                    }
-                                    Button("删除（移到废纸篓）") {
-                                        store.deleteURLs = [r.id]
-                                        store.confirmDelete = true
-                                    }
-                                }
+                            }
+                        }
+                        .onChange(of: store.selected) { id in
+                            guard let id, store.shown.contains(where: { $0.id == id }) else { return }
+                            // 不做 withAnimation：1458 行列表在动画期间每帧都要重排/重绘，
+                            // 方向键连翻时反而拖慢切图。直接定位，跟手优先。
+                            proxy.scrollTo(id, anchor: .center)
                         }
                     }
                 }
@@ -3502,14 +4287,22 @@ struct ContentView: View {
                     在 Bridge「偏好设置 → 标签」里把 5 个标签名改成对应判定词后，Bridge 会按词显示颜色并可按名筛选；
                     未改设置或对不上的词显示白标。照片已有的标签不会被覆盖。本软件不再写任何关键词。
                     """)
-                Toggle("切换时自动写说明", isOn: $store.autoWriteDescription)
+                Toggle("导入时自动写说明", isOn: $store.autoWriteDescription)
                     .help("""
-                    切换照片时把上一张的评星依据、清晰度判定（含鸟类识别）写入其元数据「说明」字段
-                    （只动说明，其他元数据一律不碰）。用「清除本软件标记」前建议先关掉这个开关，
-                    否则切照片会把说明重新写回去。
+                    导入/读取文件夹时一次性把每张的评星依据、清晰度判定写入其元数据「说明」字段
+                    （只动说明，其他元数据一律不碰）。改为导入时批量写，选片切照片时不再落盘，减少卡顿。
+                    用「清除本软件标记」前建议先关掉这个开关，否则下次导入会把说明重新写回去。
                     """)
                 Spacer()
-                if store.processing {
+                if store.historyReading {
+                    // 读历史日志是「读文件 + JSON 解码」，没有逐张进度，用不确定转圈 +
+                    // 明确文案，让用户知道这几秒的停顿是在读日志，而不是界面卡死。
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.6).frame(width: 14, height: 14)
+                        Text("正在读取历史日志文件…")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                } else if store.processing {
                     // 进度条旁直接标明这次是读历史还是真在分析新素材，
                     // 避免看到进度就以为文件夹每次都被重新分析。
                     HStack(spacing: 6) {
@@ -3560,6 +4353,26 @@ struct ContentView: View {
                 .stroke(store.dropTarget ? Color.accentColor : Color.clear, lineWidth: 3)
                 .padding(3)
         )
+        // 读历史日志（上千张/子目录日志解码可能几百毫秒~数秒）时居中提示，
+        // 避免用户把这段停顿误认为界面卡死。半透明遮罩不挡住底层，读完自动消失。
+        .overlay(
+            Group {
+                if store.historyReading {
+                    VStack(spacing: 12) {
+                        ProgressView().scaleEffect(1.4)
+                        Text("正在读取历史日志文件…")
+                            .font(.headline)
+                        Text("照片较多时可能需要几秒，请稍候")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    .padding(24)
+                    .background(RoundedRectangle(cornerRadius: 12)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.92)))
+                    .shadow(radius: 8)
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: store.historyReading)
+        )
         .onDrop(of: [.fileURL], isTargeted: $store.dropTarget) { providers in
             handleDrop(providers)
             return true
@@ -3587,14 +4400,15 @@ struct ContentView: View {
         .alert("删除照片", isPresented: $store.confirmDelete) {
             Button("取消", role: .cancel) { store.deleteURLs = [] }
             Button("移到废纸篓", role: .destructive) {
-                if !store.deleteURLs.isEmpty {
-                    let out = store.deletePhotos(store.deleteURLs)
-                    let names = out.moved.joined(separator: "、")
-                    store.status = "已移到废纸篓：\(names)（⌘Z 可撤销）" +
-                        (out.failed.map { "；失败：\($0)" } ?? "")
-                }
+                let targets = store.deleteURLs
                 store.deleteURLs = []
+                guard !targets.isEmpty else { return }
+                // 用户 2026-11-23 要求：回车直接确认。删除走后台，避免界面冻结。
+                store.status = "正在移到废纸篓…"
+                store.deletePhotos(targets) { msg in store.status = msg }
             }
+            // 回车 = 默认按钮「移到废纸篓」（用户 2026-11-23 要求），Esc = 取消。
+            .keyboardShortcut(.defaultAction)
         } message: {
             if store.deleteURLs.count == 1, let u = store.deleteURLs.first {
                 let jpg = store.siblingJPG(for: u)
@@ -3622,26 +4436,63 @@ struct ContentView: View {
         .sheet(isPresented: $store.showGenrePrompt) {
             FolderGenrePromptView().environmentObject(store)
         }
-        // ↑/↓ 切换照片（用户要求加回）：用本地事件监听，保证焦点在预览或列表都生效。
+        // ↑/↓ 切换照片 + 辅助项快捷键：统一用本地事件监听，保证焦点在预览或列表都生效。
         // 输入框里打字、弹窗/面板打开时不拦截，避免抢走系统正常的方向键行为。
         .onAppear {
             // 软件一启动就后台预热鸟种模型（低优先级）：用户导入文件夹、翻照片的
             // 这几秒正好把模型读进内存，点开第一张鸟片就不用再等 5～6 秒。
             store.prewarmBirdModel()
-            guard arrowKeyMonitor == nil else { return }
-            arrowKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
-                guard e.keyCode == 125 || e.keyCode == 126 else { return e }   // 125=↓ 126=↑
-                guard e.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return e }
+            guard shortcutMonitor == nil else { return }
+            shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
                 guard NSApp.modalWindow == nil, e.window === NSApp.mainWindow else { return e }
                 if let fr = NSApp.keyWindow?.firstResponder, fr is NSText { return e }
-                store.moveSelection(by: e.keyCode == 125 ? 1 : -1)
-                return nil
+                let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+                // 125=↓ 126=↑。单独 Shift 时扩展多选区间，预览跟着走；
+                // 其他修饰键（⌘/⌥/⌃）不拦，留给评星等快捷键或系统。
+                if (mods.isEmpty || mods == .shift), e.keyCode == 125 || e.keyCode == 126 {
+                    store.moveSelection(by: e.keyCode == 125 ? 1 : -1, shift: mods == .shift)
+                    return nil
+                }
+                for item in OverlayItem.allCases {
+                    if store.shortcuts.combo(for: item).matches(e) {
+                        store.toggleOverlay(item)
+                        return nil
+                    }
+                }
+                if store.shortcuts.overlayToggle.matches(e) {
+                    store.toggleAllOverlays()
+                    return nil
+                }
+                // 评星快捷键统一在这里处理：按钮内嵌 .keyboardShortcut 在滚动信息区里
+                // 不稳定（用户反馈按完星级不刷新），且会顺带渲染出一个灰色空按钮。
+                if let id = store.selected {
+                    if mods == .command {
+                        // 键码经系统实测：1=18 2=19 3=20 4=21 5=23 0=29
+                        // （原先写成 22:5、27:0，22 其实是 4、27 其实是 -，导致 ⌘5 无效、⌘0 要按 ⌘- 才触发）。
+                        let starKeys: [UInt16: Int] = [18: 1, 19: 2, 20: 3, 21: 4, 23: 5]
+                        if let n = starKeys[e.keyCode] {
+                            let current = store.ratingCache[id] ?? 0
+                            store.setRating(id, rating: current == n ? 0 : n)
+                            return nil
+                        }
+                        if e.keyCode == 29 {   // ⌘0 取消星级/拒绝
+                            store.setRating(id, rating: 0)
+                            return nil
+                        }
+                    }
+                    if mods == .option, e.keyCode == 51 || e.keyCode == 117 {   // ⌥⌫ / ⌥Del 拒绝
+                        let rejected = (store.ratingCache[id] ?? 0) == -1
+                        store.setRating(id, rating: rejected ? 0 : -1)
+                        return nil
+                    }
+                }
+                return e
             }
         }
         .onDisappear {
-            if let m = arrowKeyMonitor {
+            if let m = shortcutMonitor {
                 NSEvent.removeMonitor(m)
-                arrowKeyMonitor = nil
+                shortcutMonitor = nil
             }
         }
     }
