@@ -11,7 +11,7 @@ import ImageIO
 /// - VNDetectHumanRectanglesRequest 对坐姿/背影召回为 0；
 /// - VNDetectHumanBodyPoseRequest 检测人体骨架关键点，实测背影人像检出 1 人 / 13 个关键点，
 ///   长焦风光与鸟类题材照片均为 0，能可靠区分（2026-11-18 实测）。
-struct HumanPresence {
+struct HumanPresence: Codable {
     let hasPerson: Bool          // 画面里检测到了人（不管大小）
     let isMainSubject: Bool      // 人是主体（占画面够大），而非风景里的点缀小人
     let count: Int

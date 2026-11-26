@@ -5,7 +5,7 @@ import ImageIO
 
 /// 本地白平衡 / 曝光参考统计。
 /// 注意：这是统计意义上的「偏色倾向」，不是相机 K 值，也不能替代校色软件。
-struct WhiteBalanceStats {
+struct WhiteBalanceStats: Codable {
     let meanR: Double
     let meanG: Double
     let meanB: Double
@@ -42,8 +42,8 @@ enum WhiteBalance {
         }
     }
 
-    static func analyze(_ url: URL) -> WhiteBalanceStats? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    static func analyze(_ url: URL, source: CGImageSource? = nil) -> WhiteBalanceStats? {
+        guard let src = source ?? CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: 600,

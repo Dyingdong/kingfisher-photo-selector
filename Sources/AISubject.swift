@@ -8,8 +8,8 @@ import ImageIO
 /// AI 主体识别结果。与对焦点语义互补：对焦点语义看「相机对哪儿」，
 /// AI 主体识别看「画面里的主体到底是什么」——前景实例分割把主体抠出来再分类，
 /// 背景被抠掉后分类器不受蓝天/水面干扰，小主体也能认出来。
-struct AISubject {
-    enum Kind: String {
+struct AISubject: Codable {
+    enum Kind: String, Codable {
         case face       // 主体是人（含人脸/人体）
         case bird       // 主体是鸟（认出鸟种或通用 bird）
         case flower     // 主体是花（低置信度但多个花标签互相印证；题材仍归风光）

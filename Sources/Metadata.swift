@@ -61,6 +61,13 @@ enum MetadataWriter {
     static func isSupported(_ u: URL) -> Bool { isJPEG(u) || isRAW(u) }
     static func sidecar(_ u: URL) -> URL { u.deletingPathExtension().appendingPathExtension("xmp") }
 
+    // 同一侧车的读取、备份与原子替换共用锁。固定锁池避免按照片永久持有锁。
+    private static let writeLocks = (0..<64).map { _ in NSLock() }
+    private static func writeLock(for url: URL) -> NSLock {
+        let path = sidecar(url).resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
+        return writeLocks[Int(UInt(bitPattern: path.hashValue) % UInt(writeLocks.count))]
+    }
+
     static func makeNote(_ reason: String) -> String {
         "\(notePrefix) \(reason)"
     }
@@ -114,6 +121,48 @@ enum MetadataWriter {
         return nil
     }
 
+    private static let xmpNamespace = "http://ns.adobe.com/xap/1.0/"
+
+    private static func xmpNodes(_ property: String, in root: XMLNode) -> [XMLNode] {
+        var nodes: [XMLNode] = []
+        if let element = root as? XMLElement,
+           element.localName == "Description",
+           element.uri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#" {
+            nodes = (element.attributes ?? []) + (element.children ?? [])
+            return nodes.filter { $0.localName == property && $0.uri == xmpNamespace }
+        }
+        return (root.children ?? []).flatMap { xmpNodes(property, in: $0) }
+    }
+
+    private static func updateRating(_ rating: Int, root: XMLElement, description: XMLElement) {
+        let nodes = xmpNodes("Rating", in: root)
+        if let first = nodes.first {
+            first.stringValue = String(rating)
+            for duplicate in nodes.dropFirst() { duplicate.detach() }
+        } else {
+            ensureNS(description, "xmp", xmpNamespace)
+            let node = XMLElement(name: "xmp:Rating", stringValue: String(rating))
+            description.addChild(node)
+        }
+    }
+
+    private static func labelParts(in nodes: [XMLNode]) -> [String] {
+        var seen = Set<String>()
+        return nodes.flatMap { labelParts($0.stringValue) }.filter { seen.insert($0).inserted }
+    }
+
+    private static func updateLabel(_ value: String?, nodes: [XMLNode], description: XMLElement) {
+        if let value, let first = nodes.first {
+            first.stringValue = value
+            for duplicate in nodes.dropFirst() { duplicate.detach() }
+        } else if let value {
+            ensureNS(description, "xmp", xmpNamespace)
+            description.addChild(XMLElement(name: "xmp:Label", stringValue: value))
+        } else {
+            for node in nodes { node.detach() }
+        }
+    }
+
     static func attributeNode(_ name: String, _ value: String) -> XMLNode {
         XMLNode.attribute(withName: name, stringValue: value) as! XMLNode
     }
@@ -138,18 +187,26 @@ enum MetadataWriter {
         return kept.isEmpty ? note : kept + separator + note
     }
 
-    /// 合并写入：判定原因写入 dc:description / photoshop:Instructions，
+    private static func parseForWriting(_ existing: String) throws -> (XMLElement, XMLElement) {
+        let data = Data(existing.utf8)
+        let parser = XMLParser(data: data)
+        guard parser.parse(), parser.parserError == nil,
+              let doc = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]),
+              let root = doc.rootElement(), let desc = firstDescription(root) else {
+            throw MetaError.xmpUnreadable
+        }
+        return (root, desc)
+    }
+
+    /// 合并写入：判定原因写入 dc:description / photoshop:Instructions。
     /// labelColor 非 nil 且已有标签时追加 xmp:Label=<判定词>（判定词由调用方按
     /// Verdict.bridgeLabel 决定：主体清晰/焦点正常/整片偏软/景深不足/主体偏软/主体拖影）。
     /// 用户已有的关键词、说明、星级、标签全部保留，不覆盖。
     static func mergedXMP(existing: String?, note: String, labelColor: String?,
                           rating: Int? = nil) throws -> String {
-        guard let existing, !existing.isEmpty
+        guard let existing
         else { return freshXMP(note: note, labelColor: labelColor, rating: rating) }
-        guard let data = existing.data(using: .utf8),
-              let doc = try? XMLDocument(data: data, options: []),
-              let root = doc.rootElement(),
-              let desc = firstDescription(root) else { throw MetaError.xmpUnreadable }
+        let (root, desc) = try parseForWriting(existing)
 
         ensureNS(desc, "dc", "http://purl.org/dc/elements/1.1/")
         ensureNS(desc, "xmp", "http://ns.adobe.com/xap/1.0/")
@@ -181,31 +238,18 @@ enum MetadataWriter {
         }
 
         if let color = labelColor {
-            if let l = child(desc, "Label") {
-                // 已写鸟种但还没有判定词时把判定词补到最前面（用户已有标签仍不覆盖）
-                if child(desc, "BirdSpecies") != nil {
-                    let parts = labelParts(l.stringValue)
-                    if !parts.contains(where: { ownedLabels.contains($0) }) {
-                        l.stringValue = ([color] + parts).joined(separator: birdSeparator)
-                    }
-                }
-            } else {
-                let l = XMLElement(name: "xmp:Label")
-                l.stringValue = color
-                desc.addChild(l)
+            let labels = xmpNodes("Label", in: root)
+            var parts = labelParts(in: labels)
+            if labels.isEmpty || (child(desc, "BirdSpecies") != nil && !parts.contains(where: ownedLabels.contains)) {
+                parts.insert(color, at: 0)
+                updateLabel(parts.joined(separator: birdSeparator), nodes: labels, description: desc)
+            } else if labels.count > 1 {
+                updateLabel(parts.isEmpty ? nil : parts.joined(separator: birdSeparator), nodes: labels, description: desc)
             }
         }
 
         // xmp:Rating：0~5 星；-1 = Bridge 的「拒绝」。传入 nil 时保留原值。
-        if let rating {
-            if let node = child(desc, "Rating") {
-                node.stringValue = String(rating)
-            } else {
-                let r = XMLElement(name: "xmp:Rating")
-                r.stringValue = String(rating)
-                desc.addChild(r)
-            }
-        }
+        if let rating { updateRating(rating, root: root, description: desc) }
 
         return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
     }
@@ -213,28 +257,43 @@ enum MetadataWriter {
     // MARK: - 读取已有元数据
 
     static func embeddedXMP(_ data: Data) -> String? {
-        let b = [UInt8](data)
-        guard b.count > 4, b[0] == 0xFF, b[1] == 0xD8 else { return nil }
+        try? readEmbeddedXMP(data)
+    }
+
+    /// 同一套 JPEG 段边界用于读取和替换。遇到重复的标准 XMP 包时无法确定应改哪一份。
+    private static func jpegXMPLocation(_ bytes: [UInt8]) throws -> (packet: Range<Int>?, insertAt: Int) {
+        guard bytes.starts(with: [0xFF, 0xD8]) else { throw MetaError.jpegMalformed }
         var i = 2
-        while i + 3 < b.count {
-            if b[i] != 0xFF { break }
-            let m = b[i + 1]
-            if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) { i += 2; continue }
-            if m == 0xDA || m == 0xD9 { break }
-            let len = (Int(b[i + 2]) << 8) | Int(b[i + 3])
-            if len < 2 { break }
-            let end = i + 2 + len
-            if end > b.count { break }
-            if m == 0xE1 {
-                let ps = i + 4
-                if end - ps >= headerBytes.count,
-                   Array(b[ps..<(ps + headerBytes.count)]) == headerBytes {
-                    return String(bytes: b[(ps + headerBytes.count)..<end], encoding: .utf8)
-                }
+        var packet: Range<Int>?
+        var insertAt: Int?
+        while i + 1 < bytes.count {
+            guard bytes[i] == 0xFF else { throw MetaError.jpegMalformed }
+            let marker = bytes[i + 1]
+            if marker == 0xFF { i += 1; continue }
+            if marker == 0xDA || marker == 0xD9 { return (packet, insertAt ?? i) }
+            if marker == 0x01 || (0xD0...0xD7).contains(marker) { i += 2; continue }
+            guard marker != 0, i + 3 < bytes.count else { throw MetaError.jpegMalformed }
+            let length = (Int(bytes[i + 2]) << 8) | Int(bytes[i + 3])
+            let end = i + 2 + length
+            guard length >= 2, end <= bytes.count else { throw MetaError.jpegMalformed }
+            if marker == 0xE1, bytes[(i + 4)..<end].starts(with: headerBytes) {
+                guard packet == nil else { throw MetaError.xmpUnreadable }
+                packet = i..<end
             }
+            if insertAt == nil && marker != 0xE0 { insertAt = i }
             i = end
         }
-        return nil
+        throw MetaError.jpegMalformed
+    }
+
+    private static func readEmbeddedXMP(_ data: Data) throws -> String? {
+        let bytes = [UInt8](data)
+        guard let packet = try jpegXMPLocation(bytes).packet else { return nil }
+        let start = packet.lowerBound + 4 + headerBytes.count
+        guard let value = String(bytes: bytes[start..<packet.upperBound], encoding: .utf8) else {
+            throw MetaError.xmpUnreadable
+        }
+        return value
     }
 
     static func snapshot(_ u: URL) -> MetaSnapshot {
@@ -259,9 +318,10 @@ enum MetadataWriter {
             s.description = (alt.children ?? []).compactMap { $0.stringValue }.joined(separator: " | ")
         }
         s.instructions = child(desc, "Instructions")?.stringValue ?? ""
-        s.label = child(desc, "Label")?.stringValue ?? ""
+        s.label = labelParts(in: xmpNodes("Label", in: root)).joined(separator: birdSeparator)
         s.bird = child(desc, "BirdSpecies")?.stringValue
-        if let r = child(desc, "Rating")?.stringValue, let v = Int(r.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        if let r = xmpNodes("Rating", in: root).last?.stringValue,
+           let v = Int(r.trimmingCharacters(in: .whitespacesAndNewlines)), (-1...5).contains(v) {
             s.rating = v
         }
         return s
@@ -270,44 +330,19 @@ enum MetadataWriter {
     /// 只改 xmp:Rating，不动说明/关键词/标签。rating 为 0~5 星，-1 表示拒绝。
     /// 与 apply 共用同一套读取、备份、写回路径，但不会追加质检说明。
     static func setRating(to u: URL, rating: Int, backupDir: URL) throws -> WriteOutcome {
-        let fm = FileManager.default
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+
         let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before-rating.xmp")
-        let sc = sidecar(u)
-
-        if isJPEG(u) {
-            let data = try Data(contentsOf: u)
-            let embedded = embeddedXMP(data)
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            var originals: [String] = []
-            if let e = embedded { originals.append("EMBEDDED\n" + e) }
-            if let s = side { originals.append("SIDECAR\n" + s) }
-            if !originals.isEmpty { try writeBackupIfMissing(originals.joined(separator: "\n---\n"), to: backup) }
-
-            let xmp = try ratingOnlyXMP(existing: embedded ?? side, rating: rating)
-            let newData = try injectXMP(into: data, xmp: xmp)
-            try newData.write(to: u, options: .atomic)
-            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
-            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: "星级 \(rating)")
+        return try writeMetadata(to: u, backup: backup, note: "星级 \(rating)") {
+            try ratingOnlyXMP(existing: $0, rating: rating)
         }
-
-        if isRAW(u) {
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            if let s = side { try writeBackupIfMissing(s, to: backup) }
-            let xmp = try ratingOnlyXMP(existing: side, rating: rating)
-            try xmp.write(to: sc, atomically: true, encoding: .utf8)
-            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: "星级 \(rating)")
-        }
-
-        throw MetaError.unsupportedFormat(u.pathExtension)
     }
 
     /// 在已有 XMP 上只设置 Rating；没有现成 XMP 时生成一个最小合法包。
     private static func ratingOnlyXMP(existing: String?, rating: Int) throws -> String {
-        guard let existing, !existing.isEmpty,
-              let data = existing.data(using: .utf8),
-              let doc = try? XMLDocument(data: data, options: []),
-              let root = doc.rootElement(),
-              let desc = firstDescription(root) else {
+        guard let existing else {
             return """
             \(packetBegin)
             <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Kingfisher-PhotoSelector">
@@ -320,14 +355,8 @@ enum MetadataWriter {
             \(packetEnd)
             """
         }
-        ensureNS(desc, "xmp", "http://ns.adobe.com/xap/1.0/")
-        if let node = child(desc, "Rating") {
-            node.stringValue = String(rating)
-        } else {
-            let r = XMLElement(name: "xmp:Rating")
-            r.stringValue = String(rating)
-            desc.addChild(r)
-        }
+        let (root, desc) = try parseForWriting(existing)
+        updateRating(rating, root: root, description: desc)
         return packetBegin + "\n" + root.xmlString + "\n" + packetEnd
     }
 
@@ -353,7 +382,7 @@ enum MetadataWriter {
     /// 在已有 XMP 上只设置 dc:description（Bridge 的「说明」）；
     /// 没有现成 XMP 时生成一个只含说明的最小合法包；已有但解析不了时抛错保护，绝不覆盖。
     private static func descriptionOnlyXMP(existing: String?, note: String) throws -> String {
-        guard let existing, !existing.isEmpty else {
+        guard let existing else {
             let n = xmlEscape(composeDescription(old: "", info: note))
             return """
             \(packetBegin)
@@ -368,10 +397,7 @@ enum MetadataWriter {
             \(packetEnd)
             """
         }
-        guard let data = existing.data(using: .utf8),
-              let doc = try? XMLDocument(data: data, options: []),
-              let root = doc.rootElement(),
-              let desc = firstDescription(root) else { throw MetaError.xmpUnreadable }
+        let (root, desc) = try parseForWriting(existing)
         ensureNS(desc, "dc", "http://purl.org/dc/elements/1.1/")
         if let d = child(desc, "description"), let alt = child(d, "Alt"),
            let li = (alt.children ?? []).compactMap({ $0 as? XMLElement }).first {
@@ -392,35 +418,27 @@ enum MetadataWriter {
     /// 只写「说明」字段：关键词、星级、颜色标签、Instructions 等全部不动。
     /// RAW 走同名 .xmp 侧车（Bridge 标准方式，不改原片）；JPG 内嵌 XMP。
     static func setDescription(to u: URL, note: String, backupDir: URL) throws -> WriteOutcome {
-        let fm = FileManager.default
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+
+        return try writeDescription(to: u, note: note, backupDir: backupDir)
+    }
+
+    static func setDescriptionIfEmpty(to u: URL, note: String, backupDir: URL) throws -> Bool {
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+        guard snapshot(u).description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        _ = try writeDescription(to: u, note: note, backupDir: backupDir)
+        return true
+    }
+
+    private static func writeDescription(to u: URL, note: String, backupDir: URL) throws -> WriteOutcome {
         let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before-desc.xmp")
-        let sc = sidecar(u)
-
-        if isJPEG(u) {
-            let data = try Data(contentsOf: u)
-            let embedded = embeddedXMP(data)
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            var originals: [String] = []
-            if let e = embedded { originals.append("EMBEDDED\n" + e) }
-            if let s = side { originals.append("SIDECAR\n" + s) }
-            if !originals.isEmpty { try writeBackupIfMissing(originals.joined(separator: "\n---\n"), to: backup) }
-
-            let xmp = try descriptionOnlyXMP(existing: embedded ?? side, note: note)
-            let newData = try injectXMP(into: data, xmp: xmp)
-            try newData.write(to: u, options: .atomic)
-            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
-            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: "说明")
+        return try writeMetadata(to: u, backup: backup, note: "说明") {
+            try descriptionOnlyXMP(existing: $0, note: note)
         }
-
-        if isRAW(u) {
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            if let s = side { try writeBackupIfMissing(s, to: backup) }
-            let xmp = try descriptionOnlyXMP(existing: side, note: note)
-            try xmp.write(to: sc, atomically: true, encoding: .utf8)
-            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: "说明")
-        }
-
-        throw MetaError.unsupportedFormat(u.pathExtension)
     }
 
     // MARK: - 鸟种标签（追加在 xmp:Label 判定词之后）
@@ -443,11 +461,7 @@ enum MetadataWriter {
     }
 
     private static func birdOnlyXMP(existing: String?, bird: String?) throws -> String {
-        guard let existing, !existing.isEmpty,
-              let data = existing.data(using: .utf8),
-              let doc = try? XMLDocument(data: data, options: []),
-              let root = doc.rootElement(),
-              let desc = firstDescription(root) else {
+        guard let existing else {
             let value = bird.map { xmlEscape($0) } ?? ""
             let label = bird.map { "  <xmp:Label>\(xmlEscape($0))</xmp:Label>\n" } ?? ""
             let birdLine = bird.map { _ in "  <kf:BirdSpecies>\(value)</kf:BirdSpecies>\n" } ?? ""
@@ -464,18 +478,14 @@ enum MetadataWriter {
             \(packetEnd)
             """
         }
+        let (root, desc) = try parseForWriting(existing)
         ensureNS(desc, "xmp", "http://ns.adobe.com/xap/1.0/")
         ensureNS(desc, "kf", birdNamespace)
         let oldBird = child(desc, "BirdSpecies")?.stringValue
-        let kept = updatedBirdLabel(current: child(desc, "Label")?.stringValue,
+        let labels = xmpNodes("Label", in: root)
+        let kept = updatedBirdLabel(current: labelParts(in: labels).joined(separator: birdSeparator),
                                     oldBird: oldBird, newBird: bird)
-        if let labelNode = child(desc, "Label") {
-            if let kept { labelNode.stringValue = kept } else { detach(labelNode) }
-        } else if let kept {
-            let l = XMLElement(name: "xmp:Label")
-            l.stringValue = kept
-            desc.addChild(l)
-        }
+        updateLabel(kept, nodes: labels, description: desc)
         if let bird, !bird.isEmpty {
             let e = child(desc, "BirdSpecies") ?? {
                 let n = XMLElement(name: "kf:BirdSpecies")
@@ -491,35 +501,14 @@ enum MetadataWriter {
 
     /// 只写鸟种标签：判定词、说明、关键词、星级全部保留。bird=nil 清除本软件写的鸟种。
     static func setBirdLabel(to u: URL, bird: String?, backupDir: URL) throws -> WriteOutcome {
-        let fm = FileManager.default
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+
         let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before-bird.xmp")
-        let sc = sidecar(u)
-        let note = bird.map { "鸟种标签 \($0)" } ?? "清除鸟种标签"
-
-        if isJPEG(u) {
-            let data = try Data(contentsOf: u)
-            let embedded = embeddedXMP(data)
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            var originals: [String] = []
-            if let e = embedded { originals.append("EMBEDDED\n" + e) }
-            if let s = side { originals.append("SIDECAR\n" + s) }
-            if !originals.isEmpty { try writeBackupIfMissing(originals.joined(separator: "\n---\n"), to: backup) }
-            let xmp = try birdOnlyXMP(existing: embedded ?? side, bird: bird)
-            let newData = try injectXMP(into: data, xmp: xmp)
-            try newData.write(to: u, options: .atomic)
-            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
-            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: note)
+        return try writeMetadata(to: u, backup: backup, note: bird.map { "鸟种标签 \($0)" } ?? "清除鸟种标签") {
+            try birdOnlyXMP(existing: $0, bird: bird)
         }
-
-        if isRAW(u) {
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            if let s = side { try writeBackupIfMissing(s, to: backup) }
-            let xmp = try birdOnlyXMP(existing: side, bird: bird)
-            try xmp.write(to: sc, atomically: true, encoding: .utf8)
-            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: note)
-        }
-
-        throw MetaError.unsupportedFormat(u.pathExtension)
     }
 
     // MARK: - JPEG 字节级写入（不重新编码图像数据）
@@ -532,41 +521,14 @@ enum MetadataWriter {
         guard segLen <= 0xFFFF else { throw MetaError.xmpTooLarge }
         let segment: [UInt8] = [0xFF, 0xE1, UInt8(segLen >> 8), UInt8(segLen & 0xFF)] + payload
 
-        var i = 2
-        var replace: Range<Int>?
-        var insertAt: Int?
-        while i + 3 < b.count {
-            if b[i] != 0xFF { break }
-            let m = b[i + 1]
-            if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) { i += 2; continue }
-            if m == 0xDA || m == 0xD9 { break }
-            let len = (Int(b[i + 2]) << 8) | Int(b[i + 3])
-            if len < 2 { break }
-            let end = i + 2 + len
-            if end > b.count { break }
-            if m == 0xE1 {
-                let ps = i + 4
-                if end - ps >= headerBytes.count,
-                   Array(b[ps..<(ps + headerBytes.count)]) == headerBytes {
-                    replace = i..<end
-                }
-            }
-            if insertAt == nil && m != 0xE0 { insertAt = i }
-            i = end
-        }
-
-        var out: [UInt8] = []
-        if let r = replace {
-            out += b[0..<r.lowerBound]
-            out += segment
-            out += b[r.upperBound..<b.count]
-        } else {
-            let at = insertAt ?? 2
-            out += b[0..<at]
-            out += segment
-            out += b[at..<b.count]
-        }
-        return Data(out)
+        let location = try jpegXMPLocation(b)
+        let range = location.packet ?? (location.insertAt..<location.insertAt)
+        var out = Data()
+        out.reserveCapacity(b.count - range.count + segment.count)
+        out.append(contentsOf: b[..<range.lowerBound])
+        out.append(contentsOf: segment)
+        out.append(contentsOf: b[range.upperBound...])
+        return out
     }
 
     /// 写入前先做一次备份快照，返回备份文件路径；出错时不改动任何文件。
@@ -576,38 +538,54 @@ enum MetadataWriter {
     /// 已有备份时不覆盖——永远保留第一次写入前的原始状态（2026-11-20 用户要求）。
     static func apply(to u: URL, reason: String, labelColor: String?,
                       backupDir: URL, rating: Int? = nil) throws -> WriteOutcome {
-        let note = makeNote(reason)
-        let sc = sidecar(u)
-        let fm = FileManager.default
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+
         let backup = backupDir.appendingPathComponent(u.lastPathComponent + ".before.xmp")
-        var originals: [String] = []
-
-        if isJPEG(u) {
-            let data = try Data(contentsOf: u)
-            let embedded = embeddedXMP(data)
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            if let e = embedded { originals.append("EMBEDDED\n" + e) }
-            if let s = side { originals.append("SIDECAR\n" + s) }
-            if !originals.isEmpty { try writeBackupIfMissing(originals.joined(separator: "\n---\n"), to: backup) }
-
-            let xmp = try mergedXMP(existing: embedded ?? side, note: note,
-                                    labelColor: labelColor, rating: rating)
-            let newData = try injectXMP(into: data, xmp: xmp)
-            try newData.write(to: u, options: .atomic)
-            if side != nil { try xmp.write(to: sc, atomically: true, encoding: .utf8) }
-            return WriteOutcome(fileName: u.lastPathComponent, method: "JPG 内嵌 XMP", note: note)
+        return try writeMetadata(to: u, backup: backup, note: makeNote(reason)) {
+            try mergedXMP(existing: $0, note: makeNote(reason), labelColor: labelColor, rating: rating)
         }
+    }
 
-        if isRAW(u) {
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            if let s = side { try writeBackupIfMissing(s, to: backup) }
-            let xmp = try mergedXMP(existing: side, note: note,
-                                    labelColor: labelColor, rating: rating)
-            try xmp.write(to: sc, atomically: true, encoding: .utf8)
-            return WriteOutcome(fileName: u.lastPathComponent, method: "同名 .xmp 侧车", note: note)
+    private static func readSidecar(_ url: URL) throws -> String? {
+        do { return try String(contentsOf: url, encoding: .utf8) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+    }
+
+    private static func writeMetadata(to url: URL, backup: URL, note: String,
+                                      update: (String?) throws -> String) throws -> WriteOutcome {
+        guard isSupported(url) else { throw MetaError.unsupportedFormat(url.pathExtension) }
+        let sc = sidecar(url)
+        let side = try readSidecar(sc)
+        if isJPEG(url) {
+            let original = try Data(contentsOf: url)
+            let embedded = try readEmbeddedXMP(original)
+            let updated = try update(embedded ?? side)
+            let updatedSide = try side.map { try update($0) }
+            let photo = try injectXMP(into: original, xmp: updated)
+            try backupJPEG(embedded: embedded, side: side, to: backup)
+            try writeJPEG(photo, original: original, to: url, side: updatedSide)
+            return WriteOutcome(fileName: url.lastPathComponent, method: "JPG 内嵌 XMP", note: note)
         }
+        let updated = try update(side)
+        if let side { try writeBackupIfMissing(side, to: backup) }
+        try updated.write(to: sc, atomically: true, encoding: .utf8)
+        return WriteOutcome(fileName: url.lastPathComponent, method: "同名 .xmp 侧车", note: note)
+    }
 
-        throw MetaError.unsupportedFormat(u.pathExtension)
+    private static func backupJPEG(embedded: String?, side: String?, to backup: URL) throws {
+        let originals = [embedded.map { "EMBEDDED\n" + $0 }, side.map { "SIDECAR\n" + $0 }].compactMap { $0 }
+        if !originals.isEmpty { try writeBackupIfMissing(originals.joined(separator: "\n---\n"), to: backup) }
+    }
+
+    private static func writeJPEG(_ photo: Data?, original: Data, to url: URL, side: String?) throws {
+        if let photo { try photo.write(to: url, options: .atomic) }
+        do { try side?.write(to: sidecar(url), atomically: true, encoding: .utf8) }
+        catch {
+            if photo != nil { try original.write(to: url, options: .atomic) }
+            throw error
+        }
     }
 
     /// 备份原始元数据：**已存在时不覆盖**——永远保留第一次写入前的原始状态，
@@ -615,7 +593,11 @@ enum MetadataWriter {
     private static func writeBackupIfMissing(_ content: String, to url: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard !fm.fileExists(atPath: url.path) else { return }
+        var directory: ObjCBool = false
+        if fm.fileExists(atPath: url.path, isDirectory: &directory) {
+            if directory.boolValue { throw CocoaError(.fileWriteFileExists) }
+            return
+        }
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
@@ -640,10 +622,7 @@ enum MetadataWriter {
     /// 在已有 XMP 上清除本软件标记：说明/Instructions 里删掉本软件的段落，
     /// 标签若是本软件写的判定词则整个移除。没有任何本软件标记时返回 nil（无需写回）。
     private static func cleanedXMP(existing: String) throws -> String? {
-        guard let data = existing.data(using: .utf8),
-              let doc = try? XMLDocument(data: data, options: []),
-              let root = doc.rootElement(),
-              let desc = firstDescription(root) else { throw MetaError.xmpUnreadable }
+        let (root, desc) = try parseForWriting(existing)
 
         var changed = false
 
@@ -672,27 +651,18 @@ enum MetadataWriter {
             }
         }
 
-        // 鸟种段先精确摘除，判定词段随后按 ownedLabels 摘除；用户自己的标签原样保留。
-        if let birdNode = child(desc, "BirdSpecies") {
-            let oldBird = birdNode.stringValue
-            if let l = child(desc, "Label") {
-                if let kept = updatedBirdLabel(current: l.stringValue, oldBird: oldBird, newBird: nil) {
-                    if kept != (l.stringValue ?? "") { l.stringValue = kept; changed = true }
-                } else {
-                    detach(l)
-                    changed = true
-                }
-            }
-            detach(birdNode)
+        let labels = xmpNodes("Label", in: root)
+        let parts = labelParts(in: labels)
+        let birdNode = child(desc, "BirdSpecies")
+        let kept = parts.filter { $0 != birdNode?.stringValue && !ownedLabels.contains($0) }
+        if kept != parts {
+            updateLabel(kept.isEmpty ? nil : kept.joined(separator: birdSeparator),
+                        nodes: labels, description: desc)
             changed = true
         }
-        if let l = child(desc, "Label") {
-            let parts = labelParts(l.stringValue)
-            let kept = parts.filter { !ownedLabels.contains($0) }
-            if kept.count != parts.count {
-                if kept.isEmpty { detach(l) } else { l.stringValue = kept.joined(separator: birdSeparator) }
-                changed = true
-            }
+        if let birdNode {
+            detach(birdNode)
+            changed = true
         }
 
         guard changed else { return nil }
@@ -704,39 +674,28 @@ enum MetadataWriter {
     /// 有标记时先备份（沿用「已有备份不覆盖」规则）再写回。JPG 内嵌 + 侧车都清。
     static func cleanup(to u: URL, backupDir: URL) throws
         -> (fileName: String, method: String, removed: Bool) {
-        let fm = FileManager.default
+        let lock = writeLock(for: u)
+        lock.lock()
+        defer { lock.unlock() }
+
         let sc = sidecar(u)
+        let side = try readSidecar(sc)
 
         if isJPEG(u) {
             let data = try Data(contentsOf: u)
-            let embedded = embeddedXMP(data)
-            let side = fm.fileExists(atPath: sc.path) ? try? String(contentsOf: sc, encoding: .utf8) : nil
-            guard embedded != nil || side != nil else {
-                return (u.lastPathComponent, "JPG 内嵌 XMP", false)
-            }
-            var changed = false
-            var newData = data
-            if let e = embedded, let cleaned = try cleanedXMP(existing: e) {
-                newData = try injectXMP(into: data, xmp: cleaned)
-                changed = true
-            }
-            if let s = side, let cleaned = try cleanedXMP(existing: s) {
-                try cleaned.write(to: sc, atomically: true, encoding: .utf8)
-                changed = true
-            }
-            guard changed else { return (u.lastPathComponent, "JPG 内嵌 XMP", false) }
-            var originals: [String] = []
-            if let e = embedded { originals.append("EMBEDDED\n" + e) }
-            if let s = side { originals.append("SIDECAR\n" + s) }
-            try writeBackupIfMissing(originals.joined(separator: "\n---\n"),
-                                     to: backupDir.appendingPathComponent(u.lastPathComponent + ".before.xmp"))
-            try newData.write(to: u, options: .atomic)
+            let embedded = try readEmbeddedXMP(data)
+            let newPhoto = try embedded.flatMap { try cleanedXMP(existing: $0) }
+                .map { try injectXMP(into: data, xmp: $0) }
+            let newSide = try side.flatMap { try cleanedXMP(existing: $0) }
+            guard newPhoto != nil || newSide != nil else { return (u.lastPathComponent, "JPG 内嵌 XMP", false) }
+            try backupJPEG(embedded: embedded, side: side,
+                           to: backupDir.appendingPathComponent(u.lastPathComponent + ".before.xmp"))
+            try writeJPEG(newPhoto, original: data, to: u, side: newSide)
             return (u.lastPathComponent, "JPG 内嵌 XMP", true)
         }
 
         if isRAW(u) {
-            guard fm.fileExists(atPath: sc.path),
-                  let s = try? String(contentsOf: sc, encoding: .utf8), !s.isEmpty else {
+            guard let s = side else {
                 return (u.lastPathComponent, "同名 .xmp 侧车", false)
             }
             guard let cleaned = try cleanedXMP(existing: s) else {

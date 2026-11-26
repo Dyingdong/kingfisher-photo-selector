@@ -5,8 +5,8 @@ import ImageIO
 
 /// 对焦点处的语义判断结果。只用于「题材自动识别」，不改变原有的合焦判定与评分。
 /// 所有结论都带一句可供人核对的依据（识别到什么 + 置信度），识别不出来就明确说没认出来。
-struct FocusSemantics {
-    enum Kind: String {
+struct FocusSemantics: Codable {
+    enum Kind: String, Codable {
         case face       // 对焦点处识别到人脸
         case bird       // 对焦点处识别到鸟 / 鸟的身体部位
         case nonBird    // 对焦点处识别到明确的其他东西（水面、山、建筑等）
@@ -488,16 +488,16 @@ enum FocusSemanticsEngine {
 
     /// 从 RAW/JPG 载入缩略图后检测。供 Store 异步调用。
     /// subjectBoxes 为主体检测框（归一化、左下原点），用于对焦点没认出鸟时的交叉复核。
-    static func detect(url: URL, subjectBoxes: [CGRect] = []) -> FocusSemantics? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    static func detect(url: URL, subjectBoxes: [CGRect] = [],
+                       source: CGImageSource? = nil, metadata: (() -> (AFInfo?, ExifInfo?))? = nil) -> FocusSemantics? {
+        guard let src = source ?? CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: 2048
         ]
         guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
-        let af = AFReader.read(url)
-        let exif = ExifInfo.read(url)
+        let (af, exif) = metadata?() ?? (AFReader.read(url), ExifInfo.read(url))
         return detect(image: img, af: af, subjectBoxes: subjectBoxes,
                       telephoto: isTelephoto(exif))
     }

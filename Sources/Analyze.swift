@@ -117,14 +117,18 @@ enum Analyzer {
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
 
-    static func decode(_ url: URL, maxSide: Int = 1200) -> (pixels: [UInt8], w: Int, h: Int, image: CGImage)? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let opts: [CFString: Any] = [
+    static func thumbnail(_ source: CGImageSource, maxSide: Int) -> CGImage? {
+        let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: maxSide,
             kCGImageSourceCreateThumbnailWithTransform: true
         ]
-        guard let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
+    static func decode(_ url: URL, maxSide: Int = 1200, source: CGImageSource? = nil) -> (pixels: [UInt8], w: Int, h: Int, image: CGImage)? {
+        guard let src = source ?? CGImageSourceCreateWithURL(url as CFURL, nil),
+              let thumb = thumbnail(src, maxSide: maxSide) else { return nil }
         let w = thumb.width, h = thumb.height
         guard w > 0, h > 0 else { return nil }
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
@@ -180,8 +184,9 @@ enum Analyzer {
         return max(gx, gy) / max(min(gx, gy), 1e-6)
     }
 
-    static func analyze(_ url: URL, preferFaces: Bool = false) -> PhotoMetrics? {
-        guard let d = decode(url) else { return nil }
+    static func analyze(_ url: URL, preferFaces: Bool = false, source: CGImageSource? = nil,
+                        previewMaxSide: Int? = nil) -> PhotoMetrics? {
+        guard let d = decode(url, source: source) else { return nil }
         let bs = block
         let cols = d.w / bs, rows = d.h / bs
         guard cols >= 2, rows >= 2 else { return nil }
@@ -227,6 +232,21 @@ enum Analyzer {
         let centerScore = centerBlocks.isEmpty ? hi : percentile(centerBlocks, 0.5)
         let centerRatio = centerScore / max(hi, 1e-6)
 
+        // 批量筛选仅需列表小图。报告导出等调用方仍可使用完整分析图。
+        let preview: CGImage?
+        if let side = previewMaxSide, max(d.w, d.h) > side {
+            let scale = Double(side) / Double(max(d.w, d.h))
+            let w = max(1, Int((Double(d.w) * scale).rounded()))
+            let h = max(1, Int((Double(d.h) * scale).rounded()))
+            let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            ctx?.interpolationQuality = .high
+            ctx?.draw(d.image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            preview = ctx?.makeImage()
+        } else {
+            preview = d.image
+        }
         return PhotoMetrics(
             url: url, globalHi: hi, peakBlock: scores.max() ?? hi, subjectScore: s,
             ratio: s / max(hi, 1e-6), centerRatio: centerRatio,
@@ -236,7 +256,7 @@ enum Analyzer {
             subjectReblur: subjectReblur,
             scores: scores, blurScores: bScores, cols: cols, rows: rows,
             weights: region.weights, subjectSource: region.source,
-            bboxes: region.bboxes, preview: d.image,
+            bboxes: region.bboxes, preview: preview,
             width: d.w, height: d.h
         )
     }

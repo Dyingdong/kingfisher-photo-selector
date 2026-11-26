@@ -30,7 +30,6 @@ enum BirdLog {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("Kingfisher-PhotoSelector")
         guard let base else { return nil }
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent(fileName)
     }
 
@@ -41,7 +40,10 @@ enum BirdLog {
         let line = (String(data: data, encoding: .utf8) ?? "") + "\n"
         let primary = url(in: folder)
         if write(line: line, to: primary) { return primary }
-        if let fallback = fallbackURL(), write(line: line, to: fallback) { return fallback }
+        if let fallback = fallbackURL() {
+            try? FileManager.default.createDirectory(at: fallback.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if write(line: line, to: fallback) { return fallback }
+        }
         return nil
     }
 
@@ -61,12 +63,15 @@ enum BirdLog {
 
     static func load(in folder: URL) -> [BirdRecord] {
         var records: [BirdRecord] = []
-        for u in [url(in: folder), fallbackURL()].compactMap({ $0 }) {
+        let primary = url(in: folder)
+        var sources = [primary]
+        if let fallback = fallbackURL(), fallback.path != primary.path { sources.append(fallback) }
+        for u in sources {
             guard let text = try? String(contentsOf: u, encoding: .utf8) else { continue }
             for line in text.split(separator: "\n") {
                 guard let d = line.data(using: .utf8),
                       let r = try? JSONDecoder().decode(BirdRecord.self, from: d) else { continue }
-                records.append(r)
+                if u == primary || URL(fileURLWithPath: r.root).standardizedFileURL.path == folder.standardizedFileURL.path { records.append(r) }
             }
         }
         return records

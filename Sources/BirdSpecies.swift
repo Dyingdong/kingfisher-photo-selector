@@ -30,6 +30,13 @@ enum BirdSpeciesEngine {
     // 模型约 580MB，首次加载实测 5～6 秒。预热与按需加载可能同时发生，
     // 用锁串行化：后到的调用等第一次加载完直接复用，绝不重复读两遍模型。
     private static let loadLock = NSLock()
+    /// 状态查询锁：只保护下面的两个 Bool，**绝不在持锁期间加载模型**。
+    /// 2026-11-25 修复「用一会儿后界面卡死」：旧实现 isLoaded 直接抢 loadLock，
+    /// 主线程在模型加载的 5～6 秒里被阻塞（App 未响应 → 系统弹强制退出框）。
+    /// 现在主线程只读这把细粒度锁，持锁时间是纳秒级。
+    private static let stateLock = NSLock()
+    private static var stateLoaded = false
+    private static var stateLoading = false
     private static let featureDim = 768
     private static let inputName = "image"        // MLMultiArray [1,3,224,224]
     private static let outputName = "embedding"   // MLMultiArray [1,768]（未归一化）
@@ -52,10 +59,25 @@ enum BirdSpeciesEngine {
             && Bundle.main.url(forResource: "bioclip_labels", withExtension: "txt") != nil
     }
 
+    /// 非阻塞状态查询：主线程可安全调用，永远不会等模型加载完成。
     static var isLoaded: Bool {
-        loadLock.lock()
-        defer { loadLock.unlock() }
-        return model != nil
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stateLoaded
+    }
+
+    /// 模型是否正在加载（供 UI 判断阶段文案，同样不阻塞）。
+    static var isLoading: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stateLoading
+    }
+
+    private static func setState(loaded: Bool, loading: Bool) {
+        stateLock.lock()
+        stateLoaded = loaded
+        stateLoading = loading
+        stateLock.unlock()
     }
 
     @discardableResult
@@ -63,6 +85,8 @@ enum BirdSpeciesEngine {
         loadLock.lock()
         defer { loadLock.unlock() }
         guard model == nil else { return true }
+        setState(loaded: false, loading: true)
+        defer { setState(loaded: model != nil, loading: false) }
         guard available,
               let url = Bundle.main.url(forResource: "BioCLIPImage", withExtension: "mlmodelc"),
               let m = try? MLModel(contentsOf: url, configuration: MLModelConfiguration()),
@@ -99,6 +123,7 @@ enum BirdSpeciesEngine {
         model = nil
         species = []
         textFeatures = []
+        setState(loaded: false, loading: false)
     }
 
     /// 识别一张图，返回相似度降序 Top-3。nil = 模型没加载或推理失败。

@@ -4,7 +4,7 @@ import Foundation
 /// 数据来自项目内自带的 exiftool（Tools/exiftool），不依赖用户系统安装。
 /// 目前支持 Canon（AFInfo：AFPointsInFocus / AFAreaXPositions 等）；
 /// 其他品牌或 DNG 代理没有这些字段时返回 nil，界面会明确标注"无数据"。
-struct FocusPoint {
+struct FocusPoint: Codable {
     /// 归一化坐标，原点在画面左上，x 右为正、y 下为正，取值 0~1。
     let cx: Double
     let cy: Double
@@ -13,7 +13,7 @@ struct FocusPoint {
     let h: Double
 }
 
-struct AFInfo {
+struct AFInfo: Codable {
     let mode: Int                 // exiftool 的 AFAreaMode 数值
     let modeName: String
     let validPoints: Int
@@ -60,32 +60,45 @@ enum AFReader {
     }
 
     static func read(_ url: URL) -> AFInfo? {
-        guard let exe = exiftoolURL() else { return nil }
-        guard let perl = executablePath("perl") else { return nil }
+        readBatch([url])[url.path]
+    }
+
+    static func readBatch(_ urls: [URL]) -> [String: AFInfo] {
+        guard !urls.isEmpty else { return [:] }
+        guard let exe = exiftoolURL() else { return [:] }
+        guard let perl = executablePath("perl") else { return [:] }
         // Perl 对非 ASCII 的脚本路径会解析失败（App 路径含中文），
         // 因此把 exiftool 脚本复制到一个纯 ASCII 的临时路径再执行。
-        guard let stage = stageExiftool(exe) else { return nil }
+        guard let stage = stageExiftool(exe) else { return [:] }
 
         let tags = ["AFImageWidth", "AFImageHeight", "NumAFPoints", "ValidAFPoints",
                     "AFAreaWidths", "AFAreaHeights", "AFAreaXPositions",
                     "AFAreaYPositions", "AFPointsInFocus", "AFAreaMode"]
         var args = [stage.script, "-a", "-G1", "-n", "-j"]
         args += tags.map { "-" + $0 }
-        args.append(url.path)
+        args += urls.map(\.path)
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: perl)
         task.arguments = args
-        let out = Pipe(), err = Pipe()
+        let out = Pipe()
         task.standardOutput = out
-        task.standardError = err
-        do { try task.run() } catch { return nil }
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return [:] }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
-        guard task.terminationStatus == 0,
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              let d = arr.first else { return nil }
+        guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [:] }
+        var result: [String: AFInfo] = [:]
+        for row in rows {
+            guard let path = row["SourceFile"] as? String,
+                  row.keys.allSatisfy({ $0 != "Error" && !$0.hasSuffix(":Error") }) else { continue }
+            result[path] = parse(row)
+        }
+        return result
+    }
 
+    private static func parse(_ d: [String: Any]) -> AFInfo {
         // 只要 Canon 组（Track4 是同一份数据的重复）
         func val(_ key: String) -> Any? { d["Canon:" + key] ?? d[key] }
         func number(_ key: String) -> Int? {
@@ -131,9 +144,13 @@ enum AFReader {
                       points: pts, imageWidth: iw, imageHeight: ih)
     }
 
+    private static let exiftoolStageLock = NSLock()
+
     /// 把 exiftool 脚本和 lib 准备到纯 ASCII 的临时目录，规避 Perl 对中文路径的解析问题。
     /// exiftool 用脚本所在目录/lib 找模块，所以这里在同级建一个 lib 符号链接。
     private static func stageExiftool(_ original: URL) -> (script: String, dir: URL)? {
+        exiftoolStageLock.lock()
+        defer { exiftoolStageLock.unlock() }
         let fm = FileManager.default
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("fs_af_exiftool", isDirectory: true)

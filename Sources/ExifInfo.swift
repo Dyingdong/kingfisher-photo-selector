@@ -3,7 +3,7 @@ import ImageIO
 
 /// 照片的基础拍摄参数（EXIF）。相机/镜头来自 TIFF 与 EXIF 字典，
 /// ISO 兼容 CR3 的 ISOSpeed 与 DNG 的 ISOSpeedRatings 两种写法。
-struct ExifInfo {
+struct ExifInfo: Codable {
     let camera: String?
     let lens: String?
     let iso: String?
@@ -106,8 +106,8 @@ struct ExifInfo {
         return parts.joined(separator: " · ")
     }
 
-    static func read(_ url: URL) -> ExifInfo? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+    static func read(_ url: URL, source: CGImageSource? = nil) -> ExifInfo? {
+        guard let src = source ?? CGImageSourceCreateWithURL(url as CFURL, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any]
         else { return nil }
         let exif = props["{Exif}"] as? [String: Any] ?? [:]

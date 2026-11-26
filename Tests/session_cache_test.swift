@@ -88,6 +88,111 @@ struct SessionCacheTest {
             check(false, "重建 metrics 失败")
         }
 
+        var invalid = c
+        invalid.blurScores.removeLast()
+        check(SessionCache.metrics(from: invalid, url: imgURL, decodePreview: false) == nil,
+              "缺分块的缓存被拒绝")
+        invalid = c
+        invalid.cols = Int.max
+        check(SessionCache.metrics(from: invalid, url: imgURL, decodePreview: false) == nil,
+              "网格尺寸溢出的缓存被拒绝")
+
+        // —— v1 兼容：老 log（version=1、无信息字段）必须可读，新字段解码为 nil ——
+        // 行为退回现状（按需现算），补算后回写 v2。写入时把信息字段显式置 nil，
+        // 模拟老版本保存的 JSON 键缺失（Codable 解码缺失键 = nil）。
+        var v1 = snap
+        v1.version = 1
+        v1.photos[0].wb = nil
+        v1.photos[0].af = nil
+        v1.photos[0].exif = nil
+        v1.photos[0].focus = nil
+        v1.photos[0].human = nil
+        v1.photos[0].ai = nil
+        v1.photos[0].rating = nil
+        if let d1 = try? JSONEncoder().encode(v1) {
+            try! d1.write(to: SessionCache.cacheFile(for: folder))
+            if let old1 = SessionCache.load(folder: folder) {
+                check(old1.version == 1, "v1 旧缓存可读（version 往返）")
+                check(old1.photos[0].rating == nil && old1.photos[0].wb == nil
+                      && old1.photos[0].af == nil && old1.photos[0].exif == nil
+                      && old1.photos[0].focus == nil && old1.photos[0].human == nil
+                      && old1.photos[0].ai == nil, "v1 缺失信息字段解码为 nil")
+            } else {
+                check(false, "v1 旧缓存可读")
+            }
+        } else {
+            check(false, "v1 快照可编码")
+        }
+
+        // —— v2 信息字段往返：WB/AF/EXIF/Focus/Human/AI/Rating 全字段 ——
+        let info = [imgURL: PhotoInfoSnapshot(
+            wb: WhiteBalanceStats(meanR: 131.4, meanG: 128.2, meanB: 120.9,
+                                  wholeCast: "偏暖（R 高于 B）", faceCast: "接近中性",
+                                  faceRG: 1.01, faceBG: 0.97, highlightClip: 0.031,
+                                  shadowClip: 0.052),
+            af: AFInfo(mode: 2, modeName: "单点对焦", validPoints: 1, totalPoints: 525,
+                       points: [FocusPoint(cx: 0.51, cy: 0.48, w: 0.02, h: 0.02)],
+                       imageWidth: 6000, imageHeight: 4000),
+            exif: ExifInfo(camera: "Canon EOS R7", lens: "RF 100-500", iso: "3200",
+                           shutter: "1/2000s", aperture: "f/9", focalLength: "500mm",
+                           exposureBias: "+0.3EV", dateTime: "2026-11-20 10:12",
+                           flash: "未闪光", whiteBalance: "自动", metering: "评价/矩阵",
+                           exposureMode: "手动"),
+            focus: FocusSemantics(kind: .bird, reason: "对焦点处识别到：鹭 (63%)",
+                                  labels: ["heron 63%"]),
+            human: HumanPresence(hasPerson: false, isMainSubject: false, count: 0,
+                                 bodyHeightRatio: 0, reason: "未检测到人"),
+            ai: AISubject(kind: .bird, reason: "前景主体是鸟", labels: ["bird 88%"]),
+            rating: 4)]
+        SessionCache.save(folder: folder, sensitivity: 1.25, anchorHi: 900.0, hiMin: 500.0,
+                          excluded: [imgURL], results: [r], metrics: [m],
+                          selectionRects: [imgURL: CGRect(x: 0.05, y: 0.06, width: 0.5, height: 0.6)],
+                          genreOverride: [imgURL: .bird], info: info)
+        if let snap2 = SessionCache.load(folder: folder) {
+            check(snap2.version == SessionCache.version, "v2 保存后 version 为当前值")
+            let c2 = snap2.photos[0]
+            check(c2.rating == 4, "星级往返")
+            check(c2.wb?.meanR == 131.4 && c2.wb?.wholeCast == "偏暖（R 高于 B）"
+                  && c2.wb?.faceRG == 1.01, "白平衡统计往返")
+            check(c2.af?.modeName == "单点对焦" && c2.af?.points.count == 1
+                  && c2.af?.points.first?.cx == 0.51, "对焦点信息往返")
+            check(c2.exif?.iso == "3200" && c2.exif?.shutter == "1/2000s"
+                  && c2.exif?.camera == "Canon EOS R7", "EXIF 往返")
+            check(c2.focus?.kind == .bird && c2.focus?.reason.contains("鹭") == true,
+                  "对焦点语义往返（枚举+文本）")
+            check(c2.human?.hasPerson == false, "人体检测往返")
+            check(c2.ai?.kind == .bird && c2.ai?.labels == ["bird 88%"], "AI 主体往返")
+        } else {
+            check(false, "v2 信息字段快照可读回")
+        }
+
+        // 父目录恢复、子日志重定位、旧日志重名拒配。
+        let a = folder.appendingPathComponent("A/IMG.CR3")
+        let b = folder.appendingPathComponent("B/IMG.CR3")
+        var dual = snap
+        var first = c, second = c
+        first.file = "A/IMG.CR3"; first.rating = 2
+        second.file = "B/IMG.CR3"; second.rating = 5
+        dual.photos = [first, second]
+        dual.excludedFiles = [second.file]
+        let restored = SessionCache.matched(dual, source: folder, folder: folder, files: [a, b])
+        check(restored?.photos.first { $0.file == first.file }?.rating == 2 &&
+              restored?.photos.first { $0.file == second.file }?.rating == 5, "子目录同名照片独立恢复")
+        let child = b.deletingLastPathComponent()
+        let subset = SessionCache.matched(dual, source: folder, folder: child, files: [b])
+        check(subset?.photos.first?.file == "IMG.CR3" && subset?.excludedFiles == ["IMG.CR3"],
+              "读取父日志时重定位路径与排除项")
+        dual.version = 2
+        first.file = "IMG.CR3"; second.file = first.file
+        dual.photos = [first, second]
+        check(SessionCache.matched(dual, source: folder, folder: folder, files: [a, b]) == nil,
+              "老日志重复记录拒配")
+        dual.photos = [first]
+        check(SessionCache.matched(dual, source: folder, folder: folder, files: [a, b]) == nil,
+              "老日志遇到磁盘同名照片拒配")
+        let rebased = SessionCache.matched(dual, source: child, folder: folder, files: [a, b])
+        check(rebased?.photos.first?.file == "B/IMG.CR3", "老子日志唯一匹配迁入父目录")
+
         // version 不符的旧缓存要拒载
         var old = snap
         old.version = 999
