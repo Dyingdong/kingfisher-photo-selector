@@ -52,6 +52,9 @@ SRC=(
 GUI_EXTRA=(
     "$ROOT/Sources/BirdSpecies.swift"
     "$ROOT/Sources/BirdLog.swift"
+    "$ROOT/App/Comparison/BurstIndex.swift"
+    "$ROOT/App/Comparison/ComparisonWorkspace.swift"
+    "$ROOT/App/Comparison/ComparisonKeys.swift"
 )
 FLAGS=(-O -swift-version 5 -target arm64-apple-macosx13.0)
 

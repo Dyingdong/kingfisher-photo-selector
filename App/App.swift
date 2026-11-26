@@ -320,7 +320,7 @@ extension Analyzer {
 /// 目录结构：App Support/Kingfisher-PhotoSelector/PreviewCache/<文件夹路径哈希>/
 /// 文件名 = <照片名>-<源文件 mtime>-<源文件 size>.jpg——源文件重新分析/被替换后
 /// mtime/size 变化，文件名自然指向新文件，旧 stamp 文件在生成时顺手清理。
-private enum MidPreviewCache {
+enum MidPreviewCache {
     static let jpegQuality: CGFloat = 0.9
     static let maxSideCap = 3840
     static let minSideFloor = 1600
@@ -4478,8 +4478,14 @@ private struct DragBoxOverlay: View {
 
     var body: some View {
         if let s = box.start, let c = box.current {
-            Rectangle().stroke(box.isZoom ? Color.white : Color.yellow, lineWidth: 2)
-                .background((box.isZoom ? Color.white : Color.yellow).opacity(0.12))
+            Group {
+                if box.isZoom {
+                    Rectangle().stroke(.white, style: StrokeStyle(lineWidth: 1, dash: [4]))
+                } else {
+                    Rectangle().stroke(.yellow, lineWidth: 2)
+                        .background(Color.yellow.opacity(0.12))
+                }
+            }
                 .frame(width: abs(c.x - s.x), height: abs(c.y - s.y))
                 .position(x: (s.x + c.x) / 2, y: (s.y + c.y) / 2)
         }
@@ -5832,6 +5838,11 @@ struct ContentView: View {
                 .onPreferenceChange(ListViewportHeightKey.self) { h in
                     store.listViewportHeight = h
                 }
+                .onAppear {
+                    if let id = store.selected, store.shownContains(id) {
+                        proxy.scrollTo(id)
+                    }
+                }
                 .onChange(of: store.selected) { id in
                     guard let id, store.shownContains(id) else { return }
                     // Shift 区间多选：只有选中到可视边缘才滚动（露出下方/上方
@@ -6127,12 +6138,6 @@ struct ContentView: View {
                 """)
             }
         }
-        // 退出软件前把最近一次已编码的判定快照落盘（绝不在 willTerminate 里现编码
-        // 845 张 v2 JSON——那是"退出时卡死"的直接原因）。
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSApplication.willTerminateNotification)) { _ in
-            store.saveSessionOnExit()
-        }
         .sheet(isPresented: $store.showShortcuts) {
             ShortcutsView().environmentObject(store)
         }
@@ -6243,6 +6248,7 @@ struct ContentView: View {
 
 @main
 struct KingfisherPhotoSelectorApp: App {
+    @NSApplicationDelegateAdaptor(ComparisonQuitDelegate.self) private var comparisonQuit
     @StateObject private var store = Store()
 
     init() {
@@ -6529,9 +6535,9 @@ struct KingfisherPhotoSelectorApp: App {
 
     var body: some Scene {
         WindowGroup("Kingfisher-PhotoSelector") {
-            ContentView().environmentObject(store)
+            PhotoWorkspaces().environmentObject(store)
         }
-        .defaultSize(width: 1060, height: 700)
+        .defaultSize(width: 1060, height: 740)
     }
 }
 
