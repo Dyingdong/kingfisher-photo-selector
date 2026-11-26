@@ -30,7 +30,7 @@ macOS 原生 SwiftUI 照片筛选软件：批量扫描 RAW 照片，用拉普拉
 
 - **每张照片独立判定**，不按批次找基准；固定阈值 `Analyzer.independentFloor = 400`（50 张 Canon 真值标定）
 - 灵敏度语义：严格 = 阈值×1.8、标准 = ×1.0、宽松 = ×0.6；拍鸟等小主体建议保持「标准」
-- **题材识别与主体清晰度判定/星级是两条独立的线**：改 `FocusSemantics` / `AISubject` / `Score.guessGenre` 不得影响 `Analyze.swift` 的清晰度判定与星级
+- **清晰度结论独立计算**。题材识别和对焦点与主体的重合度不改变 `Analyzer.classify` 的结论。综合评分由 `ScoreEngine` 负责，题材决定各项权重，对焦点与主体的关系可作为评分和解释依据
 - 对焦点优先读原始 CR3（内置 exiftool）；DNG 仅供参考
 - 判定文案用**主体清晰度体系（六档）**：主体清晰 / 焦点正常 / 主体偏软 / 整片偏软 / 主体拖影 / 景深不足（另有「无法解码」）；不用「通过 / 失焦」，也不用旧「合焦 / 未合焦」体系
 - **放行档分两级**：主体定位可信（前景分割/人脸）才判「主体清晰」；显著性区域/中心权重兜底时判「焦点正常」，原因注明主体清晰度仅供参考
@@ -38,7 +38,7 @@ macOS 原生 SwiftUI 照片筛选软件：批量扫描 RAW 照片，用拉普拉
 - **元数据不写任何关键词**（dc:subject 已停用，2026-11 起）：关键词会干扰用户已有的 Bridge 关键词体系；标签**直接写判定词到 xmp:Label**（2026-11-20 用户拍板，不写英文颜色值）：主体清晰/焦点正常/整片偏软/景深不足/主体偏软/主体拖影、无法解码不打；照片已有标签不覆盖。Bridge 按文本匹配标签名（共 5 槽位）显示颜色，对不上显示白标（映射见 `Verdict.bridgeLabel`，App/测试/文档共用这一处）
 - 人工圈选只参与单张重判，不改变核心判定阈值
 - **写入备份随照片放同目录**（2026-11-20 用户要求）：`<照片名>.before.xmp` / `.before-rating.xmp` / `.before-desc.xmp`；**已有备份不覆盖**——永远保留第一次写入前的原始状态；「打开写入前备份」按钮打开当前选中照片所在目录
-- **「清除本软件标记」只删自己的东西**：说明/Instructions 里含 ownedTags（[合焦质检]、[Kingfisher-PhotoSelector]、旧代标记）的行 + ownedLabels（判定词体系）标签；用户说明/关键词/星级/拒绝/手标一律不动；无标记照片不写文件；清除后切照片会因「切换时自动写说明」重写说明（开关可关，清除前建议先关）
+- **「清除本软件标记」只删自己的东西**：说明/Instructions 里含 ownedTags（[合焦质检]、[Kingfisher-PhotoSelector]、旧代标记）的行 + ownedLabels（判定词体系）标签；用户说明/关键词/星级/拒绝/手标一律不动；无标记照片不写文件。开启「导入时自动写说明」时，导入或恢复会话收尾阶段批量写入说明
 
 ## 题材识别（FocusSemantics / AISubject / Score.guessGenre）
 
@@ -53,19 +53,20 @@ macOS 原生 SwiftUI 照片筛选软件：批量扫描 RAW 照片，用拉普拉
 
 ## 交互红线（用户明确要求过，勿改回）
 
-- 信息区**无折叠**：不要加 DisclosureGroup
+- **判断依据详细数值默认折叠**（2026-11-25 要求）：仅 InfoView 的详细数值网格使用 DisclosureGroup，标题「展开看详细判别依据」。清晰判定、对焦点和失误提示等结论常显
 - 分隔条：当前是 AppKit 本地事件监听方案（`NSEvent.addLocalMonitorForEvents` + divider 状态），**不要改回 VSplitView**（历史多次失败）
 - **人工圈选按照片（URL）持久保留**：`Store.selectionRects: [URL: CGRect]`，切照片/复位缩放不清除；参数按圈选区计算；AI 主体青框独立显示
 - 手势分工：⌘+拖框/右键拖框/双击=放大（只看，不碰判定参数）；⌃+拖框=圈选重判；滚轮以光标为锚；单击=复位
-- 双击对焦点放大 fill=0.38；悬停提示用**系统 popover**（勿改回自绘 overlay），满 1 秒弹出
+- 双击以鼠标点击位置为中心放大；悬停提示用**系统 popover**（勿改回自绘 overlay），满 1 秒弹出
+- 辅助项默认值：九宫格和对角线开启，热力图关闭
 - 顶部工具栏 H/F/G/D 四个开关直接显示快捷键小灰字（ShortcutToggleLabel）
 - 文案统一「人工圈选」表述（不是「你圈选」）
 - **删除照片后选下一张**（2026-11-22 要求）：单删/批量删都选删除位置之后的照片，只移除成功进入废纸篓的记录；失败项保留。撤销仅恢复到空闲的原路径，并恢复删除前的筛片记录。勿改回跳第一张
-- **会话缓存勿删**（2026-11-22 要求，11-23 改存储位置）：Sources/SessionCache.swift 按文件夹保存判定状态（退出/分析完成/重算/删除/改题材时落盘），再打开同文件夹自动加载；缓存文件 = 照片文件夹根目录的 `kingfisher-session.log`（**可见文件**，用户明确不要隐藏名；`、` 开头的旧名 `.kingfisher-session.log` 会自动转正清理），只读卷兜底回软件数据目录并自动迁移旧缓存；「重新分析」= forceReload 跳过缓存；缓存格式版本不符必须拒载
+- **会话缓存勿删**（2026-11-22 要求，11-23 改存储位置）：Sources/SessionCache.swift 按文件夹保存判定状态（退出/分析完成/重算/删除/改题材时落盘），再打开同文件夹自动加载；缓存文件 = 照片文件夹根目录的 `kingfisher-session.log`（**可见文件**，兼容同目录旧名 `.kingfisher-session.log`）。新旧目录只按所选目录自己的可用会话日志判定，不借用父目录、子目录或软件数据目录日志。题材弹窗点「取消」放弃待导入批次，保持当前会话；「重新分析」= forceReload 跳过缓存；仅接受 v1 至当前版本的会话日志
 - 左侧列表多选：`selections: Set<URL>`，⌘/⇧ 行为与访达一致；批量操作针对 selections
-- **Shift+方向键边缘滚动**（2026-11-25 要求，仿访达）：仅区间多选路径启用——选中到列表可视边缘（差 1 行）才自动滚动，滚动长度 = **当前列表可视高度的一半**对应的行数（`GeometryReader` 可视高度 ÷ 当前档行高，首帧回退到 ResultRow 上报行数；窗口越高一次露得越多），`scrollTo(target, anchor: .bottom/.top)`；未到边缘列表**完全不动**；非 Shift 切图保持 anchor=nil 最小滚动；无动画约定不变；可见行由 ResultRow onAppear/onDisappear 上报集合推导 min/max，120ms 防抖防抖动循环
-- **列表缩略图档位**（2026-11-25 要求）：列表工具栏 −/+ 调整 34/46/64/88 宽四档（默认 46×34，老用户外观不变），行高同步联动，档位存 UserDefaults key `Kingfisher-PhotoSelector.thumbnailScale.v1`；解码统一 192px、SwiftUI 缩放，缓存不按档位分键也绝不串尺寸；无动画，不影响 ⇧ 多选/滚动
-- **鸟种识别与退出防卡死**（2026-11-25 修复）：主线程绝不能抢 `BirdSpeciesEngine.loadLock`（`isLoaded`/`isLoading` 只读细粒度状态锁）；`runBirdBatch` 只排队 URL、轮到才置 `birdLoading`，避免几百张同时挂「识别中」；`ensureBird` 所有出口（含失败/换代/超时/看门狗迟到结果）必须恰好回调一次 `onSettled`（BirdSettleBox 一次性；token 与 loading 两条 guard 分开写，各自 settle），鸟种任务 token 全局单调；`willTerminate` 只写已编码快照，不在主线程做 845 张 v2 JSON 编码；`setRating` 的 XMP 写成功回调必须同时 `saveSession()`，否则 v2 日志里的旧星级会在重开时盖掉 XMP 新星级
+- **Shift+方向键边缘滚动**（2026-11-25 要求，仿访达）：仅区间多选路径启用——选中到列表可视边缘（差 1 行）才自动滚动，滚动长度 = **当前列表可视高度的一半**对应的行数（`GeometryReader` 可视高度 ÷ 当前档行高，首帧回退到 ResultRow 上报行数；窗口越高一次露得越多），`scrollTo(target, anchor: .bottom/.top)`；未到边缘列表**完全不动**；非 Shift 切图保持 anchor=nil 最小滚动；无动画约定不变；可见行由 ResultRow onAppear/onDisappear 上报集合推导 min/max，120ms 防抖，避免滚动循环
+- **列表缩略图档位**（2026-11-25 要求）：列表工具栏 −/+ 调整 34/46/64/88 宽四档（默认 46×34，老用户外观不变），行高同步联动，档位存 UserDefaults key `Kingfisher-PhotoSelector.thumbnailScale.v1`；解码统一 192px、SwiftUI 缩放，缓存不按档位分键也绝不串尺寸；无动画，不影响 ⇧ 多选/滚动。可见行的缩略图后台解码完成后独立刷新
+- **鸟种识别与退出防卡死**（2026-11-25 修复）：主线程绝不能抢 `BirdSpeciesEngine.loadLock`（`isLoaded`/`isLoading` 只读细粒度状态锁）；`runBirdBatch` 只排队 URL、轮到才置 `birdLoading`，避免几百张同时挂「识别中」；`ensureBird` 所有出口（含失败/换代/超时/看门狗迟到结果）必须恰好回调一次 `onSettled`（BirdSettleBox 一次性；token 与 loading 两条 guard 分开写，各自 settle），鸟种任务 token 全局单调；`willTerminate` 只写已编码快照，不在主线程做 845 张 v2 JSON 编码；`setRating` 的 XMP 写成功回调必须同时 `saveSession()`，使会话及时更新，历史恢复时仍以 XMP 核对评级
 
 ## 架构升级约定（2026-11-25「把能放到分析阶段的东西全放到分析阶段」）
 
@@ -73,11 +74,10 @@ macOS 原生 SwiftUI 照片筛选软件：批量扫描 RAW 照片，用拉普拉
 
 - **会话缓存 schema v3**（保留 v2 拍摄信息）：`CachedPhoto` 新增可选信息字段 wb/af/exif/focus/human/ai/rating（六类型已补 Codable，不改判定口径）；`rating != nil` 视为该张信息已算过；**v1 老 log 必须可读**（缺字段解码 nil，按需现算，后台补算后回写当前格式）；version 高于当前的拒载
 - **信息全量分析阶段**：首次导入、重算与历史目录的新增照片共用 analyzePhotos；仅旧记录缺失拍摄信息时跑 `startInfoPhase`（WB600px/AF exiftool/EXIF/Focus2048px/Human+AI 共享 1024px，与按需 ensure* 同口径同引擎）；并发限 3、utility QoS、进度并入 done/total + sessionPhase 文案；筛选页等待分析完成；与按需 ensure* 共用 attempted 去重
-- **鸟种识别默认关闭、归分析阶段**（2026-11-25 用户最终要求，勿改回按需/默认开）：`birdRecognitionEnabled`（UserDefaults，默认 false）在导入文件夹的题材弹窗用 Toggle「同时识别鸟种」开启；`runBirdBatch` 并入三个收尾路径（新素材 `finishImportAfterInfo` / v1 补算 `finishHistoryBackfill` / v2 全量命中 `apply`），`processing` 保持 true 到批量完成才进筛选。**关闭时 `logOnly=true`**：只从 `kingfisher-birds.log` 读回已有可靠结果（纯读、快），不跑推理；开启才本地推理。筛选/切图阶段绝不触发 ensureBird（已移除 retryBirdPrefetchAfterInfo、scheduleNeighborPrefetch 兜底、InfoView/BirdSpeciesPanel 的 onAppear/onChange）。单张更新只由用户主动触发：手动圈主体 `refreshBirdAfterSubjectSelection`（forceLocal + ignoreGenre，非鸟题材也识别）、手动改题材为鸟类 `setGenre`，均不受开关限制；非鸟题材有结果/在识别时鸟种面板也显示。批量自己维护 done/total（**勿借用信息阶段残留值**，否则「识别鸟种中 1350/1350」满格假象），完成即 processing=false 进度条隐藏。四重去重与「人工确认优先」保留；有结果才写 XMP/日志、无结果不写；结果落盘 `kingfisher-birds.log`（Top3/置信/来源/依据），不进 session log
+- **鸟种识别有两条独立入口**：导入有新照片的目录或直接导入 RAW 时，题材弹窗仅在「自动识别题材」或「鸟类摄影」下显示「同时识别鸟种」，每次默认关闭。勾选后仅对本次新导入且最终题材为鸟类摄影的照片批量推理，历史日志在后台优先恢复。筛选时仅在有效题材为鸟类摄影的照片上完成人工圈选才识别单张，包括自动判定为鸟类的照片。导入时是否勾选、该照片是否已经自动识别都不限制圈选重认，人工确认优先。切图、放大和手动改题材不会启动推理。解码与推理使用后台串行队列，连续圈选取消未开始的旧任务，已开始任务用 token 拦截迟到结果。日志和 XMP 在后台按顺序写入。读取日志和批量识别各自维护进度，完成后进入筛选。
 - **元数据与 DNG**：RAW（含 CR3）的鸟种/星级/判定/说明写同名标准 XMP 侧车（dc:description / photoshop:Instructions / xmp:Label / xmp:Rating），JPG 内嵌。Adobe DNG Converter 转换时自动读同名侧车并嵌入 DNG，这些字段在 CR3→DNG 后保留；鸟种同时写标准 xmp:Label，`kf:BirdSpecies` 自定义命名空间仅本软件精确更新用、不保证被转换器保留
-- **判断依据默认折叠**（2026-11-25 用户要求）：InfoView 的详细数值网格包在 DisclosureGroup 内、默认收起，标题一行提示「展开看详细判别依据」；结论行（清晰判定/对焦点/失误提示）仍常显
 - **中间层预览**：导入分析循环生成「屏幕自适应分辨率」（主屏逻辑×backingScale，钳 1600~3840）JPEG（质量 0.9）落盘 App Support/Kingfisher-PhotoSelector/PreviewCache/<文件夹路径哈希>/<照片名>-<mtime>-<size>.jpg——**不写照片文件夹、不进 Git**，可整体重建；文件名内嵌 mtime+size 校验，源文件变化自动换名重建；历史恢复走 `backfillMidPreviews` 增量补（已存在跳过）；删除照片同步删内存项与磁盘文件
-- **双层显示链（v1.0 结构回归）**：原尺寸 LRU(5) 命中→直接显示；否则显示**本张**中间层（内存 LRU 12，磁盘读回，读盘解码后台小队列）；都没有→占位；原尺寸解码完成后无缝替换；「暂显上一张」/previewSwitching 机制已移除（中间层是同一张照片）；**token/fullPreviewURL/generation 防串图必须保留**；空闲时机低优先级预解选中 ±2 原尺寸（用户总从第一张看起）；全量原尺寸前移物理不可行（180MB/张内存、15-20GB 磁盘），预取+中间层是替代方案
+- **双层显示链（v1.0 结构回归）**：原尺寸 LRU(5) 命中→直接显示；否则显示**本张**中间层（内存 LRU 36，磁盘读回，读盘解码后台小队列）；都没有→占位；原尺寸解码完成后无缝替换；「暂显上一张」/previewSwitching 机制已移除（中间层是同一张照片）；**token/fullPreviewURL/generation 防串图必须保留**；当前选中图优先解码，原尺寸就绪后空闲时逐张低优先级预解选中附近 ±2。连续切图取消未开工的过期请求。预览图就绪、平移和缩放只通知预览区；全量原尺寸前移物理不可行（180MB/张内存、15-20GB 磁盘），预取+中间层是替代方案
 - `saveSession` 准入条件用 `analysisCoreActive`（判定核心）而非 processing：信息/鸟种阶段 results 已定型可安全落盘
 
 - 会话照片与排除项使用相对导入根目录的路径。v1/v2 文件名记录仅在来源日志和素材都能唯一匹配时恢复。XMP 各写入入口按侧车路径同步整个读改写过程。已有 XMP 无法读取或解析时终止该张写入；JPG 内嵌与侧车分别合并各自原内容，清除前先备份。标签与星级兼容 XMP 属性和元素两种写法。

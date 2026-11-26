@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AppKit
 import UniformTypeIdentifiers
 import Foundation
@@ -12,6 +13,8 @@ enum FolderGenreChoice: String, CaseIterable, Identifiable {
     case auto, bird, landscape, portrait
 
     var id: String { rawValue }
+
+    var allowsImportBirdRecognition: Bool { self == .auto || self == .bird }
     var title: String {
         switch self {
         case .auto:      return "自动识别题材"
@@ -491,14 +494,27 @@ private final class PrefetchGate {
 
 // MARK: - 状态
 
+final class PreviewPresentation: ObservableObject {
+    struct Viewport {
+        var zoom: CGFloat = 1
+        var center = CGPoint(x: 0.5, y: 0.5)
+        var offset = CGSize.zero
+    }
+
+    @Published var viewport = Viewport()
+    @Published var image: CGImage?
+    @Published var reference: (url: URL, image: CGImage)?
+    @Published var showingReference = false
+    var dragAction: DragAction?
+    var panStart: CGPoint?
+    var panBegin = CGSize.zero
+}
+
 final class Store: ObservableObject {
     init() {
         // 主线程预热屏幕度量（NSScreen 是 AppKit 主线程对象）：
         // 后台分析/生成线程只读缓存值，不在后台碰 AppKit。
         MidPreviewCache.warmScreenMetrics()
-        // 鸟种识别默认关闭；用户此前在题材弹窗勾选过则沿用（2026-11-25 要求）。
-        birdRecognitionEnabled = UserDefaults.standard.bool(
-            forKey: "Kingfisher-PhotoSelector.birdRecognitionEnabled")
     }
     /// results 整体替换时让派生快照失效（元素原地改 verdict 的两处另行显式失效）。
     /// 1458 张规模下 shown / displayName 每次现算都会重复扫全表，放大切图开销。
@@ -566,7 +582,7 @@ final class Store: ObservableObject {
             // 2) 缩放/平移复位；人工圈选记录按照片持久保留，切走再切回来仍在。
             guard oldValue != selected else { return }
             navigationRevision &+= 1
-            showingReference = false
+            if preview.showingReference { preview.showingReference = false }
             if heldRatingURL != nil { heldRatingURL = nil; shownCache = nil }
             // 说明改为导入/读取完成时批量写（2026-11-23）：原来切一张写一张 XMP，
             // 选片时每张都落盘会卡顿。切照片这里不再写盘，只管缩放复位。
@@ -640,38 +656,36 @@ final class Store: ObservableObject {
         selected = next
     }
 
-    @Published var reference: (url: URL, image: CGImage)?
-    @Published var showingReference = false
+    let preview = PreviewPresentation()
+    private var referenceHasFullSize = false
+
     func pinReference(_ url: URL) {
-        guard fullPreviewURL == url, let image = fullPreview else { return }
-        reference = (url, image)
-        showingReference = false
+        guard fullPreviewURL == url, let image = preview.image else { return }
+        preview.reference = (url, image)
+        referenceHasFullSize = fullPreviewCache[url] != nil
+        preview.showingReference = false
     }
     @Published var sensitivity: Double = 1.0
     @Published var preferFaces = false
     @Published var addColorLabel = true
     /// 切换照片时自动把上一张的判定信息写进其说明字段（用户 2026-11-19 要求；可关）。
     @Published var autoWriteDescription = true
-    /// 是否在分析阶段批量识别鸟种（2026-11-25 用户要求：默认不识别，导入文件夹时
-    /// 在题材弹窗里显式勾选才跑）。手动圈主体 / 手动改题材的单张识别不受此开关限制。
-    @Published var birdRecognitionEnabled = false {
-        didSet { UserDefaults.standard.set(birdRecognitionEnabled, forKey: "Kingfisher-PhotoSelector.birdRecognitionEnabled") }
-    }
+    private var pendingBirdRecognition = false
+    private var importBirdURLs: Set<URL> = []
     @Published var confirmWrite = false
     @Published var confirmCleanup = false
     @Published var confirmDelete = false
     @Published var deleteURLs: [URL] = []
-    /// 导入文件夹后的一次性题材选择（每个文件夹每次启动只问一次）。
+    /// 导入文件夹后的一次性题材选择（仅在导入新照片时询问）。
     @Published var showGenrePrompt = false
-    @Published var genrePromptFolder: URL?
-    private var genrePromptAsked: Set<URL> = []
+    @Published private(set) var suggestedImportGenre: FolderGenreChoice = .auto
     /// 题材弹窗先于读取/分析出现：用户答完后才真正开始扫描，
     /// 选择先暂存，等新一批 results 填好再整批应用（避免改到上一批照片）。
-    private var pendingScan: (folder: URL, files: [URL], forceReload: Bool)?
+    private var pendingScan: (folder: URL?, files: [URL], forceReload: Bool)?
     private var pendingGenreChoice: FolderGenreChoice?
     private var pendingGenreResolved = false
     /// 当前批次导入时选的整批题材，写进会话缓存（含 auto）。
-    /// 下次导入同一文件夹时若 log 里已有它，就不再弹题材选择框。
+    /// 同一文件夹新增照片时用它预选题材，历史照片保留原题材。
     private var folderGenreChoice: FolderGenreChoice?
     /// 缓存被判定与本批照片无关时的说明，拼到完成状态里，方便判断是否真的读了历史。
     private var scanNote = ""
@@ -685,16 +699,10 @@ final class Store: ObservableObject {
     /// 拖框的即时几何（起点/当前点/是否放大）已从 Store 移到 DetailView 私有的
     /// DragBoxState：鼠标每帧写这里只让那一个小 overlay 重绘，不再广播整个 Store
     /// 连带 1458 行目录和全部面板 body 重算——这是"圈选主体很卡"的主因。
-    /// dragAction/didDrag 仍在 Store：只在手势开始/结束写，低频广播保留。
-    /// 当前左键拖动意图（⌘=放大 / ⌃=圈选主体 / 无修饰键=平移）；nil 表示未在拖动。
-    @Published var dragAction: DragAction?
-    @Published var didDrag = false
     @Published var excluded: Set<URL> = [] {
         didSet { writableCache = nil }
     }
     @Published var anchorHi: Double?
-    @Published var zoom: CGFloat = 1
-    @Published var zoomCenter = CGPoint(x: 0.5, y: 0.5)
     /// 人工圈选记录：按照片 URL 索引，切照片/复位缩放都不清。
     /// 与 overrideRect（单张重判结果）并存，互不覆盖——青框 AI 主体照常显示。
     @Published var selectionRects: [URL: CGRect] = [:]
@@ -765,6 +773,7 @@ final class Store: ObservableObject {
                                                attributes: .concurrent)
     /// 鸟种批量队列：串行低优先级（识别内部还有原尺寸解码，串行避免打满 CPU）。
     private let birdBatchQueue = DispatchQueue(label: "kingfisher.bird.batch", qos: .utility)
+    private let birdRecordsQueue = DispatchQueue(label: "kingfisher.bird.records", qos: .utility)
 
     // MARK: - Shift 区间多选的边缘滚动（参考访达）
     /// ResultRow 上报的当前可见行（非 @Published；滚动复用会上报乱序/延迟，
@@ -925,7 +934,7 @@ final class Store: ObservableObject {
     private var birdTaskSerial: Int = 0
     /// 鸟种批量队列（主线程状态）：只排队 URL，轮到哪张才置 loading，避免几百张
     /// 同时挂在「识别中」。现在批量完全在分析阶段跑完，筛选阶段不再有点开插队
-    /// 的路径；手动圈主体后的单张刷新靠 ensureBird(forceLocal:) 走 token 换代。
+    /// 的路径；人工圈选后的单张刷新靠任务 token 走 token 换代。
     private var birdBatchPending: [URL] = []
     private var birdBatchActive = false
     private var birdBatchTotal = 0
@@ -934,7 +943,6 @@ final class Store: ObservableObject {
     private var birdBatchGeneration: UInt = 0
     /// 本批是否只读历史日志、不推理（用户默认关闭鸟种识别）。
     /// 鸟种日志按根目录缓存在内存里，靠文件修改时间失效；切照片不再反复读盘。
-    private var birdLogMemory: [URL: (stamp: Date?, rows: [BirdRecord])] = [:]
 
     @Published var showAFPoints = true
     /// 主体框显示开关（2026-11-23 用户要求，工具栏可勾选）：
@@ -1036,7 +1044,6 @@ final class Store: ObservableObject {
     /// 图——原尺寸命中直接显示；否则显示本张的中间层（屏幕自适应分辨率，从磁盘
     /// 缓存读回，Retina 下铺满预览区仍然锐利），原尺寸后台解码完成后替换。
     /// 不再保留上一张的清晰图做过渡（中间层显示的就是这张照片，体验更好）。
-    @Published var fullPreview: CGImage?
     /// fullPreview 每次换成不同 CGImage 就自增；baseCache 用它做 token，
     /// 保证中间层→原尺寸的两跳替换中旧图立刻失效，绝不串图。
     private var fullPreviewToken: UInt = 0
@@ -1073,9 +1080,9 @@ final class Store: ObservableObject {
     /// 换文件夹/导入新会话时自增，丢弃整批旧任务结果；删除照片不走这里。
     private var fullPreviewGeneration: UInt = 0
     private let fullPreviewMax = 5
-    /// 当前图与相邻图的解码分开排队：当前图优先，预取不抢它的 CPU。
-    private let fullPreviewQueue = DispatchQueue(label: "kingfisher.fullpreview.decode", qos: .userInitiated)
-    private let fullPreviewPrefetchQueue = DispatchQueue(label: "kingfisher.fullpreview.prefetch", qos: .utility)
+    /// 原尺寸一次只解一张，当前请求可以取消尚未开始的预取。
+    private let fullPreviewQueue = DispatchQueue(label: "kingfisher.fullpreview.decode")
+    private var fullPrefetchWork: DispatchWorkItem?
     // MARK: 中间层预览（屏幕自适应分辨率，磁盘缓存 + 内存 LRU）
     /// 内存 LRU：JPEG 解码后的中间层图像（单张约为主尺寸的 1/4~1/9 位图），
     /// 容量 36 张（2026-11-25 从 12 提升：要能留住一屏可见行 + 上下各 4 行，
@@ -1093,9 +1100,6 @@ final class Store: ObservableObject {
     /// 可见行批量预热专用：与当前图的 midPreviewQueue 分开，避免一次滚动把
     /// 几十张可见照片排在队首、点选时当前图反而要排队（点选要等一秒的原因之一）。
     private let midPreviewPrefetchQueue = DispatchQueue(label: "kingfisher.midpreview.prefetch", qos: .utility)
-    @Published var panOffset = CGSize.zero
-    @Published var panStart: CGPoint?
-    @Published var panBegin = CGSize.zero
 
     /// 渲染缓存：拖动分隔条/缩放窗口会反复触发 body 重算，热力图按块绘制很重。
     /// 缓存后 body 重算只取现成 NSImage 做 GPU 缩放，避免画面跳动。
@@ -1107,6 +1111,7 @@ final class Store: ObservableObject {
     /// 左侧列表缩略图缓存。历史加载时不逐张解 RAW（太慢），这里按需解小图。
     /// 非 @Published：ResultRow 在 onAppear 触发解码，解好后写回并局部刷新。
     private var thumbnailCache: [URL: CGImage] = [:]
+    private let thumbnailReady = PassthroughSubject<URL, Never>()
     private var thumbLoading: Set<URL> = []
     /// 可见行优先、预取靠后：两条并发队列分开，避免历史恢复时后到的预取任务
     /// 把用户正在看的那几行挤在队尾（拖动滚动条整屏灰块的直接原因之一）。
@@ -1148,16 +1153,11 @@ final class Store: ObservableObject {
                 ?? Analyzer.decode(url, maxSide: Self.thumbnailDecodeSide)?.image
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // 换文件夹/重新导入：旧代次的解码结果一律丢弃，但 loading 要配对清掉。
-                guard self.thumbnailGeneration == generation else {
-                    self.thumbLoading.remove(url)
-                    return
-                }
-                self.thumbLoading.remove(url)
-                if let img {
-                    self.thumbnailCache[url] = img
-                    self.baseCache[url] = nil   // 让主图/列表重取带缩略图的新状态
-                }
+                // 旧批次结果不得清除新批次同 URL 的在途状态。
+                guard self.thumbnailGeneration == generation,
+                      self.thumbLoading.remove(url) != nil, let img else { return }
+                self.thumbnailCache[url] = img
+                self.thumbnailReady.send(url)
             }
         }
     }
@@ -1169,9 +1169,7 @@ final class Store: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             let items = self.shown
-            let offsets = items.enumerated().compactMap {
-                self.visibleRowURLs.contains($0.element.id) ? $0.offset : nil
-            }
+            let offsets = self.visibleRowURLs.compactMap { self.shownIndex(of: $0) }
             guard let lo = offsets.min(), let hi = offsets.max() else { return }
             let range = max(0, lo - 4)...min(items.count - 1, hi + 4)
             var midURLs: [URL] = []
@@ -1190,6 +1188,13 @@ final class Store: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
     }
 
+    func thumbnailUpdates(for url: URL) -> AnyPublisher<CGImage, Never> {
+        thumbnailReady
+            .filter { $0 == url }
+            .compactMap { [weak self] in self?.thumbnailCache[$0] }
+            .eraseToAnyPublisher()
+    }
+
     func thumbnail(for url: URL, fallback: CGImage?) -> CGImage? {
         thumbnailCache[url] ?? fallback
     }
@@ -1199,11 +1204,11 @@ final class Store: ObservableObject {
     /// 也绝不显示上一张的图（中间层显示的就是当前照片）。token 保证中间层→原尺寸
     /// 两跳替换时缓存立即失效，不串图。
     func baseImage(for r: PhotoResult) -> NSImage {
-        let useFull = r.id == selected && fullPreviewURL == r.id && fullPreview != nil
+        let useFull = r.id == selected && fullPreviewURL == r.id && preview.image != nil
         let token = fullPreviewToken
         if let c = baseCache[r.id], c.token == token && c.full == useFull { return c.img }
         let img: NSImage
-        if useFull, let cg = fullPreview {
+        if useFull, let cg = preview.image {
             img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         } else {
             img = NSImage()
@@ -1214,9 +1219,9 @@ final class Store: ObservableObject {
 
     /// 统一替换当前清晰图：换图即自增 token，让 baseCache 中旧图立刻失效。
     private func replaceFullPreview(_ img: CGImage?) {
-        guard fullPreview !== img else { return }
+        guard preview.image !== img else { return }
         baseCache.removeAll()
-        fullPreview = img
+        preview.image = img
         fullPreviewToken &+= 1
     }
 
@@ -1255,6 +1260,19 @@ final class Store: ObservableObject {
     func shownIndex(of url: URL) -> Int? { shownSnapshot.index[url] }
     /// O(1) 某张是否在当前列表里。替代 `shown.contains(where:)`。
     func shownContains(_ url: URL) -> Bool { shownSnapshot.index[url] != nil }
+    func isInsideVisibleRows(_ url: URL) -> Bool {
+        guard visibleRowURLs.contains(url), let index = shownIndex(of: url) else { return false }
+        var hasRowAbove = false
+        var hasRowBelow = false
+        for visible in visibleRowURLs {
+            guard let other = shownIndex(of: visible) else { continue }
+            if other < index { hasRowAbove = true }
+            if other > index { hasRowBelow = true }
+            if hasRowAbove && hasRowBelow { return true }
+        }
+        return false
+    }
+
 
     /// ↑/↓ 在当前列表（含"只看需留意"过滤）内切换照片，与列表顺序一致。
     /// 2026-11-23： Shift+↑/↓ 连续多选区间，并把预览跟着切到刚选中的那张。
@@ -1376,63 +1394,10 @@ final class Store: ObservableObject {
         scan(folder: folder, forceReload: false)
     }
 
-    /// 会话缓存优先当前文件夹，找不到就逐级向上找（最多 4 层）。
-    /// 用户可能导入 .../拍鸟/好片 这样的子文件夹，而缓存写在 .../拍鸟 根目录。
-    /// 2026-11-23 修正两个误判：
-    /// ① 日志就在导入文件夹里时以日志为准——文件夹被移动/拷贝后快照里的绝对路径会过期，
-    ///    不能因此拒绝使用随文件夹一起走的历史数据；
-    /// ② 上级日志只有在本批照片确实有文件名重合时才借用，否则新文件夹会被错标成
-    ///    「读取历史数据」却实际逐张重新分析。
+    /// 仅用所选目录自己的会话日志匹配本次素材。
     private func cachedSession(for folder: URL, files: [URL]) -> SessionSnapshot? {
-        var cur = folder.standardizedFileURL
-        for _ in 0..<4 {
-            if let snap = SessionCache.load(folder: cur),
-               let matched = SessionCache.matched(snap, source: cur, folder: folder, files: files) {
-                return matched
-            }
-            if cur.pathComponents.count <= 2 { break }
-            cur = cur.deletingLastPathComponent().standardizedFileURL
-        }
-        // 再向下汇总：用户可能把「拍鸟 / 风光 / 人像」放在一个大文件夹里分别处理过，
-        // 每批的 log 写在各自子目录。导入大文件夹时应按文件名合并这些快照，
-        // 已判定的直接恢复，只有真正新增的才分析（智慧识鸟式的"直接进入处理结果"）。
-        return mergedChildSession(for: folder, files: files)
-    }
-
-    /// 向下扫描导入目录里的所有会话日志，按文件名合并成一份虚拟快照。
-    /// 只取与本批照片有交集的日志，避免把无关子目录的历史混进来。
-    private func mergedChildSession(for folder: URL, files: [URL]) -> SessionSnapshot? {
-        let fm = FileManager.default
-        guard let e = fm.enumerator(at: folder, includingPropertiesForKeys: nil,
-                                    options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
-        var candidates: [SessionSnapshot] = []
-        for case let f as URL in e where f.lastPathComponent == SessionCache.fileName {
-            guard let data = try? Data(contentsOf: f),
-                  let snap = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
-                  // v1/v2 都可读：v1 缺信息字段（解码 nil，读取后由补算阶段升到 v2）。
-                  snap.version >= 1, snap.version <= SessionCache.version else { continue }
-            if let matched = SessionCache.matched(snap, source: f.deletingLastPathComponent(),
-                                                  folder: folder, files: files) {
-                candidates.append(matched)
-            }
-        }
-        guard !candidates.isEmpty else { return nil }
-        // 从旧到新覆盖，同一文件以最新保存的记录为准。
-        candidates.sort { $0.savedAt < $1.savedAt }
-        var merged: [String: CachedPhoto] = [:]
-        var exclusions = Set<String>()
-        for snap in candidates {
-            for p in snap.photos {
-                merged[p.file] = p
-                exclusions.remove(p.file)
-            }
-            exclusions.formUnion(snap.excludedFiles)
-        }
-        guard var snap = candidates.last, !merged.isEmpty else { return nil }
-        snap.folderPath = folder.standardizedFileURL.path
-        snap.excludedFiles = exclusions.sorted()
-        snap.photos = merged.values.sorted { $0.file < $1.file }
-        return snap
+        guard let snapshot = SessionCache.load(folder: folder, selectedFolderOnly: true) else { return nil }
+        return SessionCache.matched(snapshot, source: folder, folder: folder, files: files)
     }
 
     /// 当前素材根文件夹（scan(folder:) 记录）；「重新分析」按钮和会话缓存都靠它定位。
@@ -1452,15 +1417,13 @@ final class Store: ObservableObject {
             }
         }
         guard !files.isEmpty else {
-            currentFolder = folder
-            resetBirdState()
-            process([])
+            status = "没有找到可处理的 RAW 照片"
             return
         }
-        importFolderName = Self.folderName(from: folder)
         let sorted = files.sorted { $0.lastPathComponent < $1.lastPathComponent }
         pendingScan = (folder, sorted, forceReload)
         pendingGenreChoice = nil
+        pendingBirdRecognition = false
         pendingGenreResolved = false
         pendingHistorySnapshot = nil
         // 「重新分析」强制全量重算，不读历史日志，也就不该显示历史读取提示。
@@ -1476,7 +1439,7 @@ final class Store: ObservableObject {
         // 用 token 杜绝竞态：用户在读盘期间又导入别的文件夹时，旧的后台结果直接丢弃。
         historyReadToken += 1
         let token = historyReadToken
-        beginHistoryRead("正在读取历史日志文件…")
+        beginHistoryRead("正在检查所选文件夹的会话日志…")
         DispatchQueue.global(qos: .userInitiated).async {
             // 两件事一次读完：题材是否记过 + 完整历史快照，避免读两遍盘。
             let snap = self.cachedSession(for: folder, files: sorted)
@@ -1488,16 +1451,9 @@ final class Store: ObservableObject {
                 guard token == self.historyReadToken else { return }
                 self.endHistoryRead()
                 self.pendingHistorySnapshot = snap
-                // 2026-11-23：题材选择提前到"读取历史数据/分析"之前，用户答完才真正开扫。
-                // 但如果 log 里已经记着这批的题材选择（说明之前导入过），就不再打扰用户。
-                if !self.genrePromptAsked.contains(folder) {
-                    self.genrePromptAsked.insert(folder)
-                    if choice != nil {
-                        self.pendingGenreResolved = true
-                        self.startPendingScan()
-                        return
-                    }
-                    self.genrePromptFolder = folder
+                let cachedPaths = Set(snap?.photos.map(\.file) ?? [])
+                if sorted.contains(where: { !cachedPaths.contains(SessionCache.relativePath($0, in: folder)) }) {
+                    self.suggestedImportGenre = choice ?? .auto
                     self.showGenrePrompt = true
                     return
                 }
@@ -1512,12 +1468,25 @@ final class Store: ObservableObject {
     private func startPendingScan() {
         guard let job = pendingScan, pendingGenreResolved else { return }
         showGenrePrompt = false
-        genrePromptFolder = nil
+        statusBeforeImport = nil
         currentFolder = job.folder
+        if let nameRoot = job.folder ?? job.files.first?.deletingLastPathComponent() {
+            importFolderName = Self.folderName(from: nameRoot)
+        }
         resetBirdState()
         scanNote = ""
         let snap = job.forceReload ? nil : pendingHistorySnapshot
         pendingHistorySnapshot = nil
+        importBirdURLs = []
+        if pendingBirdRecognition {
+            if let snap, let folder = job.folder {
+                let cachedPaths = Set(snap.photos.map(\.file))
+                importBirdURLs = Set(job.files.filter { !cachedPaths.contains(SessionCache.relativePath($0, in: folder)) })
+            } else {
+                importBirdURLs = Set(job.files)
+            }
+        }
+        pendingBirdRecognition = false
         if let snap {
             apply(snapshot: snap, files: job.files)
             return
@@ -1529,9 +1498,11 @@ final class Store: ObservableObject {
     /// 快照在题材弹窗等待期间暂存，弹窗答完后由 startPendingScan 直接复用。
     private var historyReadToken = 0
     private var pendingHistorySnapshot: SessionSnapshot?
+    private var statusBeforeImport: (status: String, phase: String)?
 
     /// 标记「正在读历史日志」：进度提示 + 阶段文案，让主线程界面立即刷新出提示。
     private func beginHistoryRead(_ message: String) {
+        if statusBeforeImport == nil { statusBeforeImport = (status, sessionPhase) }
         historyReading = true
         sessionPhase = "读取历史数据"
         status = message
@@ -1543,20 +1514,17 @@ final class Store: ObservableObject {
 
     func scan(files: [URL]) {
         guard !processing else { return }
+        let kept = files.filter { MetadataWriter.isRAW($0) }
+        guard !kept.isEmpty else { status = "没有找到可处理的 RAW 照片"; return }
         historyReadToken += 1
-        historyReading = false
-        pendingScan = nil
+        endHistoryRead()
         pendingHistorySnapshot = nil
         pendingGenreChoice = nil
-        // 散拖文件没有明确的扫描根目录：清掉 currentFolder，
-        // 避免这批结果的会话缓存覆盖到上一个文件夹的缓存上。
-        currentFolder = nil
-        resetBirdState()
-        let allowed = MetadataWriter.rawExts
-        let kept = files.filter { allowed.contains($0.pathExtension.lowercased()) }
-        // 散拖多张文件时没有扫描目录，用第一张所在文件夹名兜底。
-        if let first = kept.first { importFolderName = Self.folderName(from: first.deletingLastPathComponent()) }
-        process(kept.sorted { $0.lastPathComponent < $1.lastPathComponent })
+        pendingBirdRecognition = false
+        pendingGenreResolved = false
+        pendingScan = (nil, kept.sorted { $0.lastPathComponent < $1.lastPathComponent }, false)
+        suggestedImportGenre = .auto
+        showGenrePrompt = true
     }
 
     private func process(_ files: [URL]) {
@@ -1567,8 +1535,8 @@ final class Store: ObservableObject {
         processing = true
         selected = nil
         selections = []
-        reference = nil
-        showingReference = false
+        preview.reference = nil
+        preview.showingReference = false
         heldRatingURL = nil
         requestedRatings = [:]
         ratingRequests = [:]
@@ -1722,7 +1690,7 @@ final class Store: ObservableObject {
         // 直到批量跑完才结束分析、进入筛选。这样筛选阶段鸟种已全部就绪，切图
         // 不会现算、不会转圈；之后只有手动圈主体才单张重认。
         let note = scanNote
-        status = note + "新素材分析完成：\(newCount) 张，需留意 \(suspects.count) 张；正在识别鸟种…"
+        status = note + "新素材分析完成：\(newCount) 张，需留意 \(suspects.count) 张"
         saveSession()
         writeAllDescriptions()
         scanNote = ""
@@ -1742,8 +1710,8 @@ final class Store: ObservableObject {
         processing = true
         selected = nil
         selections = []
-        reference = nil
-        showingReference = false
+        preview.reference = nil
+        preview.showingReference = false
         heldRatingURL = nil
         requestedRatings = [:]
         ratingRequests = [:]
@@ -1883,9 +1851,9 @@ final class Store: ObservableObject {
             let df = DateFormatter()
             df.dateFormat = "M-d HH:mm"
             let savedText = df.string(from: snapshot.savedAt)
-            self.applyPendingGenre()
+            self.applyPendingGenre(to: Set(additions.map(\.url).filter { byName[SessionCache.relativePath($0, in: root)] == nil }))
             self.saveSession()
-            if pendingInfo.isEmpty && newFiles.isEmpty {
+            if pendingInfo.isEmpty {
                 // v2 全量命中：信息区零现算瞬时恢复；鸟种同样在读取阶段一次性从
                 // kingfisher-birds.log 批量还原（纯读，不解码原图、不推理），完成后
                 // 才结束 processing。筛选阶段鸟种已全在内存，切图不再现算/转圈。
@@ -1898,11 +1866,11 @@ final class Store: ObservableObject {
                     self.showScreening(backfill: files)
                 }
             } else {
-                // 旧日志和新增照片共用信息补算队列。
+                // 仅补算本目录旧日志中缺失的信息。
                 let pending = pendingInfo
                 self.status = self.scanNote + "已读取历史数据（\(list.count - additions.count) 张，保存于 \(savedText)）；正在后台补算拍摄信息"
                 self.scanNote = ""
-                self.startInfoPhase(pending: pending, phaseText: "2/2 · 正在补算拍摄信息") { [weak self] in
+                self.startInfoPhase(pending: pending, phaseText: "正在补算历史照片的拍摄信息") { [weak self] in
                     self?.finishHistoryBackfill(restoredCount: list.count - additions.count,
                                                  savedText: savedText, files: files)
                 }
@@ -1932,7 +1900,7 @@ final class Store: ObservableObject {
     private func finishHistoryBackfill(restoredCount: Int, savedText: String, files: [URL]) {
         // 同新素材：鸟种并入分析阶段，processing 覆盖到批量完成才进入筛选。
         saveSession()
-        status = "已读取历史数据（\(restoredCount) 张，保存于 \(savedText)）；正在识别鸟种…"
+        status = "已读取历史数据（\(restoredCount) 张，保存于 \(savedText)）"
         writeAllDescriptions()
         runBirdBatch { [weak self] in
             guard let self else { return }
@@ -2075,13 +2043,13 @@ final class Store: ObservableObject {
 
     func recheck(id: URL, rect: CGRect) {
         guard let idx = resultIndex[id],
-              let m = metrics.first(where: { $0.url == id }) else { return }
+              let m = result(for: id)?.metrics else { return }
         // 2026-11-23：记录重判前的「只看需留意」列表顺序。若圈选后这张不再需留意、
         // 从过滤列表消失，就自动选中它原来的下一张（仍在列表里的），并明确提示，
         // 避免界面停在已消失的照片上、用户找不到下一张该处理的。
         let wasFiltered = onlySuspect
         let oldShown = shown
-        let oldIndex = oldShown.firstIndex(where: { $0.id == id })
+        let oldIndex = shownIndex(of: id)
         let wasSelected = selected == id
 
         let cr = Analyzer.rectRatio(m, rect: rect)
@@ -2140,6 +2108,7 @@ final class Store: ObservableObject {
         results[idx].overrideRect = nil
         suspectCache = nil; shownCache = nil; writableCache = nil
         selectionRects.removeValue(forKey: id)
+        cancelBirdRecognition(for: id)
         resetZoom()
         status = "已取消 \(id.deletingPathExtension().lastPathComponent) 的自选主体，恢复自动判定"
         saveSession()
@@ -2492,46 +2461,48 @@ final class Store: ObservableObject {
         birdBatchTotal = 0
         birdBatchSettled = 0
         birdBatchCompletion = nil
-        // 默认不跑模型：只把历史日志里已有的可靠结果读回内存显示（纯读、很快）。
-        // 用户显式开启「识别鸟种」才在批量里真正推理。只读模式模型不可用时照样能还原。
-        let logOnly = !birdRecognitionEnabled
-        guard BirdSpeciesEngine.available || logOnly else { completion(); return }
+        let inferenceEligible = importBirdURLs
+        importBirdURLs = []
         let targets = results
             .filter { genre(for: $0).0 == .bird }
             .filter { birdCache[$0.id] == nil && !birdLoading.contains($0.id)
                       && !birdDismissed.contains($0.id) && !birdUnreliable.contains($0.id) }
-            .map { $0.id }
+            .map(\.id)
         guard !targets.isEmpty else { completion(); return }
-        sessionPhase = logOnly ? "读取鸟种记录" : "识别鸟种中"
-        // 进度条此前借用信息阶段的 done/total，出现「识别鸟种中 1350/1350」满格
-        // 却没结果的假象。这里重置为鸟种批量自己的计数，随每张完成推进。
+        sessionPhase = "读取鸟种记录"
         done = 0
         total = targets.count
-        status = logOnly
-            ? "分析阶段：正在读取历史鸟种记录（共 \(targets.count) 张）…"
-            : "分析阶段：正在批量识别鸟种（共 \(targets.count) 张）…"
-        if logOnly {
-            restoreBirdLogs(for: targets, completion: completion)
-            return
+        status = "正在读取历史鸟种记录（共 \(targets.count) 张）…"
+        restoreBirdLogs(for: targets) {
+            let pending = targets.filter {
+                inferenceEligible.contains($0) && self.birdCache[$0] == nil && !self.birdUnreliable.contains($0)
+            }
+            guard !pending.isEmpty else { completion(); return }
+            guard BirdSpeciesEngine.available else {
+                for url in pending { self.birdMessage[url] = "鸟种模型未随软件分发" }
+                completion()
+                return
+            }
+            self.sessionPhase = "识别鸟种中"
+            self.done = 0
+            self.total = pending.count
+            self.status = "正在批量识别新照片的鸟种（共 \(pending.count) 张）…"
+            self.birdBatchPending = Array(pending.reversed())
+            self.birdBatchTotal = pending.count
+            self.birdBatchCompletion = completion
+            self.pumpBirdBatch()
         }
-        birdBatchPending = Array(targets.reversed())
-        birdBatchTotal = targets.count
-        birdBatchCompletion = completion
-        pumpBirdBatch()
     }
 
     private func restoreBirdLogs(for targets: [URL], completion: @escaping () -> Void) {
         let generation = birdBatchGeneration
         let folder = currentFolder
-        birdBatchQueue.async {
-            var byDirectory: [URL: URL] = [:]
+        birdRecordsQueue.async {
             var indices: [URL: [String: [BirdRecord]]] = [:]
             var records: [URL: BirdRecord] = [:]
             var unreliable = Set<URL>()
             for url in targets {
-                let base = folder ?? url.deletingLastPathComponent()
-                let root = byDirectory[base] ?? Self.birdLogRoot(from: base)
-                byDirectory[base] = root
+                let root = (folder ?? url.deletingLastPathComponent()).standardizedFileURL
                 if indices[root] == nil {
                     indices[root] = Dictionary(grouping: BirdLog.load(in: root), by: { $0.file })
                 }
@@ -2552,7 +2523,7 @@ final class Store: ObservableObject {
                 guard self.birdBatchGeneration == generation else { return }
                 let end = min(start + 32, targets.count)
                 for url in targets[start..<end] {
-                    if let record = restored[url] { self.applyBirdRecord(record, to: url, writeLabel: false) }
+                    if let record = restored[url] { self.applyBirdRecord(record, to: url) }
                     else if ignored.contains(url) {
                         self.birdUnreliable.insert(url)
                         self.birdMessage[url] = "历史本地识别把握不足，已忽略结果"
@@ -2566,8 +2537,7 @@ final class Store: ObservableObject {
         }
     }
 
-    /// 批量泵：只在主线程调用。一次只启动一张，且**启动前**不做任何 @Published 写入，
-    /// 这样用户点开的照片能立即走 userInitiated 队列识别，不必排在串行队尾。
+    /// 批量泵每次只安排一张，完成后再推动进度和下一张。
     private func pumpBirdBatch() {
         guard !birdBatchActive else { return }
         while !birdBatchPending.isEmpty {
@@ -2580,7 +2550,7 @@ final class Store: ObservableObject {
             }
             birdBatchActive = true
             let gen = birdBatchGeneration
-            ensureBird(for: url, on: birdBatchQueue) { [weak self] in
+            ensureBird(for: url) { [weak self] in
                 guard let self else { return }
                 guard self.birdBatchGeneration == gen else {
                     // 新批的 active 状态由新批维护。
@@ -2634,9 +2604,7 @@ final class Store: ObservableObject {
             guard let self, !self.processing, let cur = self.selected else { return }
             let items = self.shown
             guard let i = shownIndex(of: cur) else { return }
-            for j in max(0, i - 2)...min(items.count - 1, i + 2) {
-                self.preloadFullPreview(for: items[j].id)
-            }
+            self.scheduleFullPreviewPrefetch()
             for j in max(0, i - 3)...min(items.count - 1, i + 3) {
                 self.preloadMidPreview(for: items[j].id)
             }
@@ -2686,7 +2654,6 @@ final class Store: ObservableObject {
                 // 先读盘回填相邻两张的中间层（毫秒级）：点选时立即有本张的清晰
                 // 预览；原尺寸解码慢，排在后面，完成后无缝替换。
                 self.preloadMidPreview(for: url)
-                self.preloadFullPreview(for: url)
                 self.ensureExif(for: url, on: self.prefetchQueue, relevant: ok)
                 self.ensureAF(for: url, on: self.prefetchQueue, relevant: ok)
                 self.ensureWB(for: url, on: self.prefetchQueue, relevant: ok)
@@ -2809,41 +2776,46 @@ final class Store: ObservableObject {
             genreOverride.removeValue(forKey: url)
         }
         saveSession()   // 手动改题材也要落盘，下次恢复会话时保留
-        // 手动改成鸟类：分析阶段按旧题材没跑过这张，属于用户主动更新，补一次单张
-        // 识别（人工确认/dismissed 由 ensureBird 内部保护）。切图/筛选阶段不自动触发。
-        if g == .bird { ensureBird(for: url, forceLocal: true, ignoreGenre: true) }
+        if let result = result(for: url), genre(for: result).0 != .bird {
+            cancelBirdRecognition(for: url)
+        }
     }
 
     /// 题目在扫描前就问；这里只暂存答案，真正应用等新一批 results 填好后做。
-    func applyFolderGenre(_ choice: FolderGenreChoice) {
+    func applyFolderGenre(_ choice: FolderGenreChoice, recognizeBirds: Bool) {
         pendingGenreChoice = choice
+        pendingBirdRecognition = choice.allowsImportBirdRecognition && recognizeBirds
         pendingGenreResolved = true
         startPendingScan()
     }
 
-    /// 用户点「暂不设置」：不改题材，但照常开始扫描。
-    func closeGenrePrompt() {
+    /// 放弃待导入的批次，保留当前会话。
+    func cancelImport() {
+        historyReadToken += 1
+        endHistoryRead()
+        pendingScan = nil
+        pendingHistorySnapshot = nil
         pendingGenreChoice = nil
-        pendingGenreResolved = true
-        startPendingScan()
+        pendingBirdRecognition = false
+        pendingGenreResolved = false
+        showGenrePrompt = false
+        if let previous = statusBeforeImport {
+            status = previous.status
+            sessionPhase = previous.phase
+        }
+        statusBeforeImport = nil
     }
 
     /// 新一批结果落地后套用导入前选的题材，再统一落盘。
     /// 这样弹窗在读取历史数据之前出现，也不会把选择错应用到上一批照片。
-    private func applyPendingGenre() {
-        guard let job = pendingScan else { return }
+    private func applyPendingGenre(to newURLs: Set<URL>? = nil) {
+        guard pendingScan != nil else { return }
         if let choice = pendingGenreChoice {
-            folderGenreChoice = choice   // 记下来，写进 log，下次导入同文件夹不再弹窗
-            let prefix = job.folder.standardizedFileURL.path + "/"
-            let inFolder = results.filter { $0.id.standardizedFileURL.path.hasPrefix(prefix) }
-            let name = Self.folderName(from: job.folder)
-            if let g = choice.genre {
-                for r in inFolder { genreOverride[r.id] = g }
-                status += "；已把「\(name)」的 \(inFolder.count) 张设为\(g.display)"
-            } else {
-                for r in inFolder { genreOverride[r.id] = nil }
-                status += "；「\(name)」已恢复逐张识别题材"
-            }
+            folderGenreChoice = choice
+            let targets = newURLs ?? Set(results.map(\.id))
+            for url in targets { genreOverride[url] = choice.genre }
+        } else if let newURLs, let genre = folderGenreChoice?.genre {
+            for url in newURLs { genreOverride[url] = genre }
         }
         pendingScan = nil
         pendingGenreChoice = nil
@@ -2896,17 +2868,19 @@ final class Store: ObservableObject {
         // 目标已就位（中间层或原尺寸），或原尺寸正在解码（此时 fullPreview 是这张
         // 的中间层）——不动，等解码完成/失败分支收尾。
         // 解码失败的图不早返回：保留这条路径让 requestFullPreview 有机会重试。
-        if fullPreviewURL == url, fullPreview != nil, !previewFailed.contains(url) {
+        if fullPreviewURL == url, preview.image != nil, !previewFailed.contains(url) {
             return
         }
+        fullPrefetchWork?.cancel()
         // 只取消尚未开工的旧任务。已开始的结果仍可用于回看。
-        for (other, job) in Array(fullPreviewJobs) where other != url && other != reference?.url && job.claim() {
+        for (other, job) in Array(fullPreviewJobs) where other != url && job.claim() {
             fullPreviewJobs[other] = nil
         }
         fullPreviewURL = url
         if let cached = fullPreviewCache[url] {
             touchFullPreview(url)
             replaceFullPreview(cached)
+            scheduleFullPreviewPrefetch()
             return
         }
         if let mid = midPreviewCache[url] {
@@ -2921,11 +2895,35 @@ final class Store: ObservableObject {
         requestFullPreview(for: url, prefetch: false)
     }
 
-    /// 预取相邻照片的原尺寸预览：方向键连翻时基本都能命中缓存，切图零延迟。
-    /// 与当前图分队列，避免预取抢正在显示那张的解码资源。
-    func preloadFullPreview(for url: URL) {
-        guard fullPreviewCache[url] == nil else { return }
-        requestFullPreview(for: url, prefetch: true)
+    private func scheduleFullPreviewPrefetch() {
+        fullPrefetchWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.processing, let url = self.selected,
+                  self.fullPreviewURL == url, self.fullPreviewCache[url] != nil,
+                  self.fullPreviewJobs.isEmpty, let index = self.shownIndex(of: url)
+            else { return }
+            if let reference = self.preview.reference, reference.url != url,
+               !self.previewFailed.contains(reference.url), !self.referenceHasFullSize {
+                if let full = self.fullPreviewCache[reference.url] {
+                    self.preview.reference = (reference.url, full)
+                    self.referenceHasFullSize = true
+                } else if self.containsResult(reference.url) {
+                    self.requestFullPreview(for: reference.url, prefetch: true)
+                    return
+                }
+            }
+            let items = self.shown
+            // 先补相邻，再补隔一张。每次只排一个，留出切图插队机会。
+            for offset in [1, -1, 2, -2] where items.indices.contains(index + offset) {
+                let neighbor = items[index + offset].id
+                if self.fullPreviewCache[neighbor] == nil && !self.previewFailed.contains(neighbor) {
+                    self.requestFullPreview(for: neighbor, prefetch: true)
+                    return
+                }
+            }
+        }
+        fullPrefetchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: work)
     }
 
     /// 预取相邻照片的中间层（读盘+解码很便宜）：±2 提前回填，回看更快。
@@ -2962,7 +2960,7 @@ final class Store: ObservableObject {
     /// 主预览确实属于本张才画框——切图瞬间整组隐藏，图像与框同帧出现，
     /// 既不串图也不会有空框浮在加载占位上。数据未就绪时宁可不画。
     func overlaysReady(for url: URL) -> Bool {
-        fullPreviewURL == url && fullPreview != nil
+        fullPreviewURL == url && preview.image != nil
     }
 
     /// 后台解码原尺寸预览并写入 LRU。同一 URL 只跑一次（onAppear / onChange
@@ -2981,10 +2979,9 @@ final class Store: ObservableObject {
             invalidatedPreviewURLs.remove(url)
         }
         let generation = fullPreviewGeneration
-        let queue = prefetch ? fullPreviewPrefetchQueue : fullPreviewQueue
-        queue.async {
+        fullPreviewQueue.async(qos: prefetch ? .utility : .userInitiated) {
             guard job.claim() else { return }
-            let img = autoreleasepool { Analyzer.loadFullPreview(url) }
+            let img = autoreleasepool { Analyzer.loadFullPreview(url, decodeImmediately: true) }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.fullPreviewGeneration == generation,
                       self.fullPreviewJobs[url] === job else { return }
@@ -2995,16 +2992,21 @@ final class Store: ObservableObject {
                     // 当前图解码失败：若中间层在显则 DetailView 退化为小字说明；
                     // 否则显示明确的失败提示，避免"提示消失后留下无解释的空白"。
                     if self.fullPreviewURL == url {
-                        self.objectWillChange.send()
+                        self.preview.objectWillChange.send()
                     }
+                    self.scheduleFullPreviewPrefetch()
                     return
                 }
                 self.previewFailed.remove(url)
                 self.cacheFullPreview(img, for: url)
-                if self.reference?.url == url { self.reference = (url, img) }
+                if self.preview.reference?.url == url {
+                    self.preview.reference = (url, img)
+                    self.referenceHasFullSize = true
+                }
                 if self.fullPreviewURL == url {
                     self.replaceFullPreview(img)
                 }
+                self.scheduleFullPreviewPrefetch()
             }
         }
     }
@@ -3037,7 +3039,7 @@ final class Store: ObservableObject {
                 guard !self.invalidatedPreviewURLs.contains(url) else { return }
                 guard let img else {
                     self.midPreviewFailed.insert(url)
-                    if self.fullPreviewURL == url { self.objectWillChange.send() }
+                    if self.fullPreviewURL == url { self.preview.objectWillChange.send() }
                     return
                 }
                 self.midPreviewFailed.remove(url)
@@ -3075,7 +3077,7 @@ final class Store: ObservableObject {
     private func cacheFullPreview(_ img: CGImage, for url: URL) {
         fullPreviewCache[url] = img
         touchFullPreview(url)
-        // 最多留 3 张（上一张/当前/下一张）；正在显示的那张绝不能被驱逐。
+        // 最多留 5 张，正在显示的那张不参与淘汰。
         while fullPreviewOrder.count > fullPreviewMax,
               let victimIndex = fullPreviewOrder.firstIndex(where: { $0 != fullPreviewURL }) {
             let victim = fullPreviewOrder.remove(at: victimIndex)
@@ -3087,6 +3089,7 @@ final class Store: ObservableObject {
     /// 换序列 / 删除照片后清空原图预览缓存，防止旧图被当作新会话的结果显示。
     /// 中间层一起失效（generation 共用，在途的中间层读回也会被丢弃）。
     private func resetFullPreviewCache() {
+        fullPrefetchWork?.cancel()
         fullPreviewGeneration &+= 1
         fullPreviewCache = [:]
         fullPreviewOrder = []
@@ -3103,16 +3106,10 @@ final class Store: ObservableObject {
     }
 
     func resetZoom() {
-        zoom = 1
-        zoomCenter = CGPoint(x: 0.5, y: 0.5)
-        panOffset = .zero
-        panStart = nil
-        dragAction = nil
-        // 复位只针对放大/平移：人工圈选记录（黄框 + 评分参数）按照片保留。
+        preview.viewport = .init()
+        preview.panStart = nil
+        preview.dragAction = nil
     }
-
-    func zoomIn() { zoom = min(8, zoom * 1.5) }
-    func zoomOut() { zoom = max(1, zoom / 1.5) }
 
     func writeMetadata() {
         let targets = writableTargets
@@ -3223,7 +3220,10 @@ final class Store: ObservableObject {
     }
 
     private func removeTrashedRecords(_ removed: Set<URL>) {
-        if let reference, removed.contains(reference.url) { self.reference = nil; showingReference = false }
+        if let reference = preview.reference, removed.contains(reference.url) {
+            preview.reference = nil
+            preview.showingReference = false
+        }
         let oldShown = shown
         let nextID = oldShown.lastIndex(where: { removed.contains($0.id) }).flatMap { index in
             oldShown.dropFirst(index + 1).first?.id
@@ -3267,7 +3267,7 @@ final class Store: ObservableObject {
             selectionRects[key] = nil
             birdCache[key] = nil; birdTop3[key] = nil; birdSource[key] = nil
             birdReason[key] = nil; birdConfirm[key] = nil; birdMessage[key] = nil
-            birdLoading.remove(key); birdTaskToken[key] = nil
+            cancelBirdRecognition(for: key)
             birdDismissed.remove(key); birdUnreliable.remove(key)
         }
         excluded = excluded.subtracting(removed)
@@ -3452,6 +3452,8 @@ final class Store: ObservableObject {
         birdUnreliable = []
         birdMessage = [:]
         birdLoading = []
+        for job in birdQueuedJobs.values { _ = job.claim() }
+        birdQueuedJobs = [:]
         birdTaskToken = [:]
         // 换文件夹/重新导入：作废旧批次排队，避免拿新 results 里的 URL 跑老任务。
         birdBatchPending = []
@@ -3462,42 +3464,11 @@ final class Store: ObservableObject {
         birdBatchGeneration &+= 1
     }
 
-    /// 日志与 XMP 标签都随照片走。若用户导入的是子文件夹（如 .../拍鸟/好片），
-    /// 日志实际在上级根目录 .../拍鸟，这里向上找几层，避免"明明有 log 却没读到"。
-    private func birdRoot(for url: URL) -> URL {
-        Self.birdLogRoot(from: currentFolder ?? url.deletingLastPathComponent())
-    }
-
-    private static func birdLogRoot(from folder: URL) -> URL {
-        let base = folder.standardizedFileURL
-        var cur = base
-        for _ in 0..<4 {
-            if FileManager.default.fileExists(atPath: BirdLog.url(in: cur).path) { return cur }
-            if cur.pathComponents.count <= 2 { break }
-            cur = cur.deletingLastPathComponent().standardizedFileURL
-        }
-        return base
-    }
-
-    /// 读取（并按修改时间缓存）某个根目录的鸟种日志行。
-    private func birdRows(in root: URL) -> [BirdRecord] {
-        let stamp = BirdLog.stamp(in: root)
-        if let hit = birdLogMemory[root], hit.stamp == stamp { return hit.rows }
-        let rows = BirdLog.load(in: root)
-        birdLogMemory[root] = (stamp, rows)
-        return rows
-    }
-
     /// 自动兜底的星级口径：Bridge 人工星级与建议星级取高者。
     private func birdStars(for url: URL) -> Int {
         var n = ratingCache[url] ?? 0
         if let r = result(for: url) { n = max(n, score(for: r).stars) }
         return n
-    }
-
-    private func birdImage(for url: URL) -> CGImage? {
-        guard let r = result(for: url) else { return nil }
-        return baseImage(for: r).cgImage(forProposedRect: nil, context: nil, hints: nil)
     }
 
     /// 识别裁剪框：用户手动圈选优先（左下原点归一化），否则退回最大自动主体框。
@@ -3516,7 +3487,7 @@ final class Store: ObservableObject {
         list.map { "\($0.chinese) \(Int($0.confidence * 100))%" }.joined(separator: " > ")
     }
 
-    /// 后台预热本地模型：软件启动后立即低优先级加载，用户点照片时通常已经就绪。
+    /// 首次请求鸟种识别时在后台准备模型。
     /// 放在后台队列，不阻塞界面和照片分析；与按需加载由模型内部锁串行化。
     func prewarmBirdModel() {
         // 2026-11-25 修复：旧版在这行读 isLoaded 会抢模型加载锁，主线程最长被卡
@@ -3547,21 +3518,16 @@ final class Store: ObservableObject {
         }
     }
 
-    /// 拍鸟题材照片被点开时自动显示识别结果；风光 / 人像不识别、不显示。
-    /// 先读可见日志（人工确认优先），否则跑本地 BioCLIP 2。
-    /// forceLocal=true 用于圈选主体后刷新：跳过日志旧结果，强制按新裁剪框重认。
+    /// 仅由导入批量或鸟类摄影照片的人工圈选调用。日志在导入阶段统一恢复。
     /// onSettled：这张「识别有了结果」（含日志命中/把握不足/失败）时回主线程回调，
     /// 供导入后的鸟种批量统计进度；单张按需调用不传。
-    func ensureBird(for url: URL, forceLocal: Bool = false,
-                    ignoreGenre: Bool = false,
-                    on queue: DispatchQueue = .global(qos: .userInitiated),
-                    onSettled: (() -> Void)? = nil) {
+    private func ensureBird(for url: URL, onSettled: (() -> Void)? = nil) {
         // 所有出口（含 guard 早返回、换代失效、原图读失败、超时）都经过 settle，
         // 批量进度不会漏计；同一张的多次调用互不干扰。
         let settle = BirdSettleBox(onSettled)
         guard !birdDismissed.contains(url), !birdUnreliable.contains(url) else { settle.call(); return }
         guard let r = result(for: url),
-              ignoreGenre || genre(for: r).0 == .bird else {
+              genre(for: r).0 == .bird else {
             settle.call()
             return
         }
@@ -3571,30 +3537,6 @@ final class Store: ObservableObject {
             return
         }
         guard birdCache[url] == nil, !birdLoading.contains(url) else { settle.call(); return }
-
-        if !forceLocal {
-            let rows = birdRows(in: birdRoot(for: url))
-            if let rec = BirdLog.latest(in: rows, for: url.lastPathComponent,
-                                        minLocalConfidence: BirdSpeciesEngine.localAcceptThreshold,
-                                        agreementConfidence: BirdSpeciesEngine.localAgreementThreshold,
-                                        agreementReason: BirdSpeciesEngine.agreementReasonToken) {
-                applyBirdRecord(rec, to: url, writeLabel: false)
-                settle.call()
-                return
-            }
-            // 历史日志里只有低置信本地猜测：不读回来、不显示、不重跑；
-            // 顺手清掉旧版写进 xmp:Label 的鸟名（写入前仍有 .before-bird.xmp 备份）。
-            if rows.contains(where: { $0.file == url.lastPathComponent && $0.source != "人工确认" }) {
-                birdUnreliable.insert(url)
-                birdMessage[url] = "历史本地识别把握不足，已忽略结果；请放大原图后人工确认"
-                let dir = url.deletingLastPathComponent()
-                DispatchQueue.global(qos: .utility).async {
-                    _ = try? MetadataWriter.setBirdLabel(to: url, bird: nil, backupDir: dir)
-                }
-                settle.call()
-                return
-            }
-        }
 
         // 先触发预热；主线程只读细粒度状态位，抢不到模型加载锁也绝不停顿。
         prewarmBirdModel()
@@ -3614,17 +3556,23 @@ final class Store: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
             guard let self, self.birdTaskToken[url] == token,
                   self.birdLoading.contains(url) else { return }
-            self.birdLoading.remove(url)
-            self.birdMessage[url] = "鸟种识别超时，重新点开照片可重试"
+            self.cancelBirdRecognition(for: url)
+            self.birdMessage[url] = "鸟种识别超时，可重新圈选主体重试"
             settle.call()
         }
-        queue.async {
+        let job = FullPreviewJob()
+        birdQueuedJobs[url] = job
+        birdBatchQueue.async {
+            guard job.claim() else {
+                DispatchQueue.main.async { settle.call() }
+                return
+            }
             guard let cg = preferred ?? Analyzer.loadFullPreview(url) else {
                 DispatchQueue.main.async {
                     // 旧任务被换代：不能清掉新任务拥有的 loading，但必须让批量继续。
                     guard self.birdTaskToken[url] == token else { settle.call(); return }
-                    self.birdLoading.remove(url)
-                    self.birdMessage[url] = "原图读取失败，重新点开照片可重试"
+                    self.cancelBirdRecognition(for: url)
+                    self.birdMessage[url] = "原图读取失败，可重新圈选主体重试"
                     settle.call()
                 }
                 return
@@ -3655,6 +3603,7 @@ final class Store: ObservableObject {
                 // QA Bug#1：看门狗超时清过 loading 后，迟到的旧结果不得再写回
                 // （否则"超时"文案刚显示就被旧结果覆盖，且并发人工确认可能被冲掉）。
                 guard self.birdLoading.contains(url) else { settle.call(); return }
+                self.birdQueuedJobs[url] = nil
                 self.birdLoading.remove(url)
                 // 识别期间用户可能已人工确认（或日志回填了人工确认结果）：
                 // 已有结果一律采用现有值，本地识别绝不覆盖（人工确认优先不变式；
@@ -3692,12 +3641,24 @@ final class Store: ObservableObject {
         }
     }
 
+    private var birdQueuedJobs: [URL: FullPreviewJob] = [:]
+
+    private func cancelBirdRecognition(for url: URL) {
+        _ = birdQueuedJobs.removeValue(forKey: url)?.claim()
+        birdTaskToken[url] = nil
+        if birdLoading.remove(url) != nil { birdMessage[url] = nil }
+    }
+
     /// 手动圈选主体后重认鸟种：清掉旧候选/旧任务，按新框强制跑一次本地识别。
     /// 人工确认的结果不动，避免把用户核实过的鸟名覆盖掉。
     func refreshBirdAfterSubjectSelection(for url: URL) {
-        guard birdSource[url] != "人工确认" else { return }
-        // 手动圈主体后即使用户导入时没开「识别鸟种」，也允许对这一张单独识别。
-        guard containsResult(url) else { return }
+        guard let result = result(for: url), genre(for: result).0 == .bird,
+              birdSource[url] != "人工确认" else { return }
+        guard BirdSpeciesEngine.available else {
+            birdMessage[url] = "鸟种模型未随软件分发"
+            return
+        }
+        cancelBirdRecognition(for: url)
         birdCache[url] = nil
         birdTop3[url] = nil
         birdSource[url] = nil
@@ -3705,8 +3666,7 @@ final class Store: ObservableObject {
         birdMessage[url] = ""
         birdUnreliable.remove(url)     // 换了裁剪框，允许重新判断一次
         birdDismissed.remove(url)      // 用户重新框了主体，允许再次自动识别
-        birdLoading.remove(url)        // 旧任务靠 token 失效，不让它占着"识别中"
-        ensureBird(for: url, forceLocal: true, ignoreGenre: true)
+        ensureBird(for: url)
     }
 
     /// 采用一个鸟种结果：更新界面 + 追加可见日志 + 写 XMP 标签（追加在判定词之后）。
@@ -3719,14 +3679,16 @@ final class Store: ObservableObject {
         birdReason[url] = reason
         birdTop3[url] = top3
         birdMessage[url] = ""
-        let root = birdRoot(for: url)
-        let rec = BirdRecord(time: ISO8601DateFormatter().string(from: Date()),
-                             file: url.lastPathComponent, name: clean, latin: latin,
-                             confidence: confidence, source: source, reason: reason,
-                             root: root.path, stars: birdStars(for: url), top3: top3)
-        BirdLog.append(rec, in: root)
+        let base = currentFolder ?? url.deletingLastPathComponent()
+        let stars = birdStars(for: url)
         let dir = url.deletingLastPathComponent()
-        DispatchQueue.global(qos: .utility).async {
+        birdRecordsQueue.async {
+            let root = base.standardizedFileURL
+            let record = BirdRecord(time: ISO8601DateFormatter().string(from: Date()),
+                                    file: url.lastPathComponent, name: clean, latin: latin,
+                                    confidence: confidence, source: source, reason: reason,
+                                    root: root.path, stars: stars, top3: top3)
+            BirdLog.append(record, in: root)
             do {
                 _ = try MetadataWriter.setBirdLabel(to: url, bird: clean, backupDir: dir)
             } catch {
@@ -3735,17 +3697,13 @@ final class Store: ObservableObject {
         }
     }
 
-    private func applyBirdRecord(_ rec: BirdRecord, to url: URL, writeLabel: Bool) {
+    private func applyBirdRecord(_ rec: BirdRecord, to url: URL) {
         birdCache[url] = BirdSpeciesGuess(chinese: rec.name, latin: rec.latin, confidence: rec.confidence)
         birdSource[url] = rec.source
         birdReason[url] = rec.reason
         birdTop3[url] = rec.top3
         birdMessage[url] = ""
-        guard writeLabel else { return }
-        DispatchQueue.global(qos: .utility).async {
-            _ = try? MetadataWriter.setBirdLabel(to: url, bird: rec.name,
-                                                  backupDir: url.deletingLastPathComponent())
-        }
+
     }
 
     func confirmBird(for url: URL) {
@@ -3756,6 +3714,7 @@ final class Store: ObservableObject {
     }
 
     func clearBirdLabel(for url: URL) {
+        cancelBirdRecognition(for: url)
         birdCache[url] = nil
         birdSource[url] = nil
         birdReason[url] = nil
@@ -3763,7 +3722,7 @@ final class Store: ObservableObject {
         birdMessage[url] = ""
         birdConfirm[url] = ""
         birdDismissed.insert(url)   // 本次会话不再自动重认，避免清掉又被写回
-        DispatchQueue.global(qos: .utility).async {
+        birdRecordsQueue.async {
             _ = try? MetadataWriter.setBirdLabel(to: url, bird: nil,
                                                   backupDir: url.deletingLastPathComponent())
         }
@@ -4047,11 +4006,12 @@ private struct ListViewportHeightKey: PreferenceKey {
 struct ResultRow: View {
     @EnvironmentObject var store: Store
     let r: PhotoResult
+    @State private var loadedThumbnail: CGImage?
     var body: some View {
         // 档位只改显示 frame，解码统一 192px；行高随缩略图高度联动。
         let thumbSize = store.thumbnailScale.size
         HStack(spacing: 8) {
-            if let cg = store.thumbnail(for: r.id, fallback: r.metrics.preview) {
+            if let cg = loadedThumbnail ?? store.thumbnail(for: r.id, fallback: r.metrics.preview) {
                 Image(nsImage: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
                     .resizable().aspectRatio(contentMode: .fill)
                     .frame(width: thumbSize.width, height: thumbSize.height)
@@ -4060,7 +4020,15 @@ struct ResultRow: View {
                 Rectangle().fill(Color.gray.opacity(0.15))
                     .frame(width: thumbSize.width, height: thumbSize.height).cornerRadius(3)
                 // 历史恢复时 preview=nil：行出现才解小图，且不阻塞进入页面。
-                .task { store.ensureThumbnail(for: r.id, highPriority: true) }
+                .onReceive(store.thumbnailUpdates(for: r.id)) { loadedThumbnail = $0 }
+                .task(id: r.id) {
+                    // 预取可能在订阅建立前完成，先读一次缓存。
+                    if let cached = store.thumbnail(for: r.id, fallback: nil) {
+                        loadedThumbnail = cached
+                    } else {
+                        store.ensureThumbnail(for: r.id)
+                    }
+                }
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.displayName(r.id)).lineLimit(1).font(.body)
@@ -4520,6 +4488,7 @@ private struct DragBoxOverlay: View {
 
 struct DetailView: View {
     @EnvironmentObject var store: Store
+    @ObservedObject var preview: PreviewPresentation
     @StateObject private var dragBox = DragBoxState()
     let r: PhotoResult
     /// 右侧竖排布局时预览区较窄：工具栏换成两行、提示文字收进悬停说明，
@@ -4531,9 +4500,9 @@ struct DetailView: View {
     /// 同时考虑 zoomCenter 与 panOffset；第一次放大后必须按这个矩形换算坐标。
     private func displayedImageRect(fitW: CGFloat, fitH: CGFloat,
                                     ox: CGFloat, oy: CGFloat) -> CGRect {
-        let sc = store.zoom
-        let dx = (0.5 - store.zoomCenter.x) * fitW * sc + store.panOffset.width
-        let dy = (store.zoomCenter.y - 0.5) * fitH * sc + store.panOffset.height
+        let sc = preview.viewport.zoom
+        let dx = (0.5 - preview.viewport.center.x) * fitW * sc + preview.viewport.offset.width
+        let dy = (preview.viewport.center.y - 0.5) * fitH * sc + preview.viewport.offset.height
         return CGRect(
             x: ox + fitW / 2 - fitW * sc / 2 + dx,
             y: oy + fitH / 2 - fitH * sc / 2 + dy,
@@ -4547,7 +4516,7 @@ struct DetailView: View {
     private func zoomAround(_ p: CGPoint, factor: CGFloat,
                             fitW: CGFloat, fitH: CGFloat,
                             ox: CGFloat, oy: CGFloat) {
-        let sc0 = store.zoom
+        let sc0 = preview.viewport.zoom
         let sc1 = min(8, max(1, sc0 * factor))
         guard abs(sc1 - sc0) > 1e-6, fitW > 0, fitH > 0 else { return }
         let d = displayedImageRect(fitW: fitW, fitH: fitH, ox: ox, oy: oy)
@@ -4555,16 +4524,15 @@ struct DetailView: View {
         // 光标在图像中的归一化位置（缩放前后不变）
         let u = (p.x - d.minX) / d.width
         let v = (p.y - d.minY) / d.height
-        let zx = store.zoomCenter.x, zy = store.zoomCenter.y
+        let zx = preview.viewport.center.x, zy = preview.viewport.center.y
         // 令缩放后 d2.x + u*d2.w == p.x，反算所需 offset
         let dx2 = p.x - u * fitW * sc1 - ox - fitW / 2 + fitW * sc1 / 2
         let dy2 = p.y - v * fitH * sc1 - oy - fitH / 2 + fitH * sc1 / 2
-        store.panOffset = CGSize(
+        preview.viewport = .init(zoom: sc1, center: preview.viewport.center, offset: CGSize(
             width: dx2 - (0.5 - zx) * fitW * sc1,
             height: dy2 - (zy - 0.5) * fitH * sc1
-        )
-        store.zoom = sc1
-        store.panStart = nil
+        ))
+        preview.panStart = nil
     }
 
     /// 把屏幕坐标的拖框换算成图像归一化坐标（Vision 的 y 轴朝上）。
@@ -4597,10 +4565,9 @@ struct DetailView: View {
         let nyTop = min(max(((s.y + e.y) / 2 - d.minY) / d.height, 0), 1)
         let rw = min(w / d.width, 1), rh = min(h / d.height, 1)
         let factor = min(1 / max(rw, 0.001), 1 / max(rh, 0.001))
-        store.zoom = min(8, max(1.2, store.zoom * factor))
-        store.zoomCenter = CGPoint(x: nx, y: 1 - nyTop)
-        store.panOffset = .zero
-        store.panStart = nil
+        preview.viewport = .init(zoom: min(8, max(1.2, preview.viewport.zoom * factor)),
+                                 center: CGPoint(x: nx, y: 1 - nyTop))
+        preview.panStart = nil
         // 放大是「看」的操作：不写判定参数、也不再画黄框（黄框只标注用户圈选的主体）。
     }
 
@@ -4615,10 +4582,9 @@ struct DetailView: View {
         let u = min(max((p.x - d.minX) / d.width, 0), 1)
         let v = min(max((p.y - d.minY) / d.height, 0), 1)
         // zoomCenter 的 y 是 Vision 坐标（y 向上），故用 1 - v
-        store.zoomCenter = CGPoint(x: u, y: 1 - v)
-        store.zoom = min(8, max(1.2, store.zoom * 2.6))
-        store.panOffset = .zero
-        store.panStart = nil
+        preview.viewport = .init(zoom: min(8, max(1.2, preview.viewport.zoom * 2.6)),
+                                 center: CGPoint(x: u, y: 1 - v))
+        preview.panStart = nil
         // 双击放大是「看」的操作：不写判定参数、不画黄框（黄框只标注圈选主体）。
     }
 
@@ -4654,9 +4620,9 @@ struct DetailView: View {
                 }
                 .padding(.horizontal, 12).padding(.vertical, 4)
                 HStack(spacing: 12) {
-                    Button("－") { store.zoomOut() }.frame(width: 26)
-                    Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
-                    Button("＋") { store.zoomIn() }.frame(width: 26)
+                    Button("－") { preview.viewport.zoom = max(1, preview.viewport.zoom / 1.5) }.frame(width: 26)
+                    Text(String(format: "%.1f×", preview.viewport.zoom)).font(.caption).monospacedDigit()
+                    Button("＋") { preview.viewport.zoom = min(8, preview.viewport.zoom * 1.5) }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
                     Toggle(isOn: $store.lockZoom) { Text("锁定缩放").font(.caption) }
                         .help("开启后切换照片保留当前放大倍数和位置；关闭时切图自动复位")
@@ -4693,9 +4659,9 @@ struct DetailView: View {
                         ShortcutToggleLabel(title: "自选主体黄框", key: store.shortcuts.manualBox.display)
                     }
                     .help("显示/隐藏你手动圈选的主体框（黄色）。只管画面显示；取消圈选请用信息区的「取消自选主体」。快捷键 \(store.shortcuts.manualBox.display)，可在快捷键面板改。")
-                    Button("－") { store.zoomOut() }.frame(width: 26)
-                    Text(String(format: "%.1f×", store.zoom)).font(.caption).monospacedDigit()
-                    Button("＋") { store.zoomIn() }.frame(width: 26)
+                    Button("－") { preview.viewport.zoom = max(1, preview.viewport.zoom / 1.5) }.frame(width: 26)
+                    Text(String(format: "%.1f×", preview.viewport.zoom)).font(.caption).monospacedDigit()
+                    Button("＋") { preview.viewport.zoom = min(8, preview.viewport.zoom * 1.5) }.frame(width: 26)
                     Button("复位") { store.resetZoom() }.font(.caption)
                     Toggle(isOn: $store.lockZoom) { Text("锁定缩放").font(.caption) }
                         .help("开启后切换照片保留当前放大倍数和位置；关闭时切图自动复位")
@@ -4714,24 +4680,24 @@ struct DetailView: View {
             HStack {
                 Button("设为参考图") { store.pinReference(r.id) }
                     .help("固定列表当前选中的照片作比较")
-                    .disabled(store.fullPreviewURL != r.id || store.fullPreview == nil)
-                if let ref = store.reference {
-                    Button(store.showingReference ? "看候选图" : "看参考图") { store.showingReference.toggle() }
-                    Text(store.showingReference ? "参考：\(ref.url.lastPathComponent) · 评级对象：\(r.id.lastPathComponent)" : "候选：\(r.id.lastPathComponent)")
+                    .disabled(store.fullPreviewURL != r.id || preview.image == nil)
+                if let ref = preview.reference {
+                    Button(preview.showingReference ? "看候选图" : "看参考图") { preview.showingReference.toggle() }
+                    Text(preview.showingReference ? "参考：\(ref.url.lastPathComponent) · 评级对象：\(r.id.lastPathComponent)" : "候选：\(r.id.lastPathComponent)")
                         .lineLimit(1)
-                    Button("结束对比") { store.showingReference = false; store.reference = nil }
+                    Button("结束对比") { preview.showingReference = false; preview.reference = nil }
                 }
                 Spacer()
             }.font(.caption).padding(.horizontal, 12)
-            if store.showingReference, let ref = store.reference {
+            if preview.showingReference, let ref = preview.reference {
                 GeometryReader { geo in
                     let factor = min(geo.size.width / CGFloat(ref.image.width), geo.size.height / CGFloat(ref.image.height))
                     let w = CGFloat(ref.image.width) * factor, h = CGFloat(ref.image.height) * factor
                     Image(decorative: ref.image, scale: 1)
                         .resizable().frame(width: w, height: h)
-                        .scaleEffect(store.zoom)
-                        .position(x: geo.size.width / 2 + (0.5 - store.zoomCenter.x) * w * store.zoom + store.panOffset.width,
-                                  y: geo.size.height / 2 + (store.zoomCenter.y - 0.5) * h * store.zoom + store.panOffset.height)
+                        .scaleEffect(preview.viewport.zoom)
+                        .position(x: geo.size.width / 2 + (0.5 - preview.viewport.center.x) * w * preview.viewport.zoom + preview.viewport.offset.width,
+                                  y: geo.size.height / 2 + (preview.viewport.center.y - 0.5) * h * preview.viewport.zoom + preview.viewport.offset.height)
                 }.clipped()
             } else {
             GeometryReader { geo in
@@ -4746,7 +4712,7 @@ struct DetailView: View {
                 let fitH = naturalH
                 let ox = (geo.size.width - fitW) / 2
                 let oy = naturalOy
-                let scale = store.zoom
+                let scale = preview.viewport.zoom
 
                 ZStack {
                     ZStack {
@@ -4789,15 +4755,15 @@ struct DetailView: View {
                     }
                     .frame(width: fitW, height: fitH)
                     .scaleEffect(scale, anchor: .center)
-                    .offset(x: (0.5 - store.zoomCenter.x) * fitW * scale + store.panOffset.width,
-                            y: (store.zoomCenter.y - 0.5) * fitH * scale + store.panOffset.height)
+                    .offset(x: (0.5 - preview.viewport.center.x) * fitW * scale + preview.viewport.offset.width,
+                            y: (preview.viewport.center.y - 0.5) * fitH * scale + preview.viewport.offset.height)
 
                     // 双层显示链的提示层（显示的始终是本张的图，无"暂显上一张"状态）：
                     // - 原图还没就位（中间层也在途）→ 居中加载提示；
                     // - 中间层已显示、原尺寸仍在解码 → 底部小字提示，不遮挡看图；
                     // - 原尺寸解码失败 → 中间层可用时退化为底部小字，否则居中明确提示。
                     if store.isPreviewFailed(for: r.id) {
-                        if store.fullPreview != nil {
+                        if preview.image != nil {
                             VStack {
                                 Spacer()
                                 HStack(spacing: 6) {
@@ -4823,7 +4789,7 @@ struct DetailView: View {
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
-                    } else if store.fullPreview == nil {
+                    } else if preview.image == nil {
                         // 中间层与原尺寸都在途（首次进入/缓存缺失，通常零点几秒）。
                         VStack(spacing: 8) {
                             ProgressView().scaleEffect(0.8)
@@ -4864,8 +4830,8 @@ struct DetailView: View {
                     RightDragBridge(
                         onStart: { p in
                             dragBox.begin(p, zoom: true)
-                            store.dragAction = .zoom
-                            store.didDrag = true
+                            preview.dragAction = .zoom
+
                         },
                         onMove: { p in dragBox.current = p },
                         onEnd: { p in
@@ -4874,10 +4840,8 @@ struct DetailView: View {
                                                 fitW: fitW, fitH: fitH, ox: ox, oy: oy)
                             }
                             dragBox.clear()
-                            store.dragAction = nil
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                                store.didDrag = false
-                            }
+                            preview.dragAction = nil
+
                         }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4907,28 +4871,28 @@ struct DetailView: View {
                     ) { g in
                         switch g {
                         case .began(let action, let p):
-                            store.dragAction = action
-                            store.didDrag = true
+                            preview.dragAction = action
+
                             if action == .pan {
-                                store.panStart = p
-                                store.panBegin = store.panOffset
+                                preview.panStart = p
+                                preview.panBegin = preview.viewport.offset
                                 dragBox.clear()
                             } else {
                                 dragBox.begin(p, zoom: action == .zoom)
-                                store.panStart = nil
+                                preview.panStart = nil
                             }
                         case .moved(let p):
-                            if store.dragAction == .pan {
-                                guard let s = store.panStart else { break }
-                                store.panOffset = CGSize(
-                                    width: store.panBegin.width + p.x - s.x,
-                                    height: store.panBegin.height + p.y - s.y
+                            if preview.dragAction == .pan {
+                                guard let s = preview.panStart else { break }
+                                preview.viewport.offset = CGSize(
+                                    width: preview.panBegin.width + p.x - s.x,
+                                    height: preview.panBegin.height + p.y - s.y
                                 )
                             } else {
                                 dragBox.current = p
                             }
                         case .ended(let p):
-                            if let action = store.dragAction {
+                            if let action = preview.dragAction {
                                 if action == .pan {
                                     // 平移已在 moved 完成，无需额外处理。
                                 } else if let s = dragBox.start {
@@ -4948,11 +4912,9 @@ struct DetailView: View {
                                 }
                             }
                             dragBox.clear()
-                            store.panStart = nil
-                            store.dragAction = nil
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                                store.didDrag = false
-                            }
+                            preview.panStart = nil
+                            preview.dragAction = nil
+
                         case .tap:
                             store.resetZoom()
                         case .doubleTap(let p):
@@ -5569,40 +5531,39 @@ private struct BirdSpeciesPanel: View {
 private struct FolderGenrePromptView: View {
     @EnvironmentObject var store: Store
 
+    @State private var choice: FolderGenreChoice = .auto
+    @State private var recognizeBirds = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("这个文件夹主要拍什么？").font(.headline)
-            Text("选定后再读取历史数据或开始分析；整批按该题材评分，之后仍可在信息区逐张修改。选「自动识别题材」则保持逐张判断。")
-                .font(.caption).foregroundColor(.secondary)
-            ForEach(FolderGenreChoice.allCases) { c in
-                Button {
-                    store.applyFolderGenre(c)
-                } label: {
-                    HStack(spacing: 8) {
-                        Text(c.title).font(.callout)
-                        Spacer()
-                        Text(c.detail).font(.caption2).foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 5).padding(.horizontal, 8)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.10)))
+            Text("新导入的照片主要拍什么？").font(.headline)
+            Picker("题材", selection: $choice) {
+                ForEach(FolderGenreChoice.allCases) { item in
+                    Text(item.title).tag(item)
                 }
-                .buttonStyle(.plain)
+            }.pickerStyle(.radioGroup)
+            Text(choice.detail).font(.caption).foregroundColor(.secondary)
+            if choice.allowsImportBirdRecognition {
+                Toggle("同时识别鸟种", isOn: $recognizeBirds)
+                    .help("仅对新导入且判为鸟类摄影的照片进行批量识别。之后仍可对鸟类摄影照片人工圈选主体，单张重认。")
             }
-            Divider()
-            Toggle("同时识别鸟种", isOn: $store.birdRecognitionEnabled)
-                .font(.caption)
-                .help("默认关闭：只在历史日志已有结果时显示鸟名。开启后分析阶段会用本地 BioCLIP 2 逐张识别（几百张会慢一些），识别结果写入元数据和鸟种日志。之后仍可手动圈主体对单张重认。")
-            Text("鸟种识别仅对拍鸟题材生效；识别结果只作参考，以放大原图人工确认为准。")
-                .font(.caption2).foregroundColor(.secondary)
             HStack {
                 Spacer()
-                Button("暂不设置") { store.closeGenrePrompt() }
-                    .buttonStyle(.borderless).font(.caption)
+                Button("取消") { store.cancelImport() }
+                    .keyboardShortcut(.cancelAction)
+                Button("开始导入") { store.applyFolderGenre(choice, recognizeBirds: recognizeBirds) }
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
         .frame(width: 420)
+        .onAppear {
+            choice = store.suggestedImportGenre
+            recognizeBirds = false
+        }
+        .onChange(of: choice) { newChoice in
+            if !newChoice.allowsImportBirdRecognition { recognizeBirds = false }
+        }
     }
 }
 
@@ -5774,7 +5735,7 @@ struct ContentView: View {
     private var previewPane: some View {
         if let id = store.selected,
            let r = store.result(for: id) {
-            DetailView(r: r, compact: store.infoOnRight)
+            DetailView(preview: store.preview, r: r, compact: store.infoOnRight)
         } else {
             VStack(spacing: 10) {
                 Image(systemName: "photo.on.rectangle.angled")
@@ -5885,7 +5846,7 @@ struct ContentView: View {
                     }
                     // 非 Shift 切图：保持现状——不做 withAnimation；anchor=nil
                     // 只在行不可见时最小滚动，可见则列表不动（2026-11-24 修复）。
-                    proxy.scrollTo(id)
+                    if !store.isInsideVisibleRows(id) { proxy.scrollTo(id) }
                 }
             }
         }
@@ -6022,7 +5983,7 @@ struct ContentView: View {
 
             if store.processing || store.historyReading {
                 VStack(spacing: 12) {
-                    Text(store.historyReading ? "正在读取历史日志" : store.sessionPhase)
+                    Text(store.historyReading ? "正在检查所选文件夹的会话日志" : store.sessionPhase)
                         .font(.headline)
                     if store.historyReading {
                         ProgressView()
@@ -6181,9 +6142,6 @@ struct ContentView: View {
         // ↑/↓ 切换照片 + 辅助项快捷键：统一用本地事件监听，保证焦点在预览或列表都生效。
         // 输入框里打字、弹窗/面板打开时不拦截，避免抢走系统正常的方向键行为。
         .onAppear {
-            // 软件一启动就后台预热鸟种模型（低优先级）：用户导入文件夹、翻照片的
-            // 这几秒正好把模型读进内存，点开第一张鸟片就不用再等 5～6 秒。
-            if store.birdRecognitionEnabled { store.prewarmBirdModel() }
             guard shortcutMonitor == nil else { return }
             shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
                 guard NSApp.modalWindow == nil, e.window === NSApp.mainWindow else { return e }

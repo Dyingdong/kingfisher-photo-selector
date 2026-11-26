@@ -103,17 +103,18 @@ enum Analyzer {
 
     /// 显示用原尺寸解码：只取当前选中照片，按原始像素上限解码，
     /// 让放大到 1× 以上时仍保留原始细节（与 macOS「预览」的缩放观感一致）。
-    static func loadFullPreview(_ url: URL) -> CGImage? {
+    static func loadFullPreview(_ url: URL, decodeImmediately: Bool = false) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         let pw = (props?[kCGImagePropertyPixelWidth] as? Int) ?? 0
         let ph = (props?[kCGImagePropertyPixelHeight] as? Int) ?? 0
         let maxSide = max(pw, ph, 1200)
-        let opts: [CFString: Any] = [
+        var opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: maxSide,
             kCGImageSourceCreateThumbnailWithTransform: true
         ]
+        if decodeImmediately { opts[kCGImageSourceShouldCacheImmediately] = true }
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
 

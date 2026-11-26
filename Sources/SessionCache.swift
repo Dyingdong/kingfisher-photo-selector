@@ -224,7 +224,7 @@ enum SessionCache {
         }
     }
 
-    static func load(folder: URL) -> SessionSnapshot? {
+    static func load(folder: URL, selectedFolderOnly: Bool = false) -> SessionSnapshot? {
         // v1 与 v2 都可读：v1 缺信息字段（解码为 nil，App 端退回按需现算），
         // 高于当前 version 的未来格式拒载（防前向兼容破坏）。
         func decode(_ f: URL) -> SessionSnapshot? {
@@ -247,7 +247,11 @@ enum SessionCache {
         if let snap = decode(cacheFile(for: folder)) { return snap }
         // 2) 上一版的隐藏文件：自动转正
         let hidden = folder.appendingPathComponent(hiddenFileName)
-        if let snap = decode(hidden) { return migrate(snap, remove: hidden) }
+        if let snap = decode(hidden) {
+            // 预检期间可能取消导入，保持照片目录里的文件原样。
+            return selectedFolderOnly ? snap : migrate(snap, remove: hidden)
+        }
+        guard !selectedFolderOnly else { return nil }
         // 3) 更早的软件数据目录缓存：迁移到照片文件夹
         let legacy = legacyFile(for: folder)
         guard let snap = decode(legacy) else { return nil }
